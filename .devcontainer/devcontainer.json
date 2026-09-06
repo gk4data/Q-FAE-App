@@ -2,8 +2,10 @@
   "name": "Q-FAE",
   "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bookworm",
   "features": {
-    "ghcr.io/devcontainers/features/node:1": { "version": "22" },
-    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+    "ghcr.io/devcontainers/features/node:1": { "version": "22" }
+  },
+  "containerEnv": {
+    "QFAE_REDIS_URL": "redis://host.docker.internal:6379/0"
   },
   "forwardPorts": [3000, 8000, 5432, 6379],
   "postCreateCommand": "cd backend && pip install -e '.[dev]' && cd ../frontend && npm install",
