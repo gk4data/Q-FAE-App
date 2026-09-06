@@ -45,7 +45,7 @@ Upstox is the market-data provider; FastAPI is Q-FAE's backend. The backend will
    npm run dev
    ```
 
-The API health endpoint is `http://localhost:8000/api/v1/health`; the UI runs on `http://localhost:5173` by default.
+The API health endpoint is `http://localhost:8000/api/v1/health`; the UI runs on `http://localhost:3000` by default.
 
 ## Equity universe refresh
 
@@ -59,6 +59,44 @@ Invoke-RestMethod -Method Post http://localhost:8000/api/v1/instruments/refresh
 
 The frontend's future **Get instrument list** action will call this same endpoint. The mapping records `resolved`, `needs_review`, and `unmatched` rows. Only `resolved` rows are safe to subscribe to automatically.
 
-## Intentional scope of this skeleton
+## Upstox sign-in
 
-This setup does not connect to Upstox, store data, calculate indicators, produce scores, or place orders. It establishes boundaries so those capabilities can be added incrementally and tested.
+The frontend redirects the browser to `GET /api/v1/auth/upstox/login`. Q-FAE validates a one-time OAuth state value in its callback, exchanges the authorization code on the backend, and caches the bearer token locally at `.qfae/upstox_access_token.json`. The token is ignored by Git and is never returned through a frontend endpoint.
+
+The Upstox developer application must register this exact redirect URI:
+
+```text
+http://localhost:8000/api/v1/auth/upstox/callback
+```
+
+Set the same value for `UPSTOX_REDIRECT_URI` in your local `.env`; also set `QFAE_FRONTEND_URL=http://localhost:3000` when using the local Vite frontend.
+
+## Minute-based market data
+
+Q-FAE now has a provider-backed market-day foundation. It uses Upstox Historical Candle V3 for recent one-minute OHLCV, Company Profile for sector metadata, Market Data Feed V3 in `full` mode for live equity/index updates, and Redis for transient candles, quotes, and minute-level context.
+
+Start Redis before using the market endpoints:
+
+```powershell
+docker compose up -d redis
+```
+
+After signing in through the frontend, start a small bootstrap and live-feed pilot:
+
+```powershell
+Invoke-RestMethod -Method Post "http://localhost:8000/api/v1/market/bootstrap?limit=10"
+Invoke-RestMethod "http://localhost:8000/api/v1/market/status"
+Invoke-RestMethod -Method Post "http://localhost:8000/api/v1/market/live/start?limit=10"
+```
+
+Omit `limit` only when you intentionally want to load or subscribe the complete resolved universe. Historical loading is a background operation and is throttled below Upstox's published standard-API limits. Its progress and recent per-instrument errors are exposed by the status endpoint.
+
+Read the normalized state through:
+
+- `GET /api/v1/market/candles?instrument_key=NSE_EQ%7C...`
+- `GET /api/v1/market/context`
+- `WS /api/v1/market/stream`
+
+The context snapshot is recalculated once per minute and currently includes NIFTY 50 and NIFTY Bank direction, India VIX, market breadth, median spread, sector breadth/performance, liquidity coverage, stale-data coverage, and same-minute-of-day relative-volume leaders.
+
+Order placement, scoring, ML predictions, and automated trading are intentionally outside this phase.
