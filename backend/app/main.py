@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
+from app.api.routes.instruments import router as instruments_router
 from app.core.config import get_settings
 
 
@@ -19,6 +20,7 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     app.include_router(health_router, prefix="/api/v1")
+    app.include_router(instruments_router, prefix="/api/v1")
     return app
 
 

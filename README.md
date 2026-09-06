@@ -47,6 +47,18 @@ Upstox is the market-data provider; FastAPI is Q-FAE's backend. The backend will
 
 The API health endpoint is `http://localhost:8000/api/v1/health`; the UI runs on `http://localhost:5173` by default.
 
+## Equity universe refresh
+
+`Stock List.xlsx` is the source list for the Q-FAE equity universe. Refreshing the universe downloads the current public Upstox NSE instrument master, maps the requested company names to instrument keys, and writes `data/instruments/upstox_nse_equity_universe.json`.
+
+Start the API, then call:
+
+```powershell
+Invoke-RestMethod -Method Post http://localhost:8000/api/v1/instruments/refresh
+```
+
+The frontend's future **Get instrument list** action will call this same endpoint. The mapping records `resolved`, `needs_review`, and `unmatched` rows. Only `resolved` rows are safe to subscribe to automatically.
+
 ## Intentional scope of this skeleton
 
 This setup does not connect to Upstox, store data, calculate indicators, produce scores, or place orders. It establishes boundaries so those capabilities can be added incrementally and tested.

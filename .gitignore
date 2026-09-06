@@ -20,7 +20,10 @@ dist/
 .DS_Store
 Thumbs.db
 
-# Runtime data
-data/
+# Runtime data (the generated equity universe is intentionally versioned)
+data/*
+!data/instruments/
+data/instruments/*
+!data/instruments/upstox_nse_equity_universe.json
 postgres-data/
 redis-data/
