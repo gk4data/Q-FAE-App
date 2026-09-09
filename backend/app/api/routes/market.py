@@ -9,10 +9,11 @@ from typing import Annotated, Any
 from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 
 from app.core.config import get_settings
-from app.models.market import Candle, MarketContext
+from app.models.market import Candle, DailyRegimeSnapshot, MarketContext, StockFeatureSnapshot, WatchlistItem
 from app.services.equity_universe import EquityUniverseService
 from app.services.market_runtime import MarketRuntime, MarketRuntimeError
 from app.services.market_state import RedisMarketStateStore
+from app.services.upstox_market import MAX_EQUITY_SUBSCRIPTIONS
 
 router = APIRouter(prefix="/market", tags=["market data"])
 
@@ -50,7 +51,7 @@ def start_pre_market_bootstrap(
 
 @router.post("/live/start", status_code=status.HTTP_202_ACCEPTED)
 def start_live_market_stream(
-    limit: Annotated[int | None, Query(ge=1, le=1997)] = None,
+    limit: Annotated[int | None, Query(ge=1, le=MAX_EQUITY_SUBSCRIPTIONS)] = None,
 ) -> dict[str, Any]:
     """Connect to Upstox Market Data Feed V3 in full mode."""
     return _runtime_action(lambda: get_market_runtime().start_live(limit))
@@ -68,6 +69,17 @@ def market_runtime_status() -> dict[str, Any]:
     return get_market_runtime().status()
 
 
+@router.get("/watchlist", response_model=list[WatchlistItem])
+def get_pilot_watchlist(
+    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+) -> list[WatchlistItem]:
+    """Return the configured pilot stocks with their latest cached minute data."""
+    try:
+        return get_market_runtime().get_watchlist(limit)
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
 @router.get("/candles", response_model=list[Candle])
 def get_recent_candles(
     instrument_key: str,
@@ -81,6 +93,28 @@ def get_recent_candles(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Redis market state is unavailable",
         ) from exc
+
+
+@router.get("/features", response_model=list[StockFeatureSnapshot])
+def get_minute_features(
+    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+) -> list[StockFeatureSnapshot]:
+    """Return the latest explainable feature snapshot for each pilot stock."""
+    try:
+        return get_market_runtime().get_features(limit)
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.get("/daily-regimes", response_model=list[DailyRegimeSnapshot])
+def get_daily_regimes(
+    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+) -> list[DailyRegimeSnapshot]:
+    """Return independent multi-horizon trend, structure, participation, and risk evidence."""
+    try:
+        return get_market_runtime().get_daily_regimes(limit)
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
 
 @router.get("/context", response_model=MarketContext)

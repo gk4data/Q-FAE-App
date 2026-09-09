@@ -18,7 +18,29 @@ UPSTOX_API_ROOT = "https://api.upstox.com"
 NIFTY_50_KEY = "NSE_INDEX|Nifty 50"
 NIFTY_BANK_KEY = "NSE_INDEX|Nifty Bank"
 INDIA_VIX_KEY = "NSE_INDEX|India VIX"
-MARKET_CONTEXT_KEYS = (NIFTY_50_KEY, NIFTY_BANK_KEY, INDIA_VIX_KEY)
+SECTOR_INDEX_SYMBOLS = {
+    NIFTY_BANK_KEY: "Nifty Bank",
+    "NSE_INDEX|Nifty Auto": "Nifty Auto",
+    "NSE_INDEX|NIFTY CONSR DURBL": "Nifty Consumer Durables",
+    "NSE_INDEX|Nifty Fin Service": "Nifty Financial Services",
+    "NSE_INDEX|Nifty FMCG": "Nifty FMCG",
+    "NSE_INDEX|NIFTY HEALTHCARE": "Nifty Healthcare",
+    "NSE_INDEX|Nifty IT": "Nifty IT",
+    "NSE_INDEX|Nifty Media": "Nifty Media",
+    "NSE_INDEX|Nifty Metal": "Nifty Metal",
+    "NSE_INDEX|NIFTY OIL AND GAS": "Nifty Oil & Gas",
+    "NSE_INDEX|Nifty Pharma": "Nifty Pharma",
+    "NSE_INDEX|Nifty PSU Bank": "Nifty PSU Bank",
+    "NSE_INDEX|Nifty Realty": "Nifty Realty",
+}
+MARKET_CONTEXT_SYMBOLS = {
+    NIFTY_50_KEY: "NIFTY 50",
+    INDIA_VIX_KEY: "INDIA VIX",
+    **SECTOR_INDEX_SYMBOLS,
+}
+MARKET_CONTEXT_KEYS = tuple(MARKET_CONTEXT_SYMBOLS)
+MAX_FULL_FEED_INSTRUMENTS = 2_000
+MAX_EQUITY_SUBSCRIPTIONS = MAX_FULL_FEED_INSTRUMENTS - len(MARKET_CONTEXT_KEYS)
 INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
 
@@ -67,7 +89,12 @@ class RequestRateLimiter:
             self._sleeper(wait_for)
 
 
-def parse_candle_rows(instrument_key: str, rows: Iterable[Any]) -> list[Candle]:
+def parse_candle_rows(
+    instrument_key: str,
+    rows: Iterable[Any],
+    *,
+    interval: str = "1minute",
+) -> list[Candle]:
     """Normalize Upstox array candles into typed Q-FAE candles."""
     candles: list[Candle] = []
     for row in rows:
@@ -79,6 +106,7 @@ def parse_candle_rows(instrument_key: str, rows: Iterable[Any]) -> list[Candle]:
                 Candle(
                     instrument_key=instrument_key,
                     timestamp=timestamp,
+                    interval=interval,
                     open=float(row[1]),
                     high=float(row[2]),
                     low=float(row[3]),
@@ -231,7 +259,9 @@ class UpstoxMarketDataClient:
         as_of: date | None = None,
     ) -> list[Candle]:
         as_of = as_of or datetime.now(INDIA_TIMEZONE).date()
-        from_date = as_of - timedelta(days=max(10, sessions * 2 + 3))
+        # One-minute V3 requests are capped at one month. Twenty-nine calendar
+        # days normally contain enough sessions for the configured ATR baseline.
+        from_date = as_of - timedelta(days=min(29, max(10, sessions * 2 + 3)))
         encoded_key = quote(instrument_key, safe="")
         payload = self._get(
             f"/v3/historical-candle/{encoded_key}/minutes/1/{as_of.isoformat()}/{from_date.isoformat()}"
@@ -240,6 +270,26 @@ class UpstoxMarketDataClient:
         if not isinstance(rows, list):
             raise UpstoxMarketDataError("Upstox historical response did not contain candles")
         return keep_latest_sessions(parse_candle_rows(instrument_key, rows), sessions)
+
+    def fetch_daily_history(
+        self,
+        instrument_key: str,
+        sessions: int,
+        *,
+        as_of: date | None = None,
+    ) -> list[Candle]:
+        """Fetch a compact daily baseline for multi-horizon regime features."""
+        as_of = as_of or datetime.now(INDIA_TIMEZONE).date()
+        from_date = as_of - timedelta(days=max(400, sessions * 2 + 30))
+        encoded_key = quote(instrument_key, safe="")
+        payload = self._get(
+            f"/v3/historical-candle/{encoded_key}/days/1/{as_of.isoformat()}/{from_date.isoformat()}"
+        )
+        rows = payload.get("data", {}).get("candles")
+        if not isinstance(rows, list):
+            raise UpstoxMarketDataError("Upstox daily historical response did not contain candles")
+        candles = parse_candle_rows(instrument_key, rows, interval="day")
+        return candles[-sessions:]
 
     def fetch_sector(self, isin: str) -> str | None:
         payload = self._get(f"/v2/fundamentals/{quote(isin, safe='')}/profile")

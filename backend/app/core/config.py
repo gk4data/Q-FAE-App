@@ -28,11 +28,15 @@ class Settings(BaseSettings):
     qfae_stock_list_path: Path = PROJECT_ROOT / "Stock List.xlsx"
     qfae_equity_universe_path: Path = PROJECT_ROOT / "data" / "instruments" / "upstox_nse_equity_universe.json"
     qfae_redis_url: str = "redis://localhost:6379/0"
-    qfae_market_history_days: int = 5
+    qfae_market_history_days: int = 14
     qfae_market_history_retention_days: int = 35
+    qfae_daily_history_sessions: int = 300
     qfae_market_request_rate_per_second: int = 8
     qfae_market_request_rate_per_minute: int = 450
     qfae_market_snapshot_interval_seconds: int = 60
+    qfae_market_pilot_size: int = 20
+    qfae_feature_max_spread_bps: float = 25.0
+    qfae_feature_min_traded_value_inr: float = 10_000_000.0
 
     @property
     def cors_origins(self) -> list[str]:

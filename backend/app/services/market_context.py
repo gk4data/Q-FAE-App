@@ -12,9 +12,15 @@ from app.models.market import (
     LiveSnapshot,
     MarketContext,
     RelativeVolumeLeader,
+    SectorIndexState,
     SectorState,
 )
-from app.services.upstox_market import INDIA_VIX_KEY, NIFTY_50_KEY, NIFTY_BANK_KEY
+from app.services.upstox_market import (
+    INDIA_VIX_KEY,
+    NIFTY_50_KEY,
+    NIFTY_BANK_KEY,
+    SECTOR_INDEX_SYMBOLS,
+)
 
 INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 
@@ -42,7 +48,11 @@ def _change_percent(snapshot: LiveSnapshot | None) -> float | None:
     return (snapshot.ltp / snapshot.previous_close - 1) * 100
 
 
-def _benchmark(instrument_key: str, snapshots: dict[str, LiveSnapshot]) -> BenchmarkState:
+def _benchmark(
+    instrument_key: str,
+    snapshots: dict[str, LiveSnapshot],
+    fresh_cutoff: datetime,
+) -> BenchmarkState:
     snapshot = snapshots.get(instrument_key)
     change = _change_percent(snapshot)
     direction = "unavailable" if change is None else "up" if change > 0 else "down" if change < 0 else "flat"
@@ -52,7 +62,24 @@ def _benchmark(instrument_key: str, snapshots: dict[str, LiveSnapshot]) -> Bench
         previous_close=snapshot.previous_close if snapshot else None,
         change_percent=round(change, 4) if change is not None else None,
         direction=direction,
+        updated_at=snapshot.received_at if snapshot else None,
+        fresh=bool(snapshot and snapshot.received_at >= fresh_cutoff),
     )
+
+
+def _sector_indices(
+    snapshots: dict[str, LiveSnapshot],
+    fresh_cutoff: datetime,
+) -> list[SectorIndexState]:
+    states = []
+    for instrument_key, sector in SECTOR_INDEX_SYMBOLS.items():
+        benchmark = _benchmark(instrument_key, snapshots, fresh_cutoff)
+        states.append(SectorIndexState(sector=sector, **benchmark.model_dump()))
+    states.sort(
+        key=lambda item: item.change_percent if item.change_percent is not None else float("-inf"),
+        reverse=True,
+    )
+    return states
 
 
 def build_market_context(
@@ -98,7 +125,12 @@ def build_market_context(
                 average_change_percent=round(sum(available) / len(available), 4) if available else None,
             )
         )
-    sector_states.sort(key=lambda item: item.average_change_percent or float("-inf"), reverse=True)
+    sector_states.sort(
+        key=lambda item: item.average_change_percent
+        if item.average_change_percent is not None
+        else float("-inf"),
+        reverse=True,
+    )
 
     leaders = [
         RelativeVolumeLeader(
@@ -115,9 +147,10 @@ def build_market_context(
     return MarketContext(
         as_of=as_of,
         cadence_seconds=cadence_seconds,
-        nifty_50=_benchmark(NIFTY_50_KEY, by_key),
-        nifty_bank=_benchmark(NIFTY_BANK_KEY, by_key),
-        india_vix=_benchmark(INDIA_VIX_KEY, by_key),
+        nifty_50=_benchmark(NIFTY_50_KEY, by_key, fresh_cutoff),
+        nifty_bank=_benchmark(NIFTY_BANK_KEY, by_key, fresh_cutoff),
+        india_vix=_benchmark(INDIA_VIX_KEY, by_key, fresh_cutoff),
+        sector_indices=_sector_indices(by_key, fresh_cutoff),
         universe_size=len(equities),
         fresh_instruments=len(fresh),
         stale_instruments=len(equities) - len(fresh),

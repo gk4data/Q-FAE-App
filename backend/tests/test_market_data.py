@@ -1,9 +1,11 @@
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
-from app.models.market import Candle, LiveSnapshot
+from app.models.market import Candle, LiveSnapshot, RelativeVolumeMetric
 from app.services.market_context import build_market_context, calculate_relative_volume
+from app.services.market_runtime import MarketRuntime, nse_market_close_at
 from app.services.market_state import InMemoryMarketStateStore
 from app.services.upstox_market import (
     INDIA_VIX_KEY,
@@ -39,6 +41,9 @@ def test_parse_candles_and_keep_latest_sessions() -> None:
 
     assert parsed[0].volume == 1200
     assert keep_latest_sessions(parsed, 1) == [parsed[1]]
+
+    daily = parse_candle_rows("NSE_EQ|TEST", rows, interval="day")
+    assert daily[0].interval == "day"
 
 
 def test_invalid_candle_contract_is_rejected() -> None:
@@ -123,6 +128,7 @@ def test_market_context_calculates_breadth_benchmarks_sectors_and_spread() -> No
         snapshot(NIFTY_50_KEY, "NIFTY 50", 25100, 25000),
         snapshot(NIFTY_BANK_KEY, "NIFTY BANK", 51000, 51200),
         snapshot(INDIA_VIX_KEY, "INDIA VIX", 13, 12.5),
+        snapshot("NSE_INDEX|Nifty IT", "NIFTY IT", 41000, 40000),
     ]
 
     context = build_market_context(
@@ -136,6 +142,10 @@ def test_market_context_calculates_breadth_benchmarks_sectors_and_spread() -> No
     assert context.advance_decline_ratio == 1
     assert context.nifty_50.direction == "up"
     assert context.nifty_bank.direction == "down"
+    assert len(context.sector_indices) == 13
+    assert context.sector_indices[0].sector == "Nifty IT"
+    assert context.sector_indices[0].change_percent == 2.5
+    assert context.sector_indices[0].fresh is True
     assert context.sectors[0].sector == "Banks"
     assert context.median_spread_bps is not None
 
@@ -149,3 +159,88 @@ def test_in_memory_store_replaces_an_updating_minute_candle() -> None:
     stored = store.get_candles("NSE_EQ|TEST")
     assert len(stored) == 1
     assert stored[0].volume == 250
+
+
+def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached() -> None:
+    instruments = [
+        {
+            "requested_name": f"Company {index}",
+            "status": "resolved",
+            "candidate": {
+                "instrument_key": f"NSE_EQ|{index}",
+                "trading_symbol": f"STOCK{index}",
+                "isin": f"ISIN{index}",
+            },
+        }
+        for index in range(12)
+    ]
+
+    class UniverseService:
+        @staticmethod
+        def load() -> dict[str, list[dict[str, object]]]:
+            return {"instruments": instruments}
+
+    store = InMemoryMarketStateStore()
+    completed = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 30, tzinfo=IST), 250)
+    current = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 31, tzinfo=IST), 100)
+    store.save_candles([completed, current])
+    store.save_relative_volume(
+        RelativeVolumeMetric(
+            instrument_key="NSE_EQ|0",
+            relative_volume=2.5,
+            candle_timestamp=completed.timestamp,
+            calculated_at=datetime(2026, 9, 8, 9, 31, tzinfo=IST),
+        )
+    )
+    store.save_snapshot(
+        LiveSnapshot(
+            instrument_key="NSE_EQ|0",
+            symbol="STOCK0",
+            received_at=datetime.now(UTC),
+            ltp=101,
+            previous_close=100,
+            current_candle=current,
+        )
+    )
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(
+            qfae_market_pilot_size=10,
+            qfae_market_history_days=14,
+        ),
+        state_store=store,
+        universe_service=UniverseService(),
+    )
+
+    rows = runtime.get_watchlist()
+
+    assert len(rows) == 10
+    assert rows[0].symbol == "STOCK0"
+    assert rows[0].change_percent == 1
+    assert rows[0].relative_volume == 2.5
+    assert rows[0].data_state == "cached"
+
+
+def test_previous_session_candle_is_not_used_as_current_session_rvol() -> None:
+    previous_close = candle("NSE_EQ|TEST", datetime(2026, 9, 7, 15, 29, tzinfo=IST), 500)
+    opening_candle = candle("NSE_EQ|TEST", datetime(2026, 9, 8, 9, 15, tzinfo=IST), 100)
+    snapshot = LiveSnapshot(
+        instrument_key="NSE_EQ|TEST",
+        symbol="TEST",
+        received_at=datetime(2026, 9, 8, 9, 15, tzinfo=IST),
+        current_candle=opening_candle,
+    )
+
+    completed = MarketRuntime._latest_completed_candle(
+        snapshot,
+        [previous_close, opening_candle],
+    )
+
+    assert completed is None
+
+
+def test_nse_market_close_is_scheduled_for_330_pm_ist() -> None:
+    now = datetime(2026, 9, 8, 10, 0, tzinfo=UTC)
+
+    market_close = nse_market_close_at(now)
+
+    assert market_close == datetime(2026, 9, 8, 15, 30, tzinfo=IST)
