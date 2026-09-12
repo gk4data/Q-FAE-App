@@ -1,8 +1,10 @@
 # Future historical-data storage policy
 
-Status: architectural requirement for the full-universe phase; not yet implemented.
+Status: PostgreSQL daily candles, bounded pilot minute history, and rolling minute-of-day profiles are implemented. Full-universe scaling and research archives remain future phases.
 
 Q-FAE must not download the complete historical dataset again every morning. Historical market data will use a rolling, incremental storage model with distinct policies for daily and one-minute data.
+
+The implemented foundation includes an Alembic-managed schema, idempotent candle upserts, per-instrument sync watermarks, Redis hydration from PostgreSQL, a five-day daily overlap, and a two-day one-minute overlap. Minute rows are retained for a configurable 35 calendar days. Profiles are rebuilt from retained prior sessions and deliberately exclude the current live date.
 
 ## Required storage tiers
 
@@ -35,6 +37,8 @@ Before older raw minutes expire, update compact statistical profiles for each in
 
 These profiles allow live same-minute comparisons without repeatedly reading or storing every historical minute candle.
 
+Q-FAE now uses the persisted median-volume profile for intraday RVOL when at least five comparable sessions are available. It falls back to the Redis history calculation when a profile is unavailable or insufficient. Historical bid/ask spread is not supplied with Upstox candle history, so spread-profile fields should remain unavailable until Q-FAE persistently samples reliable live depth.
+
 ### Research archive
 
 - Longer raw one-minute history may be retained separately for strategy backtesting when justified.
@@ -66,4 +70,4 @@ These profiles allow live same-minute comparisons without repeatedly reading or 
 - Provider corrections, symbol changes, instrument-key changes, splits, bonuses, and other corporate actions must be handled without destroying the original observations.
 - Daily history is broad and permanent; raw minute retention is selective and bounded.
 
-This policy should be implemented before Q-FAE expands from the pilot universe to full-universe daily processing.
+Before full-universe expansion, benchmark PostgreSQL write/query throughput, partition minute candles if justified, and implement the research archive and corporate-action adjustment layers.

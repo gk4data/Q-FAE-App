@@ -5,7 +5,8 @@
     "ghcr.io/devcontainers/features/node:1": { "version": "22" }
   },
   "containerEnv": {
-    "QFAE_REDIS_URL": "redis://host.docker.internal:6379/0"
+    "QFAE_REDIS_URL": "redis://host.docker.internal:6379/0",
+    "POSTGRES_HOST": "host.docker.internal"
   },
   "forwardPorts": [3000, 8000, 5432, 6379],
   "postCreateCommand": "cd backend && pip install -e '.[dev]' && cd ../frontend && npm install",

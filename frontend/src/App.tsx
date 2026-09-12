@@ -6,8 +6,10 @@ type RuntimeStatus = {
   cadence_seconds: number;
   pilot_size: number;
   redis_available: boolean;
-  bootstrap: { state: string; total: number; processed: number; history_loaded: number; daily_history_loaded: number; benchmark_daily_loaded: number; sectors_loaded: number; errors: number };
+  database_available: boolean;
+  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; corporate_actions_synced: number; corporate_actions_stored: number; corporate_actions_assessed: number; corporate_adjustments_built: number; corporate_documents_stored: number; corporate_financial_contexts: number; corporate_ai_analyzed: number; corporate_outcomes_evaluated: number; errors: number };
   live: { state: string; connected: boolean; subscribed: number; last_message_at: string | null; scheduled_stop_at: string | null; error: string | null };
+  reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
 
 type WatchlistItem = {
@@ -62,6 +64,17 @@ type MarketContext = {
     relative_volume: number;
     candle_timestamp: string;
   }>;
+};
+
+type MarketRegime = {
+  as_of: string;
+  state: "risk_on" | "mixed" | "risk_off" | "insufficient";
+  observations: number;
+  breadth_ratio: number | null;
+  breadth_persistence: number | null;
+  sector_participation: number | null;
+  vix_acceleration_percent: number | null;
+  unavailable_inputs: string[];
 };
 
 type OpeningRangeFeatures = {
@@ -169,6 +182,104 @@ type DailyRegime = {
   cautions: string[];
 };
 
+type EvidencePillar = {
+  key: string;
+  label: string;
+  state: "supportive" | "mixed" | "caution" | "unavailable";
+  available_checks: number;
+  supportive_checks: number;
+  caution_checks: number;
+  evidence: string[];
+  cautions: string[];
+};
+
+type OpportunityEvidence = {
+  instrument_key: string;
+  symbol: string;
+  sector: string | null;
+  as_of: string;
+  data_quality: string;
+  confluence: "strong_support" | "supportive" | "mixed" | "caution" | "insufficient";
+  pillars: EvidencePillar[];
+  flow_liquidity: {
+    data_quality: string;
+    relative_volume: number | null;
+    volume_acceleration: number | null;
+    spread_bps: number | null;
+    traded_value_inr: number | null;
+    depth_imbalance: number | null;
+    passes_spread_filter: boolean | null;
+    passes_traded_value_filter: boolean | null;
+    volume_state: string;
+    liquidity_state: string;
+    confirmation: string;
+    evidence: string[];
+    cautions: string[];
+  };
+  signal_persistence: null | {
+    state: "building" | "confirmed" | "weakening" | "failed" | "neutral";
+    supportive_minutes: number;
+    caution_minutes: number;
+    observed_minutes: number;
+    transition: string | null;
+    reason: string;
+  };
+  risk_assessment: null | {
+    eligible: boolean;
+    status: "pass" | "partial" | "rejected";
+    reference_order_value_inr: number;
+    estimated_buy_slippage_bps: number | null;
+    estimated_sell_slippage_bps: number | null;
+    distance_to_upper_circuit_percent: number | null;
+    distance_to_lower_circuit_percent: number | null;
+    gates: Array<{ key: string; status: string; reason: string }>;
+  };
+  corporate_action_context: null | {
+    state: "positive" | "negative" | "neutral" | "unavailable";
+    active_events: number;
+    maximum_materiality: number | null;
+    deterministic_sentiment: number | null;
+    ai_impact_score: number | null;
+    effective_score: number | null;
+    evidence: string[];
+    cautions: string[];
+  };
+  validation_notes: string[];
+};
+
+type CorporateActionAssessment = {
+  event_id: string;
+  assessment_version: number;
+  instrument_key: string;
+  symbol: string;
+  category: string;
+  direction: "positive" | "negative" | "neutral" | "contextual";
+  materiality_score: number;
+  sentiment_score: number;
+  confidence: number;
+  impact_horizon: string;
+  reference_price: number | null;
+  reference_price_date: string | null;
+  derived_metrics: Record<string, number | string | null>;
+  evidence: string[];
+  cautions: string[];
+  requires_ai_review: boolean;
+};
+
+type CorporateActionAIAnalysis = {
+  event_id: string;
+  analysis_version: number;
+  status: "complete" | "unavailable";
+  impact_score: number | null;
+  impact_probability: number | null;
+  confidence: number | null;
+  impact_horizon: string | null;
+  rationale: string | null;
+  citation_document_ids: string[];
+  grounded: boolean;
+  error: string | null;
+};
+
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 const number = (value: number | null, digits = 2) =>
@@ -243,7 +354,7 @@ function IndexCard({ name, state }: { name: string; state: BenchmarkState }) {
   );
 }
 
-function MarketContextPanel({ context }: { context: MarketContext | null }) {
+function MarketContextPanel({ context, regime }: { context: MarketContext | null; regime: MarketRegime | null }) {
   if (!context) {
     return (
       <section className="context-card context-placeholder">
@@ -258,7 +369,7 @@ function MarketContextPanel({ context }: { context: MarketContext | null }) {
     <section className="context-card">
       <div className="context-heading">
         <div><p className="eyebrow">MARKET CONTEXT</p><h2>One-minute market pulse</h2></div>
-        <span>As of {new Date(context.as_of).toLocaleTimeString("en-IN")}</span>
+        <div className="context-status"><span className={`confluence-badge ${regime?.state ?? "insufficient"}`}>{regime?.state.replaceAll("_", " ") ?? "regime waiting"}</span><span>As of {new Date(context.as_of).toLocaleTimeString("en-IN")}</span></div>
       </div>
 
       <div className="index-grid">
@@ -486,30 +597,124 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
   );
 }
 
+function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
+  return (
+    <section className="table-card evidence-card">
+      <div className="table-heading">
+        <div><h2>Validated evidence confluence</h2><p>Intraday, daily, market-relative, volume and liquidity evidence in one view</p></div>
+        <span>Transparent classifications only · no strategy weights</span>
+      </div>
+      <div className="table-scroll">
+        <table className="evidence-table">
+          <thead><tr><th>Stock</th><th>Confluence</th><th>Persistence</th><th>Risk gates</th><th>Intraday</th><th>Daily regime</th><th>NIFTY / sector</th><th>Volume / liquidity</th><th>Corporate event</th><th>Validation</th></tr></thead>
+          <tbody>
+            {rows.map((row) => {
+              const pillars = Object.fromEntries(row.pillars.map((pillar) => [pillar.key, pillar]));
+              return (
+                <tr key={row.instrument_key}>
+                  <td><strong>{row.symbol}</strong><small>{row.sector ?? "Sector unavailable"}</small><span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span></td>
+                  <td><span className={`confluence-badge ${row.confluence}`}>{row.confluence.replaceAll("_", " ")}</span></td>
+                  <td>{row.signal_persistence ? <><span className={`signal-badge ${row.signal_persistence.state}`}>{row.signal_persistence.state}</span><small>{row.signal_persistence.supportive_minutes}/{row.signal_persistence.observed_minutes} supportive minutes</small>{row.signal_persistence.transition && <span className="evidence-tag">{row.signal_persistence.transition.replaceAll("_", " ")}</span>}</> : "N/A"}</td>
+                  <td>{row.risk_assessment ? <><span className={`filter-badge ${row.risk_assessment.status === "rejected" ? "reject" : row.risk_assessment.status}`}>{row.risk_assessment.status}</span><MetricLine label="Buy slip" value={row.risk_assessment.estimated_buy_slippage_bps == null ? "N/A" : `${number(row.risk_assessment.estimated_buy_slippage_bps)} bps`} /><MetricLine label="Upper circuit" value={percent(row.risk_assessment.distance_to_upper_circuit_percent)} />{row.risk_assessment.gates.filter((gate) => gate.status !== "pass").slice(0, 2).map((gate) => <span className="caution-tag" key={gate.key}>{gate.key.replaceAll("_", " ")}: {gate.status}</span>)}</> : "N/A"}</td>
+                  {(["intraday", "daily", "relative_strength", "confirmation"] as const).map((key) => {
+                    const pillar = pillars[key];
+                    if (key === "confirmation") {
+                      const flow = row.flow_liquidity;
+                      return (
+                        <td key={key}>
+                          <span className={`confirmation-badge ${flow.confirmation}`}>{flow.confirmation.replaceAll("_", " ")}</span>
+                          <MetricLine label="RVOL" value={multiple(flow.relative_volume)} />
+                          <MetricLine label="Acceleration" value={multiple(flow.volume_acceleration)} />
+                          <MetricLine label="Spread" value={flow.spread_bps == null ? "N/A" : `${number(flow.spread_bps)} bps`} />
+                          <MetricLine label="Traded value" value={tradedValue(flow.traded_value_inr)} />
+                          <small>{flow.volume_state.replaceAll("_", " ")} volume · {flow.liquidity_state.replaceAll("_", " ")} liquidity</small>
+                          {flow.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+                        </td>
+                      );
+                    }
+                    return <td key={key}>{pillar ? <><span className={`pillar-state ${pillar.state}`}>{pillar.state}</span><small>{pillar.supportive_checks} supportive · {pillar.caution_checks} cautions</small>{pillar.evidence.slice(0, 2).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{pillar.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</> : "N/A"}</td>;
+                  })}
+                  <td>{row.corporate_action_context ? <><span className={`pillar-state ${row.corporate_action_context.state === "positive" ? "supportive" : row.corporate_action_context.state === "negative" ? "caution" : "mixed"}`}>{row.corporate_action_context.state}</span><MetricLine label="Active events" value={String(row.corporate_action_context.active_events)} /><MetricLine label="Effective score" value={row.corporate_action_context.effective_score == null ? "N/A" : number(row.corporate_action_context.effective_score, 0)} />{row.corporate_action_context.cautions.map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</> : "N/A"}</td>
+                  <td>{row.validation_notes.length ? row.validation_notes.map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>) : <span className="evidence-tag">inputs current</span>}</td>
+                </tr>
+              );
+            })}
+            {!rows.length && <tr><td className="feature-empty" colSpan={10}>Waiting for current-session feature evidence.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessment[]; analyses: CorporateActionAIAnalysis[] }) {
+  if (!rows.length) return null;
+  const aiByEvent = Object.fromEntries(analyses.map((item) => [item.event_id, item]));
+  return (
+    <section className="table-card corporate-action-card">
+      <div className="table-heading">
+        <div><h2>Corporate-action materiality</h2><p>Deterministic event metrics based on facts and the pre-event close</p></div>
+        <span>Versioned rules · AI is optional and source-grounded</span>
+      </div>
+      <div className="table-scroll">
+        <table className="corporate-action-table">
+          <thead><tr><th>Stock</th><th>Action</th><th>Direction</th><th>Materiality</th><th>Sentiment</th><th>Derived metrics</th><th>Confidence</th><th>Grounded AI</th><th>Review notes</th></tr></thead>
+          <tbody>{rows.map((row) => {
+            const ai = aiByEvent[row.event_id];
+            return <tr key={`${row.event_id}-${row.assessment_version}`}>
+              <td><strong>{row.symbol}</strong><small>{row.reference_price_date ? `Reference ${row.reference_price_date}` : "Reference price unavailable"}</small></td>
+              <td><span className="factor-state">{row.category}</span><small>{row.impact_horizon.replaceAll("_", " ")}</small></td>
+              <td><span className={`direction-badge ${row.direction}`}>{row.direction}</span></td>
+              <td className="numeric"><strong>{number(row.materiality_score, 0)}/100</strong></td>
+              <td className={`numeric ${tone(row.sentiment_score)}`}>{row.sentiment_score > 0 ? "+" : ""}{number(row.sentiment_score, 0)}</td>
+              <td>{Object.entries(row.derived_metrics).slice(0, 4).map(([key, value]) => <MetricLine key={key} label={key.replaceAll("_", " ")} value={typeof value === "number" ? number(value) : value ?? "N/A"} />)}</td>
+              <td><strong>{number(row.confidence * 100, 0)}%</strong><small>Rules v{row.assessment_version}</small></td>
+              <td>{ai?.grounded ? <><strong className={tone(ai.impact_score)}>{ai.impact_score != null && ai.impact_score > 0 ? "+" : ""}{number(ai.impact_score, 0)}</strong><small>{number((ai.confidence ?? 0) * 100, 0)}% confidence · {ai.citation_document_ids.length} citation(s)</small>{ai.rationale && <span className="evidence-tag">{ai.rationale}</span>}</> : <><span className="factor-state">Not active</span><small>{ai?.error?.replaceAll("_", " ") ?? "No eligible grounded analysis"}</small></>}</td>
+              <td>{row.cautions.slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.requires_ai_review && <span className="evidence-tag">rules sufficient</span>}</td>
+            </tr>;
+          })}</tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
 function Dashboard() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [stocks, setStocks] = useState<WatchlistItem[]>([]);
   const [context, setContext] = useState<MarketContext | null>(null);
+  const [marketRegime, setMarketRegime] = useState<MarketRegime | null>(null);
   const [features, setFeatures] = useState<StockFeatures[]>([]);
   const [regimes, setRegimes] = useState<DailyRegime[]>([]);
+  const [evidence, setEvidence] = useState<OpportunityEvidence[]>([]);
+  const [corporateActions, setCorporateActions] = useState<CorporateActionAssessment[]>([]);
+  const [corporateActionAI, setCorporateActionAI] = useState<CorporateActionAIAnalysis[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [statusResponse, watchlistResponse, contextResponse, featuresResponse, regimesResponse] = await Promise.all([
+      const [statusResponse, watchlistResponse, contextResponse, marketRegimeResponse, featuresResponse, regimesResponse, evidenceResponse, corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
         fetch(`${apiBaseUrl}/market/status`),
         fetch(`${apiBaseUrl}/market/watchlist`),
         fetch(`${apiBaseUrl}/market/context`),
+        fetch(`${apiBaseUrl}/market/regime`),
         fetch(`${apiBaseUrl}/market/features`),
         fetch(`${apiBaseUrl}/market/daily-regimes`),
+        fetch(`${apiBaseUrl}/market/evidence`),
+        fetch(`${apiBaseUrl}/market/corporate-action-assessments?limit=100`),
+        fetch(`${apiBaseUrl}/market/corporate-action-ai`),
       ]);
       if (!statusResponse.ok || !watchlistResponse.ok) throw new Error("Market service is unavailable");
       setRuntime(await statusResponse.json() as RuntimeStatus);
       setStocks(await watchlistResponse.json() as WatchlistItem[]);
       setContext(contextResponse.ok ? await contextResponse.json() as MarketContext : null);
+      setMarketRegime(marketRegimeResponse.ok ? await marketRegimeResponse.json() as MarketRegime : null);
       setFeatures(featuresResponse.ok ? await featuresResponse.json() as StockFeatures[] : []);
       setRegimes(regimesResponse.ok ? await regimesResponse.json() as DailyRegime[] : []);
+      setEvidence(evidenceResponse.ok ? await evidenceResponse.json() as OpportunityEvidence[] : []);
+      setCorporateActions(corporateActionsResponse.ok ? await corporateActionsResponse.json() as CorporateActionAssessment[] : []);
+      setCorporateActionAI(corporateActionAIResponse.ok ? await corporateActionAIResponse.json() as CorporateActionAIAnalysis[] : []);
       setError(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not load market data");
@@ -522,7 +727,7 @@ function Dashboard() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const runAction = async (action: "bootstrap" | "live/start" | "live/stop") => {
+  const runAction = async (action: "bootstrap" | "live/start" | "live/stop" | "reconcile") => {
     setBusy(action);
     setError(null);
     try {
@@ -540,6 +745,7 @@ function Dashboard() {
   };
 
   const bootstrapping = runtime?.bootstrap.state === "running";
+  const reconciling = runtime?.reconciliation.state === "running";
   const live = runtime?.live.connected === true;
   const liveStarting = ["connecting", "reconnecting"].includes(runtime?.live.state ?? "");
   const pilotSize = runtime?.pilot_size ?? 20;
@@ -564,6 +770,9 @@ function Dashboard() {
           <button className="secondary" type="button" disabled={bootstrapping || busy !== null} onClick={() => void runAction("bootstrap")}>
             {bootstrapping ? `Preparing ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? pilotSize}` : `Prepare ${pilotSize} stocks`}
           </button>
+          <button className="secondary" type="button" disabled={live || bootstrapping || reconciling || busy !== null || !runtime?.database_available} onClick={() => void runAction("reconcile")}>
+            {reconciling ? `Reconciling ${runtime?.reconciliation.processed ?? 0}/${runtime?.reconciliation.total ?? 35}` : "Reconcile close"}
+          </button>
           {!live && !liveStarting ? (
             <button type="button" disabled={busy !== null || !runtime?.redis_available} onClick={() => void runAction("live/start")}>Start live feed</button>
           ) : (
@@ -576,13 +785,26 @@ function Dashboard() {
 
       <section className="summary-grid" aria-label="Market data status">
         <article><span>Redis</span><strong>{runtime?.redis_available ? "Ready" : "Offline"}</strong></article>
+        <article><span>PostgreSQL</span><strong>{runtime?.database_available ? "Ready" : "Offline"}</strong></article>
         <article><span>History</span><strong>{runtime?.bootstrap.history_loaded ?? 0}/{pilotSize}</strong></article>
+        <article><span>Minute stored</span><strong>{runtime?.bootstrap.minute_history_persisted ?? 0}/{pilotSize}</strong></article>
+        <article><span>RVOL profiles</span><strong>{runtime?.bootstrap.minute_profiles_built ?? 0}/{pilotSize}</strong></article>
         <article><span>Daily regimes</span><strong>{runtime?.bootstrap.daily_history_loaded ?? 0}/{pilotSize}</strong></article>
+        <article><span>Daily stored</span><strong>{runtime?.bootstrap.daily_history_persisted ?? 0}/{pilotSize}</strong></article>
         <article><span>Sectors</span><strong>{runtime?.bootstrap.sectors_loaded ?? 0}/{pilotSize}</strong></article>
+        <article><span>Corporate actions</span><strong>{runtime?.bootstrap.corporate_actions_synced ?? 0}/{pilotSize}</strong></article>
+        <article><span>CA assessments</span><strong>{runtime?.bootstrap.corporate_actions_assessed ?? 0}</strong></article>
+        <article><span>CA outcomes</span><strong>{runtime?.bootstrap.corporate_outcomes_evaluated ?? 0}</strong></article>
+        <article><span>CA sources</span><strong>{runtime?.bootstrap.corporate_documents_stored ?? 0}</strong></article>
         <article><span>Subscribed</span><strong>{runtime?.live.subscribed ?? 0}</strong></article>
+        <article><span>Reconciliation</span><strong>{runtime?.reconciliation.state ?? "Idle"}</strong></article>
       </section>
 
-      <MarketContextPanel context={context} />
+      <MarketContextPanel context={context} regime={marketRegime} />
+
+      <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />
+
+      <EvidenceBoard rows={evidence} />
 
       <DailyRegimePanel regimes={regimes} />
 

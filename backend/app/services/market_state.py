@@ -12,10 +12,15 @@ from redis import Redis
 
 from app.models.market import (
     Candle,
+    CorporateActionContext,
     DailyRegimeSnapshot,
     LiveSnapshot,
     MarketContext,
+    MarketRegimeSnapshot,
+    OpportunityEvidenceSnapshot,
     RelativeVolumeMetric,
+    RiskAssessment,
+    SignalPersistenceSnapshot,
     StockFeatureSnapshot,
 )
 
@@ -42,6 +47,17 @@ class MarketStateStore(Protocol):
     def get_sectors(self) -> dict[str, str]: ...
     def save_context(self, context: MarketContext) -> None: ...
     def get_context(self) -> MarketContext | None: ...
+    def get_context_history(self, limit: int = 5) -> list[MarketContext]: ...
+    def save_market_regime(self, regime: MarketRegimeSnapshot) -> None: ...
+    def get_market_regime(self) -> MarketRegimeSnapshot | None: ...
+    def save_evidence(self, evidence: OpportunityEvidenceSnapshot) -> None: ...
+    def get_evidence_history(self, instrument_key: str, limit: int = 3) -> list[OpportunityEvidenceSnapshot]: ...
+    def save_signal(self, signal: SignalPersistenceSnapshot) -> None: ...
+    def get_signals(self) -> dict[str, SignalPersistenceSnapshot]: ...
+    def save_risk_assessment(self, risk: RiskAssessment) -> None: ...
+    def get_risk_assessments(self) -> dict[str, RiskAssessment]: ...
+    def save_corporate_action_context(self, context: CorporateActionContext) -> None: ...
+    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]: ...
 
 
 class RedisMarketStateStore:
@@ -53,6 +69,11 @@ class RedisMarketStateStore:
     _DAILY_REGIMES_KEY = "qfae:market:daily-regimes"
     _SECTORS_KEY = "qfae:market:sectors"
     _CONTEXT_KEY = "qfae:market:context"
+    _CONTEXT_HISTORY_KEY = "qfae:market:context-history"
+    _MARKET_REGIME_KEY = "qfae:market:regime"
+    _SIGNALS_KEY = "qfae:market:signals"
+    _RISK_KEY = "qfae:market:risk"
+    _CORPORATE_ACTION_CONTEXT_KEY = "qfae:market:corporate-action-context"
 
     def __init__(self, redis_url: str, retention_days: int = 35) -> None:
         self._redis = Redis.from_url(
@@ -73,6 +94,10 @@ class RedisMarketStateStore:
     @staticmethod
     def _daily_candle_key(instrument_key: str) -> str:
         return f"qfae:market:candles:day:{instrument_key}"
+
+    @staticmethod
+    def _evidence_key(instrument_key: str) -> str:
+        return f"qfae:market:evidence:{instrument_key}"
 
     def save_candles(self, candles: Iterable[Candle]) -> int:
         candle_list = list(candles)
@@ -177,11 +202,69 @@ class RedisMarketStateStore:
         return dict(self._redis.hgetall(self._SECTORS_KEY))
 
     def save_context(self, context: MarketContext) -> None:
-        self._redis.set(self._CONTEXT_KEY, context.model_dump_json())
+        value = context.model_dump_json()
+        score = context.as_of.timestamp()
+        with self._redis.pipeline(transaction=False) as pipeline:
+            pipeline.set(self._CONTEXT_KEY, value)
+            pipeline.zremrangebyscore(self._CONTEXT_HISTORY_KEY, score, score)
+            pipeline.zadd(self._CONTEXT_HISTORY_KEY, {value: score})
+            pipeline.zremrangebyscore(self._CONTEXT_HISTORY_KEY, "-inf", score - 172800)
+            pipeline.expire(self._CONTEXT_HISTORY_KEY, int(timedelta(days=2).total_seconds()))
+            pipeline.execute()
 
     def get_context(self) -> MarketContext | None:
         value = self._redis.get(self._CONTEXT_KEY)
         return MarketContext.model_validate_json(value) if value else None
+
+    def get_context_history(self, limit: int = 5) -> list[MarketContext]:
+        values = self._redis.zrange(self._CONTEXT_HISTORY_KEY, -limit, -1)
+        return [MarketContext.model_validate_json(value) for value in values]
+
+    def save_market_regime(self, regime: MarketRegimeSnapshot) -> None:
+        self._redis.set(self._MARKET_REGIME_KEY, regime.model_dump_json())
+
+    def get_market_regime(self) -> MarketRegimeSnapshot | None:
+        value = self._redis.get(self._MARKET_REGIME_KEY)
+        return MarketRegimeSnapshot.model_validate_json(value) if value else None
+
+    def save_evidence(self, evidence: OpportunityEvidenceSnapshot) -> None:
+        key = self._evidence_key(evidence.instrument_key)
+        score = evidence.as_of.timestamp()
+        with self._redis.pipeline(transaction=False) as pipeline:
+            pipeline.zremrangebyscore(key, score, score)
+            pipeline.zadd(key, {evidence.model_dump_json(): score})
+            pipeline.zremrangebyscore(key, "-inf", score - 432000)
+            pipeline.expire(key, int(timedelta(days=5).total_seconds()))
+            pipeline.execute()
+
+    def get_evidence_history(self, instrument_key: str, limit: int = 3) -> list[OpportunityEvidenceSnapshot]:
+        values = self._redis.zrange(self._evidence_key(instrument_key), -limit, -1)
+        return [OpportunityEvidenceSnapshot.model_validate_json(value) for value in values]
+
+    def save_signal(self, signal: SignalPersistenceSnapshot) -> None:
+        self._redis.hset(self._SIGNALS_KEY, signal.instrument_key, signal.model_dump_json())
+
+    def get_signals(self) -> dict[str, SignalPersistenceSnapshot]:
+        return {key: SignalPersistenceSnapshot.model_validate_json(value) for key, value in self._redis.hgetall(self._SIGNALS_KEY).items()}
+
+    def save_risk_assessment(self, risk: RiskAssessment) -> None:
+        self._redis.hset(self._RISK_KEY, risk.instrument_key, risk.model_dump_json())
+
+    def get_risk_assessments(self) -> dict[str, RiskAssessment]:
+        return {key: RiskAssessment.model_validate_json(value) for key, value in self._redis.hgetall(self._RISK_KEY).items()}
+
+    def save_corporate_action_context(self, context: CorporateActionContext) -> None:
+        self._redis.hset(
+            self._CORPORATE_ACTION_CONTEXT_KEY,
+            context.instrument_key,
+            context.model_dump_json(),
+        )
+
+    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]:
+        return {
+            key: CorporateActionContext.model_validate_json(value)
+            for key, value in self._redis.hgetall(self._CORPORATE_ACTION_CONTEXT_KEY).items()
+        }
 
 
 class InMemoryMarketStateStore:
@@ -196,6 +279,12 @@ class InMemoryMarketStateStore:
         self._daily_regimes: dict[str, DailyRegimeSnapshot] = {}
         self._sectors: dict[str, str] = {}
         self._context: MarketContext | None = None
+        self._context_history: list[MarketContext] = []
+        self._market_regime: MarketRegimeSnapshot | None = None
+        self._evidence: dict[str, list[OpportunityEvidenceSnapshot]] = {}
+        self._signals: dict[str, SignalPersistenceSnapshot] = {}
+        self._risk: dict[str, RiskAssessment] = {}
+        self._corporate_action_contexts: dict[str, CorporateActionContext] = {}
         self._lock = threading.RLock()
 
     def ping(self) -> bool:
@@ -287,7 +376,56 @@ class InMemoryMarketStateStore:
     def save_context(self, context: MarketContext) -> None:
         with self._lock:
             self._context = context
+            self._context_history = [item for item in self._context_history if item.as_of != context.as_of]
+            self._context_history.append(context)
+            self._context_history = self._context_history[-1440:]
 
     def get_context(self) -> MarketContext | None:
         with self._lock:
             return self._context
+
+    def get_context_history(self, limit: int = 5) -> list[MarketContext]:
+        with self._lock:
+            return list(self._context_history[-limit:])
+
+    def save_market_regime(self, regime: MarketRegimeSnapshot) -> None:
+        with self._lock:
+            self._market_regime = regime
+
+    def get_market_regime(self) -> MarketRegimeSnapshot | None:
+        with self._lock:
+            return self._market_regime
+
+    def save_evidence(self, evidence: OpportunityEvidenceSnapshot) -> None:
+        with self._lock:
+            rows = [item for item in self._evidence.get(evidence.instrument_key, []) if item.as_of != evidence.as_of]
+            rows.append(evidence)
+            self._evidence[evidence.instrument_key] = rows[-1500:]
+
+    def get_evidence_history(self, instrument_key: str, limit: int = 3) -> list[OpportunityEvidenceSnapshot]:
+        with self._lock:
+            return list(self._evidence.get(instrument_key, [])[-limit:])
+
+    def save_signal(self, signal: SignalPersistenceSnapshot) -> None:
+        with self._lock:
+            self._signals[signal.instrument_key] = signal
+
+    def get_signals(self) -> dict[str, SignalPersistenceSnapshot]:
+        with self._lock:
+            return dict(self._signals)
+
+    def save_risk_assessment(self, risk: RiskAssessment) -> None:
+        with self._lock:
+            self._risk[risk.instrument_key] = risk
+
+    def get_risk_assessments(self) -> dict[str, RiskAssessment]:
+        with self._lock:
+            return dict(self._risk)
+
+    def save_corporate_action_context(self, context: CorporateActionContext) -> None:
+        with self._lock:
+            self._corporate_action_contexts[context.instrument_key] = context
+
+    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]:
+        with self._lock:
+            return dict(self._corporate_action_contexts)

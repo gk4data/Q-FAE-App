@@ -56,6 +56,7 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .context-heading .eyebrow { margin-bottom: .4rem; }
 .context-heading h2 { margin: 0; font-size: 1.25rem; letter-spacing: -.02em; }
 .context-heading > span { color: #8190a4; font-size: .74rem; }
+.context-status { display: flex; align-items: center; gap: .65rem; color: #8190a4; font-size: .74rem; }
 .context-placeholder { display: flex; align-items: center; justify-content: space-between; gap: 2rem; padding: 1.25rem; }
 .context-placeholder h2 { margin: 0; font-size: 1.15rem; }
 .context-placeholder > p { max-width: 520px; margin: 0; color: #8493a8; font-size: .82rem; line-height: 1.5; }
@@ -89,6 +90,32 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .empty-copy { margin: 1rem 0; color: #78879a; font-size: .76rem; line-height: 1.5; }
 .table-card { border: 1px solid #253141; border-radius: .65rem; background: #101720; overflow: hidden; }
 .feature-card { margin-bottom: 1.2rem; }
+.evidence-card { margin-bottom: 1.2rem; }
+.corporate-action-card { margin-bottom: 1.2rem; }
+.corporate-action-table { min-width: 1550px; }
+.corporate-action-table td { min-width: 140px; vertical-align: top; white-space: normal; }
+.corporate-action-table td:nth-child(6), .corporate-action-table td:last-child { min-width: 230px; }
+.direction-badge { display: inline-block; border-radius: 999px; padding: .25rem .48rem; background: #283342; color: #a5b3c6; font-size: .58rem; letter-spacing: .05em; text-transform: uppercase; }
+.direction-badge.positive { background: #15382d; color: #8ce4bc; }
+.direction-badge.negative { background: #43232b; color: #ffacb5; }
+.direction-badge.neutral, .direction-badge.contextual { background: #3d331d; color: #e4c87e; }
+.evidence-table { min-width: 2100px; }
+.evidence-table td { min-width: 180px; vertical-align: top; white-space: normal; }
+.evidence-table td:first-child, .evidence-table td:nth-child(2) { min-width: 130px; }
+.pillar-state, .confluence-badge { display: inline-block; margin-bottom: .4rem; border-radius: 999px; padding: .25rem .48rem; background: #283342; color: #a5b3c6; font-size: .58rem; letter-spacing: .05em; text-transform: uppercase; }
+.confirmation-badge { display: inline-block; margin-bottom: .55rem; border-radius: 999px; padding: .25rem .48rem; background: #283342; color: #a5b3c6; font-size: .58rem; letter-spacing: .05em; text-transform: uppercase; }
+.confirmation-badge.strong_confirmation, .confirmation-badge.confirmed { background: #15382d; color: #8ce4bc; }
+.confirmation-badge.rejected { background: #43232b; color: #ffacb5; }
+.confirmation-badge.liquid_but_unconfirmed, .confirmation-badge.volume_without_full_liquidity { background: #3d331d; color: #e4c87e; }
+.signal-badge { display: inline-block; margin-bottom: .45rem; border-radius: 999px; padding: .25rem .48rem; background: #283342; color: #a5b3c6; font-size: .58rem; letter-spacing: .05em; text-transform: uppercase; }
+.signal-badge.confirmed { background: #15382d; color: #8ce4bc; }
+.signal-badge.building, .signal-badge.weakening { background: #3d331d; color: #e4c87e; }
+.signal-badge.failed { background: #43232b; color: #ffacb5; }
+.confluence-badge.risk_on { background: #15382d; color: #8ce4bc; }
+.confluence-badge.risk_off { background: #43232b; color: #ffacb5; }
+.pillar-state.supportive, .confluence-badge.supportive, .confluence-badge.strong_support { background: #15382d; color: #8ce4bc; }
+.pillar-state.caution, .confluence-badge.caution { background: #43232b; color: #ffacb5; }
+.pillar-state.mixed, .confluence-badge.mixed { background: #3d331d; color: #e4c87e; }
 .regime-card { margin-bottom: 1.2rem; }
 .regime-table { min-width: 1540px; }
 .regime-table td { min-width: 175px; vertical-align: top; }

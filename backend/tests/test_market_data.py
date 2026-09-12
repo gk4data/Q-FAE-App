@@ -14,6 +14,7 @@ from app.services.upstox_market import (
     UpstoxMarketDataError,
     keep_latest_sessions,
     normalize_feed_message,
+    normalize_corporate_actions,
     parse_candle_rows,
 )
 
@@ -60,7 +61,10 @@ def test_full_feed_message_is_normalized() -> None:
                     "marketFF": {
                         "ltpc": {"ltp": 101.5, "ltt": "1788493624000", "ltq": "25", "cp": 99.5},
                         "marketLevel": {
-                            "bidAskQuote": [{"bidP": 101.45, "bidQ": "100", "askP": 101.55, "askQ": "80"}]
+                            "bidAskQuote": [
+                                {"bidP": 101.45, "bidQ": "100", "askP": 101.55, "askQ": "80"},
+                                {"bidP": 101.40, "bidQ": "200", "askP": 101.60, "askQ": "180"},
+                            ]
                         },
                         "marketOHLC": {
                             "ohlc": [
@@ -75,10 +79,14 @@ def test_full_feed_message_is_normalized() -> None:
                                 }
                             ]
                         },
-                        "atp": 100.75,
-                        "vtt": "200000",
-                        "tbq": "50000",
-                        "tsq": "45000",
+                        "eFeedDetails": {
+                            "atp": 100.75,
+                            "vtt": "200000",
+                            "tbq": "50000",
+                            "tsq": "45000",
+                            "lc": 80,
+                            "uc": 120,
+                        },
                     }
                 }
             }
@@ -91,8 +99,43 @@ def test_full_feed_message_is_normalized() -> None:
     assert snapshots[0].symbol == "TEST"
     assert snapshots[0].ltp == 101.5
     assert snapshots[0].best_ask_price == 101.55
+    assert len(snapshots[0].market_depth) == 2
+    assert snapshots[0].market_depth[1].ask_quantity == 180
+    assert snapshots[0].lower_circuit == 80
+    assert snapshots[0].upper_circuit == 120
     assert snapshots[0].current_candle is not None
     assert snapshots[0].current_candle.volume == 7250
+
+
+def test_corporate_actions_preserve_facts_and_normalize_dates() -> None:
+    actions = normalize_corporate_actions(
+        "INE000000001",
+        "NSE_EQ|INE000000001",
+        "TEST",
+        [
+            {
+                "name": "Dividend",
+                "expiry_date": "14 Aug 2025",
+                "amount": 5.5,
+                "ratio": None,
+                "event_details": [
+                    {"name": "Announcement date", "value": "25 Apr 2025"},
+                    {"name": "Ex dividend date", "value": "14 Aug 2025"},
+                    {"name": "Record date", "value": "14 Aug 2025"},
+                    {"name": "Details", "value": "Final dividend"},
+                ],
+            }
+        ],
+        ingested_at=datetime(2026, 9, 12, tzinfo=UTC),
+    )
+
+    assert len(actions) == 1
+    assert actions[0].action_type == "Dividend"
+    assert actions[0].announcement_date.isoformat() == "2025-04-25"
+    assert actions[0].ex_date.isoformat() == "2025-08-14"
+    assert actions[0].amount == 5.5
+    assert actions[0].details["Details"] == "Final dividend"
+    assert len(actions[0].event_id) == 32
 
 
 def test_relative_volume_uses_same_minute_from_prior_sessions() -> None:
@@ -244,3 +287,32 @@ def test_nse_market_close_is_scheduled_for_330_pm_ist() -> None:
     market_close = nse_market_close_at(now)
 
     assert market_close == datetime(2026, 9, 8, 15, 30, tzinfo=IST)
+
+
+def test_live_persistence_collects_all_completed_minutes_after_watermark() -> None:
+    first = candle("NSE_EQ|TEST", datetime(2026, 9, 8, 9, 15, tzinfo=IST), 100)
+    second = candle("NSE_EQ|TEST", datetime(2026, 9, 8, 9, 16, tzinfo=IST), 200)
+    forming = candle("NSE_EQ|TEST", datetime(2026, 9, 8, 9, 17, tzinfo=IST), 50)
+
+    class Repository:
+        @staticmethod
+        def latest_candle_timestamp(*_args):
+            return datetime(2026, 9, 7, 15, 29, tzinfo=IST)
+
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+        historical_repository=Repository(),
+    )
+    snapshot = LiveSnapshot(
+        instrument_key="NSE_EQ|TEST",
+        symbol="TEST",
+        received_at=forming.timestamp,
+        current_candle=forming,
+    )
+    pending: dict[tuple[str, datetime], Candle] = {}
+
+    runtime._collect_unpersisted_minutes(snapshot, [first, second, forming], second, pending)
+
+    assert list(pending.values()) == [first, second]
