@@ -488,14 +488,13 @@ function MetricLine({ label, value, valueClass = "" }: { label: string; value: s
 }
 
 function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
-  const [expanded, setExpanded] = useState(true);
   return (
     <section className="table-card regime-card">
       <div className="table-heading">
         <div><h2>Daily regime evidence</h2><p>Independent horizons reveal established trends, pullbacks and new transitions</p></div>
-        <div className="table-heading-actions"><span>Long history provides context; it never blocks fresh strength</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Daily regime evidence" /></div>
+        <span>Long history provides context; it never blocks fresh strength</span>
       </div>
-      {expanded && <div className="table-scroll" id="daily-regime-content">
+      <div className="table-scroll">
         <table className="regime-table">
           <thead><tr><th>Stock</th><th>5 / 20 / 60 / 120 / 250 sessions</th><th>Trend alignment</th><th>Price structure</th><th>Participation</th><th>Volatility</th><th>Evidence and cautions</th></tr></thead>
           <tbody>
@@ -558,17 +557,12 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
             )}
           </tbody>
         </table>
-      </div>}
+      </div>
     </section>
   );
 }
 
-function SectionToggle({ expanded, onToggle, label }: { expanded: boolean; onToggle: () => void; label: string }) {
-  return <button className="section-toggle" type="button" aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`} onClick={onToggle}><span aria-hidden="true">{expanded ? "−" : "+"}</span>{expanded ? "Collapse" : "Expand"}</button>;
-}
-
 function FeatureMatrix({ features }: { features: StockFeatures[] }) {
-  const [expanded, setExpanded] = useState(true);
   const openingRange = (feature: StockFeatures, minutes: number) =>
     feature.opening_ranges.find((range) => range.minutes === minutes);
 
@@ -576,9 +570,9 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
     <section className="table-card feature-card">
       <div className="table-heading">
         <div><h2>Intraday feature matrix</h2><p>Nine explainable factor groups, recalculated after every completed minute</p></div>
-        <div className="table-heading-actions"><span>Raw factor detail behind the pilot opportunity score</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Intraday feature matrix" /></div>
+        <span>Raw factor detail behind the pilot opportunity score</span>
       </div>
-      {expanded && <div className="table-scroll" id="intraday-feature-content">
+      <div className="table-scroll">
         <table className="feature-table">
           <thead>
             <tr>
@@ -659,21 +653,20 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
             )}
           </tbody>
         </table>
-      </div>}
+      </div>
     </section>
   );
 }
 
 function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
-  const [expanded, setExpanded] = useState(true);
   const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental", "catalyst"];
   return (
     <section className="table-card opportunity-card">
       <div className="table-heading">
         <div><h2>Explainable opportunity ranking</h2><p>Coverage-adjusted long-continuation candidates, recalculated every completed minute</p></div>
-        <div className="table-heading-actions"><span>Pilot v1 · provisional weights · not yet backtested</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Explainable opportunity ranking" /></div>
+        <span>Pilot v1 · provisional weights · not yet backtested</span>
       </div>
-      {expanded && <div className="table-scroll" id="opportunity-ranking-content">
+      <div className="table-scroll">
         <table className="opportunity-table">
           <thead><tr><th>Rank</th><th>Stock</th><th>CMP</th><th>Opportunity score</th>{componentKeys.map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}<th>Why it ranks</th><th>Risk / missing</th></tr></thead>
           <tbody>
@@ -697,20 +690,19 @@ function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
             {!rows.length && <tr><td className="feature-empty" colSpan={12}>Waiting for completed-minute evidence and risk checks before ranking opportunities.</td></tr>}
           </tbody>
         </table>
-      </div>}
+      </div>
     </section>
   );
 }
 
 function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
-  const [expanded, setExpanded] = useState(true);
   return (
     <section className="table-card evidence-card">
       <div className="table-heading">
         <div><h2>Validated evidence confluence</h2><p>Intraday, daily, market-relative, volume and liquidity evidence in one view</p></div>
-        <div className="table-heading-actions"><span>Underlying evidence used by the provisional ranking model</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Validated evidence confluence" /></div>
+        <span>Underlying evidence used by the provisional ranking model</span>
       </div>
-      {expanded && <div className="table-scroll" id="validated-evidence-content">
+      <div className="table-scroll">
         <table className="evidence-table">
           <thead><tr><th>Stock</th><th>Confluence</th><th>Persistence</th><th>Risk gates</th><th>Intraday</th><th>Daily regime</th><th>NIFTY / sector</th><th>Volume / liquidity</th><th>Corporate event</th><th>Validation</th></tr></thead>
           <tbody>
@@ -748,22 +740,20 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
             {!rows.length && <tr><td className="feature-empty" colSpan={10}>Waiting for current-session feature evidence.</td></tr>}
           </tbody>
         </table>
-      </div>}
+      </div>
     </section>
   );
 }
 
 function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessment[]; analyses: CorporateActionAIAnalysis[] }) {
-  const [expanded, setExpanded] = useState(true);
-  if (!rows.length) return null;
   const aiByEvent = Object.fromEntries(analyses.map((item) => [item.event_id, item]));
   return (
     <section className="table-card corporate-action-card">
       <div className="table-heading">
         <div><h2>Corporate-action materiality</h2><p>Deterministic event metrics based on facts and the pre-event close</p></div>
-        <div className="table-heading-actions"><span>Versioned rules · AI is optional and source-grounded</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Corporate-action materiality" /></div>
+        <span>Versioned rules · AI is optional and source-grounded</span>
       </div>
-      {expanded && <div className="table-scroll" id="corporate-action-content">
+      <div className="table-scroll">
         <table className="corporate-action-table">
           <thead><tr><th>Stock</th><th>Action</th><th>Direction</th><th>Materiality</th><th>Sentiment</th><th>Derived metrics</th><th>Confidence</th><th>Grounded AI</th><th>Review notes</th></tr></thead>
           <tbody>{rows.map((row) => {
@@ -780,8 +770,45 @@ function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessm
               <td>{row.cautions.slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.requires_ai_review && <span className="evidence-tag">rules sufficient</span>}</td>
             </tr>;
           })}</tbody>
+          {!rows.length && <tbody><tr><td className="feature-empty" colSpan={9}>No corporate-action materiality records are available for the pilot stocks.</td></tr></tbody>}
         </table>
-      </div>}
+      </div>
+    </section>
+  );
+}
+
+function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
+  return (
+    <section className="table-card">
+      <div className="table-heading">
+        <div><h2>Approved stocks</h2><p>Latest available one-minute values</p></div>
+        <span>Refreshes every 5 seconds · calculations every 60 seconds</span>
+      </div>
+      <div className="table-scroll">
+        <table>
+          <thead><tr><th>Stock</th><th>Sector</th><th>LTP</th><th>Change</th><th>1m O / H / L / C</th><th>Volume</th><th>RVOL</th><th>Spread</th><th>State</th></tr></thead>
+          <tbody>
+            {stocks.map((stock) => (
+              <tr key={stock.instrument_key}>
+                <td><strong>{stock.symbol}</strong><small>{stock.company_name}</small></td>
+                <td>{stock.sector ?? "—"}</td>
+                <td className="numeric">{number(stock.ltp)}</td>
+                <td className={`numeric ${(stock.change_percent ?? 0) > 0 ? "positive" : (stock.change_percent ?? 0) < 0 ? "negative" : ""}`}>
+                  {stock.change_percent == null ? "—" : `${stock.change_percent > 0 ? "+" : ""}${number(stock.change_percent)}%`}
+                </td>
+                <td className="numeric candle-values">{[stock.open, stock.high, stock.low, stock.close].map((value) => number(value)).join(" / ")}</td>
+                <td className="numeric">{integer(stock.volume)}</td>
+                <td className="numeric" title={stock.relative_volume == null ? "No current-session comparable RVOL is available yet" : "Relative volume for the latest completed one-minute candle"}>
+                  {stock.relative_volume == null ? "N/A" : `${number(stock.relative_volume)}x`}
+                </td>
+                <td className="numeric">{stock.spread_bps == null ? "—" : `${number(stock.spread_bps)} bps`}</td>
+                <td><span className={`data-badge ${stock.data_state}`}>{stock.data_state}</span></td>
+              </tr>
+            ))}
+            {!stocks.length && <tr><td className="feature-empty" colSpan={9}>Waiting for approved-stock market data.</td></tr>}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
 }
@@ -816,6 +843,17 @@ function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCh
   );
 }
 
+type AnalysisTab = "opportunities" | "intraday" | "corporate" | "evidence" | "daily" | "stocks";
+
+const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
+  { id: "opportunities", label: "Opportunity Ranking" },
+  { id: "intraday", label: "Intraday Features" },
+  { id: "corporate", label: "Corporate Actions" },
+  { id: "evidence", label: "Evidence Confluence" },
+  { id: "daily", label: "Daily Regime" },
+  { id: "stocks", label: "Approved Stocks" },
+];
+
 function Dashboard() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [stocks, setStocks] = useState<WatchlistItem[]>([]);
@@ -828,7 +866,7 @@ function Dashboard() {
   const [corporateActions, setCorporateActions] = useState<CorporateActionAssessment[]>([]);
   const [corporateActionAI, setCorporateActionAI] = useState<CorporateActionAIAnalysis[]>([]);
   const [financialResultReport, setFinancialResultReport] = useState<FinancialResultCheckReport | null>(null);
-  const [approvedStocksExpanded, setApprovedStocksExpanded] = useState(true);
+  const [activeAnalysisTab, setActiveAnalysisTab] = useState<AnalysisTab>("opportunities");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -963,45 +1001,32 @@ function Dashboard() {
 
       <MarketContextPanel context={context} regime={marketRegime} />
 
-      <OpportunityRankingBoard rows={opportunities} />
-
-      <FeatureMatrix features={features} />
-
-      <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />
-
-      <EvidenceBoard rows={evidence} />
-
-      <DailyRegimePanel regimes={regimes} />
-
-      <section className="table-card">
-        <div className="table-heading">
-          <div><h2>Approved stocks</h2><p>Latest available one-minute values</p></div>
-          <div className="table-heading-actions"><span>Refreshes every 5 seconds · calculations every 60 seconds</span><SectionToggle expanded={approvedStocksExpanded} onToggle={() => setApprovedStocksExpanded((value) => !value)} label="Approved stocks" /></div>
+      <section className="analysis-workspace" aria-label="Market analysis workspace">
+        <div className="analysis-tabs" role="tablist" aria-label="Analysis sections">
+          {ANALYSIS_TABS.map((tab) => (
+            <button
+              className={`analysis-tab ${activeAnalysisTab === tab.id ? "active" : ""}`}
+              id={`analysis-tab-${tab.id}`}
+              key={tab.id}
+              type="button"
+              role="tab"
+              aria-selected={activeAnalysisTab === tab.id}
+              aria-controls={`analysis-panel-${tab.id}`}
+              tabIndex={activeAnalysisTab === tab.id ? 0 : -1}
+              onClick={() => setActiveAnalysisTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
         </div>
-        {approvedStocksExpanded && <div className="table-scroll" id="approved-stocks-content">
-          <table>
-            <thead><tr><th>Stock</th><th>Sector</th><th>LTP</th><th>Change</th><th>1m O / H / L / C</th><th>Volume</th><th>RVOL</th><th>Spread</th><th>State</th></tr></thead>
-            <tbody>
-              {stocks.map((stock) => (
-                <tr key={stock.instrument_key}>
-                  <td><strong>{stock.symbol}</strong><small>{stock.company_name}</small></td>
-                  <td>{stock.sector ?? "—"}</td>
-                  <td className="numeric">{number(stock.ltp)}</td>
-                  <td className={`numeric ${(stock.change_percent ?? 0) > 0 ? "positive" : (stock.change_percent ?? 0) < 0 ? "negative" : ""}`}>
-                    {stock.change_percent == null ? "—" : `${stock.change_percent > 0 ? "+" : ""}${number(stock.change_percent)}%`}
-                  </td>
-                  <td className="numeric candle-values">{[stock.open, stock.high, stock.low, stock.close].map((value) => number(value)).join(" / ")}</td>
-                  <td className="numeric">{integer(stock.volume)}</td>
-                  <td className="numeric" title={stock.relative_volume == null ? "No current-session comparable RVOL is available yet" : "Relative volume for the latest completed one-minute candle"}>
-                    {stock.relative_volume == null ? "N/A" : `${number(stock.relative_volume)}x`}
-                  </td>
-                  <td className="numeric">{stock.spread_bps == null ? "—" : `${number(stock.spread_bps)} bps`}</td>
-                  <td><span className={`data-badge ${stock.data_state}`}>{stock.data_state}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>}
+        <div className="analysis-tab-panel" id={`analysis-panel-${activeAnalysisTab}`} role="tabpanel" aria-labelledby={`analysis-tab-${activeAnalysisTab}`}>
+          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} />}
+          {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} />}
+          {activeAnalysisTab === "corporate" && <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />}
+          {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} />}
+          {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} />}
+          {activeAnalysisTab === "stocks" && <ApprovedStocksPanel stocks={stocks} />}
+        </div>
       </section>
 
       <section className="financial-utility-card">
