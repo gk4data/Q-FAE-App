@@ -16,9 +16,11 @@ Q-FAE records what the system knew at each completed minute before any strategy 
 - **Safe adjusted-series overlay:** raw provider candles remain untouched. Versioned dividend, bonus and verified face-value split factors produce a separate adjusted-candle response; ambiguous mechanical terms are marked `unavailable` instead of guessed.
 - **Official filing evidence:** preparation best-effort synchronizes matching NSE corporate announcements, their attachment URLs, exchange text and untouched response metadata. A filing outage is reported but cannot stop market history preparation.
 - **Financial context:** Upstox quarterly consolidated income-statement and cash-flow facts are stored separately from event facts and interpretations.
+- **Financial-result cache:** quarterly income statements and annual income, cash-flow and balance-sheet responses are content-versioned. Latest-quarter snapshots younger than 30 days are reused per stock by both preparation and the dashboard utility.
 - **Grounded AI adapter:** AI interpretation is opt-in. It runs only with an explicitly configured model and supporting documents, uses strict structured output, stores no API response at OpenAI, and rejects scores that do not cite a supplied document ID.
 - **Event outcomes and calibration:** 1/5/20-session raw and NIFTY-relative returns are recorded. Category/direction buckets require at least 30 observations before being labelled ready; the report never changes live weights automatically.
-- **Live evidence context:** active events and their deterministic or grounded-AI impact appear beside the minute evidence. They are contextual and remain outside confluence weights until outcome validation is sufficient.
+- **Live evidence context:** active events and their deterministic or grounded-AI impact appear beside the minute evidence. They remain outside the raw confluence; the separate pilot ranking uses them only in its bounded 5% catalyst component.
+- **Explainable pilot ranking:** every completed-minute evidence record now includes a versioned long-continuation score. Component weights, contributions, coverage, persistence adjustment and invalidating risk gates remain inspectable; the model is explicitly labelled provisional until backtested.
 
 ## API
 
@@ -33,6 +35,7 @@ Q-FAE records what the system knew at each completed minute before any strategy 
 - `GET /api/v1/market/corporate-action-ai`
 - `GET /api/v1/market/corporate-action-outcomes`
 - `GET /api/v1/market/corporate-action-calibration`
+- `GET /api/v1/market/opportunities`
 
 The existing `GET /api/v1/market/evidence` response now includes `signal_persistence`, `risk_assessment`, `corporate_action_context`, and an explicit `derivatives_confirmation` availability state.
 

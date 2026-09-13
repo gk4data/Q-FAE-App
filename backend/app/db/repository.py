@@ -23,11 +23,13 @@ from app.db.models import (
     CorporateActionOutcomeRecord,
     CorporateFinancialContextRecord,
     EvidenceObservationRecord,
+    FinancialResultSnapshotRecord,
+    FinancialMetricSnapshotRecord,
     MarketCandleRecord,
     MinuteOfDayProfileRecord,
     SessionReconciliationRecord,
 )
-from app.models.market import AdjustedCandle, Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, MinuteOfDayProfile
+from app.models.market import AdjustedCandle, Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, MinuteOfDayProfile
 from app.services.corporate_action_pipeline import adjust_candles
 from app.services.evidence_outcomes import evaluate_observation
 from app.services.market_context import INDIA_TIMEZONE
@@ -539,6 +541,86 @@ class HistoricalMarketRepository:
             return None
         return CorporateFinancialContext(isin=r.isin, instrument_key=r.instrument_key, symbol=r.symbol, statement_type=r.statement_type, latest_revenue_crore=float(r.latest_revenue_crore) if r.latest_revenue_crore is not None else None, latest_operating_profit_crore=float(r.latest_operating_profit_crore) if r.latest_operating_profit_crore is not None else None, latest_net_profit_crore=float(r.latest_net_profit_crore) if r.latest_net_profit_crore is not None else None, latest_operating_cash_flow_crore=float(r.latest_operating_cash_flow_crore) if r.latest_operating_cash_flow_crore is not None else None, revenue_period=r.revenue_period, cash_flow_period=r.cash_flow_period, raw_payload=dict(r.raw_payload), data_quality=r.data_quality, fetched_at=r.fetched_at)
 
+    def upsert_financial_result_snapshot(self, item: FinancialResultSnapshot) -> None:
+        payload = item.model_dump()
+        statement = insert(FinancialResultSnapshotRecord).values(payload)
+        with self.engine.begin() as connection:
+            connection.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["snapshot_id"],
+                    set_={
+                        "instrument_key": statement.excluded.instrument_key,
+                        "symbol": statement.excluded.symbol,
+                        "quarterly_period": statement.excluded.quarterly_period,
+                        "annual_period": statement.excluded.annual_period,
+                        "quarterly_available": statement.excluded.quarterly_available,
+                        "annual_available": statement.excluded.annual_available,
+                        "last_seen_at": statement.excluded.last_seen_at,
+                        "updated_at": func.now(),
+                    },
+                )
+            )
+
+    def get_latest_financial_result_snapshot(
+        self,
+        *,
+        isin: str | None = None,
+        instrument_key: str | None = None,
+    ) -> FinancialResultSnapshot | None:
+        query = select(FinancialResultSnapshotRecord)
+        if isin:
+            query = query.where(FinancialResultSnapshotRecord.isin == isin)
+        if instrument_key:
+            query = query.where(FinancialResultSnapshotRecord.instrument_key == instrument_key)
+        query = query.order_by(FinancialResultSnapshotRecord.last_seen_at.desc()).limit(1)
+        with Session(self.engine) as session:
+            record = session.scalar(query)
+        return self._to_financial_result_snapshot(record) if record else None
+
+    def get_latest_financial_result_snapshots(
+        self, instrument_keys: Sequence[str]
+    ) -> dict[str, FinancialResultSnapshot]:
+        return {
+            key: snapshot
+            for key in instrument_keys
+            if (snapshot := self.get_latest_financial_result_snapshot(instrument_key=key))
+        }
+
+    def upsert_financial_metric_snapshot(self, item: FinancialMetricSnapshot) -> None:
+        payload = item.model_dump()
+        payload["metrics_payload"] = {
+            "growth": payload.pop("growth"),
+            "margins": payload.pop("margins"),
+            "capital": payload.pop("capital"),
+            "eps": payload.pop("eps"),
+        }
+        statement = insert(FinancialMetricSnapshotRecord).values(payload)
+        with self.engine.begin() as connection:
+            connection.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["source_snapshot_id", "calculation_version"],
+                    set_={
+                        key: getattr(statement.excluded, key)
+                        for key in payload
+                        if key not in {"source_snapshot_id", "calculation_version"}
+                    },
+                )
+            )
+
+    def get_financial_metric_snapshots(
+        self,
+        *,
+        instrument_key: str | None = None,
+        limit: int = 500,
+    ) -> list[FinancialMetricSnapshot]:
+        query = select(FinancialMetricSnapshotRecord)
+        if instrument_key:
+            query = query.where(FinancialMetricSnapshotRecord.instrument_key == instrument_key)
+        query = query.order_by(FinancialMetricSnapshotRecord.calculated_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        return [self._to_financial_metric_snapshot(record) for record in records]
+
     def upsert_corporate_action_ai_analyses(self, rows: Iterable[CorporateActionAIAnalysis]) -> int:
         values = list(rows)
         with self.engine.begin() as connection:
@@ -804,4 +886,47 @@ class HistoricalMarketRepository:
             cautions=list(record.cautions),
             requires_ai_review=record.requires_ai_review,
             assessed_at=record.assessed_at,
+        )
+
+    @staticmethod
+    def _to_financial_result_snapshot(
+        record: FinancialResultSnapshotRecord,
+    ) -> FinancialResultSnapshot:
+        return FinancialResultSnapshot(
+            snapshot_id=record.snapshot_id,
+            isin=record.isin,
+            instrument_key=record.instrument_key,
+            symbol=record.symbol,
+            statement_type=record.statement_type,
+            quarterly_period=record.quarterly_period,
+            annual_period=record.annual_period,
+            quarterly_available=record.quarterly_available,
+            annual_available=record.annual_available,
+            raw_payload=dict(record.raw_payload),
+            captured_at=record.captured_at,
+            last_seen_at=record.last_seen_at,
+        )
+
+    @staticmethod
+    def _to_financial_metric_snapshot(
+        record: FinancialMetricSnapshotRecord,
+    ) -> FinancialMetricSnapshot:
+        payload = dict(record.metrics_payload)
+        return FinancialMetricSnapshot(
+            source_snapshot_id=record.source_snapshot_id,
+            calculation_version=record.calculation_version,
+            isin=record.isin,
+            instrument_key=record.instrument_key,
+            symbol=record.symbol,
+            latest_quarter=record.latest_quarter,
+            latest_annual_period=record.latest_annual_period,
+            growth=payload.get("growth", {}),
+            margins=payload.get("margins", {}),
+            capital=payload.get("capital", {}),
+            eps=payload.get("eps", {}),
+            data_quality=record.data_quality,
+            unavailable=list(record.unavailable),
+            cautions=list(record.cautions),
+            formulas=dict(record.formulas),
+            calculated_at=record.calculated_at,
         )

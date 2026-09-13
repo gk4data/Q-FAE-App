@@ -11,5 +11,4 @@ Q-FAE combines its implemented measurements into four transparent pillars withou
 
 Each available check contributes either supportive evidence or a caution within its own pillar. The confluence label (`strong_support`, `supportive`, `mixed`, `caution`, or `insufficient`) counts pillar classifications equally; it is not a weighted score. Missing, stale, limited-history, unmapped-sector, and future-dated inputs remain visible in `validation_notes` rather than being converted to neutral zeros.
 
-The dashboard and `GET /api/v1/market/evidence` expose these results. Final weights, thresholds, ranking, and any direction-specific strategy must be selected only after point-in-time validation and backtesting.
-
+The dashboard and `GET /api/v1/market/evidence` expose these raw results. Pilot-v1 consumes them through the separately versioned [opportunity-ranking layer](opportunity-ranking.md). The ranking weights and thresholds are visibly provisional and must be calibrated with point-in-time outcomes before they are treated as predictive.

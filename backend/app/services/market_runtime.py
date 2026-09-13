@@ -20,13 +20,18 @@ from app.models.market import (
     CorporateActionCalibrationReport,
     CorporateActionDocument,
     CorporateActionOutcome,
+    CorporateFinancialContext,
     DailyReconciliationRecord,
     DailyRegimeSnapshot,
     EvidenceOutcomeObservation,
+    FinancialResultAvailability,
+    FinancialResultCheckReport,
+    FinancialMetricSnapshot,
     FlowLiquidityConfirmation,
     LiveSnapshot,
     MinuteOfDayProfile,
     OpportunityEvidenceSnapshot,
+    RankedOpportunity,
     RelativeVolumeMetric,
     StockFeatureSnapshot,
     RiskAssessment,
@@ -51,6 +56,12 @@ from app.services.corporate_action_pipeline import (
 from app.services.equity_universe import EquityUniverseService
 from app.services.evidence_integration import build_opportunity_evidence
 from app.services.flow_confirmation import build_flow_liquidity_confirmation
+from app.services.financial_results import (
+    context_from_financial_snapshot,
+    snapshot_is_reusable,
+)
+from app.services.financial_metrics import calculate_financial_metrics
+from app.services.opportunity_scoring import build_opportunity_score, rank_opportunities
 from app.services.market_regime import build_market_regime
 from app.services.market_features import build_stock_features
 from app.services.market_context import INDIA_TIMEZONE, build_market_context, calculate_relative_volume
@@ -127,6 +138,7 @@ class MarketRuntime:
             "corporate_adjustments_built": 0,
             "corporate_documents_stored": 0,
             "corporate_financial_contexts": 0,
+            "financial_results_reused": 0,
             "corporate_ai_analyzed": 0,
             "corporate_outcomes_evaluated": 0,
             "errors": 0,
@@ -349,7 +361,7 @@ class MarketRuntime:
             raise MarketRuntimeError("PostgreSQL minute profiles are unavailable") from exc
 
     def get_opportunity_evidence(self, limit: int | None = None) -> list[OpportunityEvidenceSnapshot]:
-        """Combine validated feature families without applying strategy weights."""
+        """Return validated feature families and their stored point-in-time score."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
         features = self.state_store.get_features()
@@ -394,6 +406,36 @@ class MarketRuntime:
             "insufficient": 4,
         }
         return sorted(rows, key=lambda row: (confluence_order.get(row.confluence, 9), row.symbol))
+
+    def get_ranked_opportunities(self, limit: int | None = None) -> list[RankedOpportunity]:
+        """Rank current long-continuation candidates with explicit coverage and gates."""
+        evidence = self.get_opportunity_evidence(limit)
+        market_regime = self.state_store.get_market_regime()
+        features = self.state_store.get_features()
+        snapshots = {
+            snapshot.instrument_key: snapshot
+            for snapshot in self.state_store.get_snapshots()
+        }
+        evidence = [
+            item.model_copy(update={"market_regime": market_regime})
+            for item in evidence
+        ]
+        try:
+            return rank_opportunities(
+                evidence,
+                self._latest_financial_metrics_by_instrument(),
+                {
+                    key: feature.relative_strength.session_return_percent
+                    for key, feature in features.items()
+                },
+                {
+                    key: snapshot.ltp if snapshot.ltp is not None and snapshot.ltp > 0 else None
+                    for key, snapshot in snapshots.items()
+                },
+                weights=self._opportunity_scoring_weights(),
+            )
+        except ValueError as exc:
+            raise MarketRuntimeError(f"Opportunity scoring configuration is invalid: {exc}") from exc
 
     def get_risk_assessments(self, limit: int | None = None) -> list[RiskAssessment]:
         instruments = self._resolved_instruments(limit)
@@ -517,6 +559,59 @@ class MarketRuntime:
         except Exception as exc:
             raise MarketRuntimeError("Corporate-action calibration is unavailable") from exc
 
+    def check_financial_results(
+        self,
+        limit: int | None = None,
+    ) -> FinancialResultCheckReport:
+        """Check the pilot universe, reusing latest-quarter snapshots younger than the cache window."""
+        if self.historical_repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        instruments = self._resolved_instruments(limit)
+        limiter = RequestRateLimiter(
+            self.settings.qfae_market_request_rate_per_second,
+            self.settings.qfae_market_request_rate_per_minute,
+        )
+        items: list[FinancialResultAvailability] = []
+        with UpstoxMarketDataClient(self._require_access_token(), limiter) as client:
+            for instrument in instruments:
+                try:
+                    item, _ = self._sync_financial_result(client, instrument)
+                except Exception as exc:
+                    item = FinancialResultAvailability(
+                        instrument_key=instrument["instrument_key"],
+                        symbol=instrument["symbol"],
+                        isin=instrument.get("isin"),
+                        state="failed",
+                        reason=f"provider_check_failed:{type(exc).__name__}",
+                    )
+                items.append(item)
+        return FinancialResultCheckReport(
+            generated_at=datetime.now(UTC),
+            cache_days=self.settings.qfae_financial_results_cache_days,
+            total=len(items),
+            fetched=sum(item.state == "fetched" for item in items),
+            reused=sum(item.state == "reused" for item in items),
+            unavailable=sum(item.state == "unavailable" for item in items),
+            failed=sum(item.state == "failed" for item in items),
+            items=items,
+        )
+
+    def get_financial_metrics(
+        self,
+        *,
+        instrument_key: str | None = None,
+        limit: int = 500,
+    ) -> list[FinancialMetricSnapshot]:
+        if self.historical_repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        try:
+            return self.historical_repository.get_financial_metric_snapshots(
+                instrument_key=instrument_key,
+                limit=limit,
+            )
+        except Exception as exc:
+            raise MarketRuntimeError("Financial metric snapshots are unavailable") from exc
+
     def get_flow_confirmations(self, limit: int | None = None) -> list[FlowLiquidityConfirmation]:
         """Return current-session volume and executable-liquidity confirmation."""
         self._require_state_store()
@@ -592,6 +687,7 @@ class MarketRuntime:
                 "corporate_adjustments_built": 0,
                 "corporate_documents_stored": 0,
                 "corporate_financial_contexts": 0,
+                "financial_results_reused": 0,
                 "corporate_ai_analyzed": 0,
                 "corporate_outcomes_evaluated": 0,
                 "errors": 0,
@@ -887,6 +983,7 @@ class MarketRuntime:
             "corporate_adjustments_built": 0,
             "corporate_documents_stored": 0,
             "corporate_financial_contexts": 0,
+            "financial_results_reused": 0,
             "corporate_ai_analyzed": 0,
             "corporate_outcomes_evaluated": 0,
         }
@@ -941,11 +1038,15 @@ class MarketRuntime:
                     financial_context = None
                     if isin:
                         try:
-                            financial_context = client.fetch_corporate_financial_context(
-                                isin, key, symbol
+                            financial_status, financial_context = self._sync_financial_result(
+                                client, instrument
                             )
-                            repository.upsert_corporate_financial_context(financial_context)
-                            counters["corporate_financial_contexts"] += 1
+                            counters["corporate_financial_contexts"] += int(
+                                financial_status.state == "fetched"
+                            )
+                            counters["financial_results_reused"] += int(
+                                financial_status.state == "reused"
+                            )
                         except Exception as exc:
                             errors.append(f"{symbol}: financial context: {type(exc).__name__}")
 
@@ -1055,6 +1156,88 @@ class MarketRuntime:
             if ai_scorer is not None:
                 ai_scorer.close()
         return counters, errors
+
+    def _sync_financial_result(
+        self,
+        client: UpstoxMarketDataClient,
+        instrument: dict[str, str],
+    ) -> tuple[FinancialResultAvailability, CorporateFinancialContext | None]:
+        repository = self.historical_repository
+        if repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        key = instrument["instrument_key"]
+        symbol = instrument["symbol"]
+        isin = instrument.get("isin")
+        if not isin:
+            return (
+                FinancialResultAvailability(
+                    instrument_key=key,
+                    symbol=symbol,
+                    state="unavailable",
+                    reason="isin_unavailable",
+                ),
+                None,
+            )
+        now = datetime.now(UTC)
+        snapshot = repository.get_latest_financial_result_snapshot(isin=isin)
+        if snapshot_is_reusable(
+            snapshot,
+            now=now,
+            cache_days=self.settings.qfae_financial_results_cache_days,
+        ):
+            context = repository.get_corporate_financial_context(isin)
+            if context is None and snapshot is not None:
+                context = context_from_financial_snapshot(snapshot)
+                repository.upsert_corporate_financial_context(context)
+            if snapshot is not None:
+                repository.upsert_financial_metric_snapshot(
+                    calculate_financial_metrics(snapshot)
+                )
+            return (
+                FinancialResultAvailability(
+                    instrument_key=key,
+                    symbol=symbol,
+                    isin=isin,
+                    state="reused",
+                    reason="latest_quarter_snapshot_younger_than_cache_window",
+                    quarterly_period=snapshot.quarterly_period if snapshot else None,
+                    annual_period=snapshot.annual_period if snapshot else None,
+                    quarterly_available=bool(snapshot and snapshot.quarterly_available),
+                    annual_available=bool(snapshot and snapshot.annual_available),
+                    snapshot_at=snapshot.last_seen_at if snapshot else None,
+                    cache_fresh=True,
+                ),
+                context,
+            )
+        snapshot, context = client.fetch_financial_results(isin, key, symbol)
+        repository.upsert_financial_result_snapshot(snapshot)
+        repository.upsert_corporate_financial_context(context)
+        repository.upsert_financial_metric_snapshot(calculate_financial_metrics(snapshot))
+        available = snapshot.quarterly_available or snapshot.annual_available
+        return (
+            FinancialResultAvailability(
+                instrument_key=key,
+                symbol=symbol,
+                isin=isin,
+                state="fetched" if available else "unavailable",
+                reason=(
+                    "provider_snapshot_stored"
+                    if available
+                    else "provider_has_no_quarterly_or_annual_results"
+                ),
+                quarterly_period=snapshot.quarterly_period,
+                annual_period=snapshot.annual_period,
+                quarterly_available=snapshot.quarterly_available,
+                annual_available=snapshot.annual_available,
+                snapshot_at=snapshot.last_seen_at,
+                cache_fresh=snapshot_is_reusable(
+                    snapshot,
+                    now=now,
+                    cache_days=self.settings.qfae_financial_results_cache_days,
+                ),
+            ),
+            context,
+        )
 
     def _prepare_minute_history(
         self,
@@ -1435,6 +1618,7 @@ class MarketRuntime:
         previous_signals = self.state_store.get_signals()
         corporate_contexts = self.state_store.get_corporate_action_contexts()
         repository = self.historical_repository
+        financial_metrics = self._latest_financial_metrics_by_instrument()
         for feature in features:
             try:
                 if feature.as_of != as_of:
@@ -1485,7 +1669,17 @@ class MarketRuntime:
                     update={
                         "signal_persistence": signal,
                         "risk_assessment": risk,
+                        "market_regime": market_regime,
                         "corporate_action_context": corporate_contexts.get(feature.instrument_key),
+                    }
+                )
+                evidence = evidence.model_copy(
+                    update={
+                        "opportunity_score": build_opportunity_score(
+                            evidence,
+                            financial_metrics.get(feature.instrument_key),
+                            weights=self._opportunity_scoring_weights(),
+                        )
                     }
                 )
                 self.state_store.save_signal(signal)
@@ -1521,6 +1715,29 @@ class MarketRuntime:
                 )
             except Exception:
                 logger.exception("Could not record minute evidence for %s", feature.symbol)
+
+    def _opportunity_scoring_weights(self) -> dict[str, float]:
+        return {
+            "price_trend": self.settings.qfae_score_weight_price_trend,
+            "participation": self.settings.qfae_score_weight_participation,
+            "market_sector": self.settings.qfae_score_weight_market_sector,
+            "liquidity_execution": self.settings.qfae_score_weight_liquidity_execution,
+            "fundamental": self.settings.qfae_score_weight_fundamental,
+            "catalyst": self.settings.qfae_score_weight_catalyst,
+        }
+
+    def _latest_financial_metrics_by_instrument(self) -> dict[str, FinancialMetricSnapshot]:
+        repository = self.historical_repository
+        if repository is None:
+            return {}
+        try:
+            result: dict[str, FinancialMetricSnapshot] = {}
+            for item in repository.get_financial_metric_snapshots(limit=5000):
+                result.setdefault(item.instrument_key, item)
+            return result
+        except Exception:
+            logger.exception("Could not load financial metrics for opportunity scoring")
+            return {}
 
     def _profile_relative_volume(self, candle: Candle) -> float | None:
         repository = self.historical_repository

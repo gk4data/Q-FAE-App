@@ -24,11 +24,14 @@ from app.models.market import (
     DailyReconciliationRecord,
     DailyRegimeSnapshot,
     EvidenceOutcomeObservation,
+    FinancialResultCheckReport,
+    FinancialMetricSnapshot,
     FlowLiquidityConfirmation,
     MarketContext,
     MarketRegimeSnapshot,
     MinuteOfDayProfile,
     OpportunityEvidenceSnapshot,
+    RankedOpportunity,
     RiskAssessment,
     StockFeatureSnapshot,
     WatchlistItem,
@@ -157,6 +160,17 @@ def get_opportunity_evidence(
     """Return validated, unweighted confluence across the implemented evidence families."""
     try:
         return get_market_runtime().get_opportunity_evidence(limit)
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.get("/opportunities", response_model=list[RankedOpportunity])
+def get_ranked_opportunities(
+    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+) -> list[RankedOpportunity]:
+    """Return the provisional, explainable long-continuation ranking."""
+    try:
+        return get_market_runtime().get_ranked_opportunities(limit)
     except MarketRuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
@@ -309,6 +323,32 @@ def get_corporate_action_calibration() -> CorporateActionCalibrationReport:
     """Report outcome buckets; samples under 30 remain explicitly uncalibrated."""
     try:
         return get_market_runtime().get_corporate_action_calibration()
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.post("/financial-results/check", response_model=FinancialResultCheckReport)
+def check_financial_results(
+    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+) -> FinancialResultCheckReport:
+    """Check quarterly/annual availability, reusing protected recent snapshots by default."""
+    try:
+        return get_market_runtime().check_financial_results(limit)
+    except MarketRuntimeError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.get("/financial-metrics", response_model=list[FinancialMetricSnapshot])
+def get_financial_metrics(
+    instrument_key: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
+) -> list[FinancialMetricSnapshot]:
+    """Return versioned, deterministic statement-derived metrics without model weights."""
+    try:
+        return get_market_runtime().get_financial_metrics(
+            instrument_key=instrument_key,
+            limit=limit,
+        )
     except MarketRuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 

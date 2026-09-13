@@ -176,6 +176,37 @@ def _intraday_pillar(feature: StockFeatureSnapshot) -> EvidencePillar:
             "efficient_upward_path",
             "efficient_downward_path",
         )
+    gap = feature.gap
+    if gap.gap_percent is not None and gap.gap_percent > 0 and gap.state != "flat_open":
+        pillar.check(
+            gap.retention_percent,
+            gap.state in {"holding", "extending"},
+            "positive_gap_retained",
+            "positive_gap_fading_or_filled",
+        )
+    elif gap.gap_percent is not None and gap.gap_percent < 0 and gap.state != "flat_open":
+        pillar.check(
+            gap.retention_percent,
+            gap.state == "filled_or_reversed",
+            "negative_gap_recovered",
+            "negative_gap_retained",
+        )
+    pullback = feature.pullback
+    if pullback.direction in {"up", "down"} and pullback.quality != "unavailable":
+        pillar.check(
+            pullback.quality,
+            pullback.direction == "up" and pullback.quality in {"holding_extreme", "orderly"},
+            "constructive_uptrend_pullback",
+            "pullback_or_direction_unsupportive",
+        )
+    range_atr = feature.volatility.session_range_atr
+    if range_atr is not None and momentum is not None and range_atr >= 0.7:
+        pillar.check(
+            range_atr,
+            momentum > 0,
+            "positive_volatility_expansion",
+            "negative_volatility_expansion",
+        )
     return pillar.build()
 
 

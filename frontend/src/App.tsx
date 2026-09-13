@@ -7,7 +7,7 @@ type RuntimeStatus = {
   pilot_size: number;
   redis_available: boolean;
   database_available: boolean;
-  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; corporate_actions_synced: number; corporate_actions_stored: number; corporate_actions_assessed: number; corporate_adjustments_built: number; corporate_documents_stored: number; corporate_financial_contexts: number; corporate_ai_analyzed: number; corporate_outcomes_evaluated: number; errors: number };
+  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; corporate_actions_synced: number; corporate_actions_stored: number; corporate_actions_assessed: number; corporate_adjustments_built: number; corporate_documents_stored: number; corporate_financial_contexts: number; financial_results_reused: number; corporate_ai_analyzed: number; corporate_outcomes_evaluated: number; errors: number };
   live: { state: string; connected: boolean; subscribed: number; last_message_at: string | null; scheduled_stop_at: string | null; error: string | null };
   reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
@@ -247,6 +247,45 @@ type OpportunityEvidence = {
   validation_notes: string[];
 };
 
+type OpportunityScoreComponent = {
+  key: string;
+  label: string;
+  weight_percent: number;
+  score: number | null;
+  coverage_percent: number;
+  contribution_points: number;
+  positive_factors: string[];
+  cautions: string[];
+  unavailable_inputs: string[];
+};
+
+type RankedOpportunity = {
+  rank: number | null;
+  instrument_key: string;
+  symbol: string;
+  sector: string | null;
+  as_of: string;
+  current_market_price: number | null;
+  session_return_percent: number | null;
+  score: {
+    model_version: string;
+    strategy: string;
+    calibration_status: string;
+    evidence_score: number;
+    coverage_percent: number;
+    coverage_adjusted_score: number;
+    persistence_multiplier: number;
+    final_score: number;
+    eligible: boolean;
+    status: "high_priority" | "promising" | "watch" | "low_conviction" | "ineligible" | "insufficient_data";
+    weights: Record<string, number>;
+    components: OpportunityScoreComponent[];
+    top_positive_factors: string[];
+    top_cautions: string[];
+    invalidation_reasons: string[];
+  };
+};
+
 type CorporateActionAssessment = {
   event_id: string;
   assessment_version: number;
@@ -278,6 +317,28 @@ type CorporateActionAIAnalysis = {
   citation_document_ids: string[];
   grounded: boolean;
   error: string | null;
+};
+
+type FinancialResultCheckReport = {
+  generated_at: string;
+  cache_days: number;
+  total: number;
+  fetched: number;
+  reused: number;
+  unavailable: number;
+  failed: number;
+  items: Array<{
+    instrument_key: string;
+    symbol: string;
+    state: "fetched" | "reused" | "unavailable" | "failed";
+    reason: string;
+    quarterly_period: string | null;
+    annual_period: string | null;
+    quarterly_available: boolean;
+    annual_available: boolean;
+    snapshot_at: string | null;
+    cache_fresh: boolean;
+  }>;
 };
 
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
@@ -427,13 +488,14 @@ function MetricLine({ label, value, valueClass = "" }: { label: string; value: s
 }
 
 function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
+  const [expanded, setExpanded] = useState(true);
   return (
     <section className="table-card regime-card">
       <div className="table-heading">
         <div><h2>Daily regime evidence</h2><p>Independent horizons reveal established trends, pullbacks and new transitions</p></div>
-        <span>Long history provides context; it never blocks fresh strength</span>
+        <div className="table-heading-actions"><span>Long history provides context; it never blocks fresh strength</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Daily regime evidence" /></div>
       </div>
-      <div className="table-scroll">
+      {expanded && <div className="table-scroll" id="daily-regime-content">
         <table className="regime-table">
           <thead><tr><th>Stock</th><th>5 / 20 / 60 / 120 / 250 sessions</th><th>Trend alignment</th><th>Price structure</th><th>Participation</th><th>Volatility</th><th>Evidence and cautions</th></tr></thead>
           <tbody>
@@ -496,12 +558,17 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
             )}
           </tbody>
         </table>
-      </div>
+      </div>}
     </section>
   );
 }
 
+function SectionToggle({ expanded, onToggle, label }: { expanded: boolean; onToggle: () => void; label: string }) {
+  return <button className="section-toggle" type="button" aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`} onClick={onToggle}><span aria-hidden="true">{expanded ? "−" : "+"}</span>{expanded ? "Collapse" : "Expand"}</button>;
+}
+
 function FeatureMatrix({ features }: { features: StockFeatures[] }) {
+  const [expanded, setExpanded] = useState(true);
   const openingRange = (feature: StockFeatures, minutes: number) =>
     feature.opening_ranges.find((range) => range.minutes === minutes);
 
@@ -509,9 +576,9 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
     <section className="table-card feature-card">
       <div className="table-heading">
         <div><h2>Intraday feature matrix</h2><p>Nine explainable factor groups, recalculated after every completed minute</p></div>
-        <span>No composite score or model weighting yet</span>
+        <div className="table-heading-actions"><span>Raw factor detail behind the pilot opportunity score</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Intraday feature matrix" /></div>
       </div>
-      <div className="table-scroll">
+      {expanded && <div className="table-scroll" id="intraday-feature-content">
         <table className="feature-table">
           <thead>
             <tr>
@@ -592,19 +659,58 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
             )}
           </tbody>
         </table>
+      </div>}
+    </section>
+  );
+}
+
+function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
+  const [expanded, setExpanded] = useState(true);
+  const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental", "catalyst"];
+  return (
+    <section className="table-card opportunity-card">
+      <div className="table-heading">
+        <div><h2>Explainable opportunity ranking</h2><p>Coverage-adjusted long-continuation candidates, recalculated every completed minute</p></div>
+        <div className="table-heading-actions"><span>Pilot v1 · provisional weights · not yet backtested</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Explainable opportunity ranking" /></div>
       </div>
+      {expanded && <div className="table-scroll" id="opportunity-ranking-content">
+        <table className="opportunity-table">
+          <thead><tr><th>Rank</th><th>Stock</th><th>CMP</th><th>Opportunity score</th>{componentKeys.map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}<th>Why it ranks</th><th>Risk / missing</th></tr></thead>
+          <tbody>
+            {rows.map((row) => {
+              const components = Object.fromEntries(row.score.components.map((component) => [component.key, component]));
+              return (
+                <tr key={row.instrument_key}>
+                  <td className="rank-cell">{row.rank ?? "—"}</td>
+                  <td><strong>{row.symbol}</strong><small>{row.sector ?? "Sector unavailable"}</small><span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span></td>
+                  <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong><span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span><small>Current market session</small></td>
+                  <td><strong className="opportunity-score">{number(row.score.final_score, 1)}</strong><small>Evidence {number(row.score.evidence_score, 1)} · coverage {number(row.score.coverage_percent, 0)}%</small><small>Persistence ×{number(row.score.persistence_multiplier, 2)}</small></td>
+                  {componentKeys.map((key) => {
+                    const component = components[key];
+                    return <td key={key}>{component ? <><strong>{component.score == null ? "N/A" : number(component.score, 0)}</strong><small>{number(component.weight_percent, 0)}% weight · {number(component.coverage_percent, 0)}% covered</small><small>{number(component.contribution_points, 1)} points</small></> : "N/A"}</td>;
+                  })}
+                  <td className="tag-cell">{row.score.top_positive_factors.slice(0, 4).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.score.top_positive_factors.length && <span className="factor-state">No strong positive evidence</span>}</td>
+                  <td className="tag-cell">{[...row.score.invalidation_reasons, ...row.score.top_cautions].slice(0, 5).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.score.invalidation_reasons.length && !row.score.top_cautions.length && <span className="evidence-tag">No active caution</span>}</td>
+                </tr>
+              );
+            })}
+            {!rows.length && <tr><td className="feature-empty" colSpan={12}>Waiting for completed-minute evidence and risk checks before ranking opportunities.</td></tr>}
+          </tbody>
+        </table>
+      </div>}
     </section>
   );
 }
 
 function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
+  const [expanded, setExpanded] = useState(true);
   return (
     <section className="table-card evidence-card">
       <div className="table-heading">
         <div><h2>Validated evidence confluence</h2><p>Intraday, daily, market-relative, volume and liquidity evidence in one view</p></div>
-        <span>Transparent classifications only · no strategy weights</span>
+        <div className="table-heading-actions"><span>Underlying evidence used by the provisional ranking model</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Validated evidence confluence" /></div>
       </div>
-      <div className="table-scroll">
+      {expanded && <div className="table-scroll" id="validated-evidence-content">
         <table className="evidence-table">
           <thead><tr><th>Stock</th><th>Confluence</th><th>Persistence</th><th>Risk gates</th><th>Intraday</th><th>Daily regime</th><th>NIFTY / sector</th><th>Volume / liquidity</th><th>Corporate event</th><th>Validation</th></tr></thead>
           <tbody>
@@ -642,21 +748,22 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
             {!rows.length && <tr><td className="feature-empty" colSpan={10}>Waiting for current-session feature evidence.</td></tr>}
           </tbody>
         </table>
-      </div>
+      </div>}
     </section>
   );
 }
 
 function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessment[]; analyses: CorporateActionAIAnalysis[] }) {
+  const [expanded, setExpanded] = useState(true);
   if (!rows.length) return null;
   const aiByEvent = Object.fromEntries(analyses.map((item) => [item.event_id, item]));
   return (
     <section className="table-card corporate-action-card">
       <div className="table-heading">
         <div><h2>Corporate-action materiality</h2><p>Deterministic event metrics based on facts and the pre-event close</p></div>
-        <span>Versioned rules · AI is optional and source-grounded</span>
+        <div className="table-heading-actions"><span>Versioned rules · AI is optional and source-grounded</span><SectionToggle expanded={expanded} onToggle={() => setExpanded((value) => !value)} label="Corporate-action materiality" /></div>
       </div>
-      <div className="table-scroll">
+      {expanded && <div className="table-scroll" id="corporate-action-content">
         <table className="corporate-action-table">
           <thead><tr><th>Stock</th><th>Action</th><th>Direction</th><th>Materiality</th><th>Sentiment</th><th>Derived metrics</th><th>Confidence</th><th>Grounded AI</th><th>Review notes</th></tr></thead>
           <tbody>{rows.map((row) => {
@@ -674,8 +781,38 @@ function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessm
             </tr>;
           })}</tbody>
         </table>
-      </div>
+      </div>}
     </section>
+  );
+}
+
+function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCheckReport; onClose: () => void }) {
+  return (
+    <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
+      <section className="results-dialog" role="dialog" aria-modal="true" aria-labelledby="financial-results-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-heading">
+          <div><p className="eyebrow">FINANCIAL DATA UTILITY</p><h2 id="financial-results-title">Quarterly and annual result check</h2></div>
+          <button className="secondary" type="button" onClick={onClose}>Close</button>
+        </div>
+        <p className="dialog-summary">Fetched {report.fetched} · reused {report.reused} · unavailable {report.unavailable} · failed {report.failed}</p>
+        {report.reused > 0 && <p className="cache-guard-note">Upstox was not called for {report.reused} stock(s) because the latest completed-quarter snapshot is less than {report.cache_days} days old.</p>}
+        <div className="table-scroll dialog-table-scroll">
+          <table className="financial-results-table">
+            <thead><tr><th>Stock</th><th>Status</th><th>Quarterly</th><th>Annual</th><th>Snapshot</th><th>Reason</th></tr></thead>
+            <tbody>{report.items.map((item) => (
+              <tr key={item.instrument_key}>
+                <td><strong>{item.symbol}</strong></td>
+                <td><span className={`data-badge ${item.state}`}>{item.state}</span></td>
+                <td>{item.quarterly_available ? item.quarterly_period ?? "Available" : "Not available"}</td>
+                <td>{item.annual_available ? item.annual_period ?? "Available" : "Not available"}</td>
+                <td>{item.snapshot_at ? new Date(item.snapshot_at).toLocaleDateString("en-IN") : "—"}</td>
+                <td><small>{item.reason.replaceAll("_", " ")}</small></td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -687,14 +824,17 @@ function Dashboard() {
   const [features, setFeatures] = useState<StockFeatures[]>([]);
   const [regimes, setRegimes] = useState<DailyRegime[]>([]);
   const [evidence, setEvidence] = useState<OpportunityEvidence[]>([]);
+  const [opportunities, setOpportunities] = useState<RankedOpportunity[]>([]);
   const [corporateActions, setCorporateActions] = useState<CorporateActionAssessment[]>([]);
   const [corporateActionAI, setCorporateActionAI] = useState<CorporateActionAIAnalysis[]>([]);
+  const [financialResultReport, setFinancialResultReport] = useState<FinancialResultCheckReport | null>(null);
+  const [approvedStocksExpanded, setApprovedStocksExpanded] = useState(true);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [statusResponse, watchlistResponse, contextResponse, marketRegimeResponse, featuresResponse, regimesResponse, evidenceResponse, corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
+      const [statusResponse, watchlistResponse, contextResponse, marketRegimeResponse, featuresResponse, regimesResponse, evidenceResponse, opportunitiesResponse, corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
         fetch(`${apiBaseUrl}/market/status`),
         fetch(`${apiBaseUrl}/market/watchlist`),
         fetch(`${apiBaseUrl}/market/context`),
@@ -702,6 +842,7 @@ function Dashboard() {
         fetch(`${apiBaseUrl}/market/features`),
         fetch(`${apiBaseUrl}/market/daily-regimes`),
         fetch(`${apiBaseUrl}/market/evidence`),
+        fetch(`${apiBaseUrl}/market/opportunities`),
         fetch(`${apiBaseUrl}/market/corporate-action-assessments?limit=100`),
         fetch(`${apiBaseUrl}/market/corporate-action-ai`),
       ]);
@@ -713,6 +854,7 @@ function Dashboard() {
       setFeatures(featuresResponse.ok ? await featuresResponse.json() as StockFeatures[] : []);
       setRegimes(regimesResponse.ok ? await regimesResponse.json() as DailyRegime[] : []);
       setEvidence(evidenceResponse.ok ? await evidenceResponse.json() as OpportunityEvidence[] : []);
+      setOpportunities(opportunitiesResponse.ok ? await opportunitiesResponse.json() as RankedOpportunity[] : []);
       setCorporateActions(corporateActionsResponse.ok ? await corporateActionsResponse.json() as CorporateActionAssessment[] : []);
       setCorporateActionAI(corporateActionAIResponse.ok ? await corporateActionAIResponse.json() as CorporateActionAIAnalysis[] : []);
       setError(null);
@@ -739,6 +881,24 @@ function Dashboard() {
       await refresh();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "The request could not be completed");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const checkFinancialResults = async () => {
+    setBusy("financial-results");
+    setError(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 20}`, { method: "POST" });
+      if (!response.ok) {
+        const payload = await response.json() as { detail?: string };
+        throw new Error(payload.detail ?? "Financial results could not be checked");
+      }
+      setFinancialResultReport(await response.json() as FinancialResultCheckReport);
+      await refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Financial results could not be checked");
     } finally {
       setBusy(null);
     }
@@ -796,11 +956,16 @@ function Dashboard() {
         <article><span>CA assessments</span><strong>{runtime?.bootstrap.corporate_actions_assessed ?? 0}</strong></article>
         <article><span>CA outcomes</span><strong>{runtime?.bootstrap.corporate_outcomes_evaluated ?? 0}</strong></article>
         <article><span>CA sources</span><strong>{runtime?.bootstrap.corporate_documents_stored ?? 0}</strong></article>
+        <article><span>Financial reused</span><strong>{runtime?.bootstrap.financial_results_reused ?? 0}</strong></article>
         <article><span>Subscribed</span><strong>{runtime?.live.subscribed ?? 0}</strong></article>
         <article><span>Reconciliation</span><strong>{runtime?.reconciliation.state ?? "Idle"}</strong></article>
       </section>
 
       <MarketContextPanel context={context} regime={marketRegime} />
+
+      <OpportunityRankingBoard rows={opportunities} />
+
+      <FeatureMatrix features={features} />
 
       <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />
 
@@ -808,14 +973,12 @@ function Dashboard() {
 
       <DailyRegimePanel regimes={regimes} />
 
-      <FeatureMatrix features={features} />
-
       <section className="table-card">
         <div className="table-heading">
           <div><h2>Approved stocks</h2><p>Latest available one-minute values</p></div>
-          <span>Refreshes every 5 seconds · calculations every 60 seconds</span>
+          <div className="table-heading-actions"><span>Refreshes every 5 seconds · calculations every 60 seconds</span><SectionToggle expanded={approvedStocksExpanded} onToggle={() => setApprovedStocksExpanded((value) => !value)} label="Approved stocks" /></div>
         </div>
-        <div className="table-scroll">
+        {approvedStocksExpanded && <div className="table-scroll" id="approved-stocks-content">
           <table>
             <thead><tr><th>Stock</th><th>Sector</th><th>LTP</th><th>Change</th><th>1m O / H / L / C</th><th>Volume</th><th>RVOL</th><th>Spread</th><th>State</th></tr></thead>
             <tbody>
@@ -838,8 +1001,15 @@ function Dashboard() {
               ))}
             </tbody>
           </table>
-        </div>
+        </div>}
       </section>
+
+      <section className="financial-utility-card">
+        <div><p className="eyebrow">DATA UTILITIES</p><h2>Quarterly and annual results</h2><p>Check Upstox availability for the pilot stocks. Recent latest-quarter snapshots are protected from duplicate downloads for 30 days.</p></div>
+        <button className="secondary" type="button" disabled={busy !== null || !runtime?.database_available} onClick={() => void checkFinancialResults()}>{busy === "financial-results" ? "Checking results…" : "Check financial results"}</button>
+      </section>
+
+      {financialResultReport && <FinancialResultsDialog report={financialResultReport} onClose={() => setFinancialResultReport(null)} />}
     </main>
   );
 }

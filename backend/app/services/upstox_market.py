@@ -14,7 +14,8 @@ from urllib.parse import quote
 
 import httpx
 
-from app.models.market import Candle, CorporateAction, CorporateFinancialContext, LiveSnapshot, MarketDepthLevel
+from app.models.market import Candle, CorporateAction, CorporateFinancialContext, FinancialResultSnapshot, LiveSnapshot, MarketDepthLevel
+from app.services.financial_results import build_financial_snapshot
 
 UPSTOX_API_ROOT = "https://api.upstox.com"
 NIFTY_50_KEY = "NSE_INDEX|Nifty 50"
@@ -416,46 +417,52 @@ class UpstoxMarketDataClient:
         instrument_key: str,
         symbol: str,
     ) -> CorporateFinancialContext:
+        _, context = self.fetch_financial_results(isin, instrument_key, symbol)
+        return context
+
+    def fetch_financial_results(
+        self,
+        isin: str,
+        instrument_key: str,
+        symbol: str,
+    ) -> tuple[FinancialResultSnapshot, CorporateFinancialContext]:
+        """Fetch quarterly results plus annual income, cash flow and balance sheet."""
         encoded = quote(isin, safe="")
-        income = self._get(
+        quarterly_income = self._get(
             f"/v2/fundamentals/{encoded}/income-statement?type=consolidated&time_period=quarterly"
         ).get("data")
-        cash_flow = self._get(
-            f"/v2/fundamentals/{encoded}/cash-flow?type=consolidated"
-        ).get("data")
-        income = income if isinstance(income, Mapping) else {}
-        cash_flow = cash_flow if isinstance(cash_flow, Mapping) else {}
 
-        def latest(payload: Mapping[str, Any], collection: str, category: str) -> tuple[float | None, str | None]:
-            rows = payload.get(collection)
-            if not isinstance(rows, list):
-                return None, None
-            match = next(
-                (item for item in rows if isinstance(item, Mapping) and str(item.get("category", "")).casefold() == category),
-                None,
-            )
-            history = match.get("history") if isinstance(match, Mapping) else None
-            row = history[0] if isinstance(history, list) and history and isinstance(history[0], Mapping) else None
-            return (_optional_float(row.get("value")), str(row.get("period"))) if row else (None, None)
+        def optional_data(path: str, empty: object) -> object:
+            try:
+                return self._get(path).get("data", empty)
+            except UpstoxMarketDataError:
+                return empty
 
-        revenue, revenue_period = latest(income, "income_statement", "revenue")
-        operating_profit, _ = latest(income, "income_statement", "operating_profit")
-        net_profit, _ = latest(income, "income_statement", "net_profit")
-        operating_cash_flow, cash_period = latest(cash_flow, "cash_flow", "operating")
-        available = sum(value is not None for value in (revenue, operating_profit, net_profit, operating_cash_flow))
-        return CorporateFinancialContext(
+        annual_income = optional_data(
+            f"/v2/fundamentals/{encoded}/income-statement?type=consolidated&time_period=yearly&fs=true",
+            {},
+        )
+        annual_cash_flow = optional_data(
+            f"/v2/fundamentals/{encoded}/cash-flow?type=consolidated&fs=true",
+            {},
+        )
+        annual_balance_sheet = optional_data(
+            f"/v2/fundamentals/{encoded}/balance-sheet?type=consolidated&fs=true",
+            {},
+        )
+        key_ratios = optional_data(
+            f"/v2/fundamentals/{encoded}/key-ratios",
+            [],
+        )
+        return build_financial_snapshot(
             isin=isin,
             instrument_key=instrument_key,
             symbol=symbol,
-            latest_revenue_crore=revenue,
-            latest_operating_profit_crore=operating_profit,
-            latest_net_profit_crore=net_profit,
-            latest_operating_cash_flow_crore=operating_cash_flow,
-            revenue_period=revenue_period,
-            cash_flow_period=cash_period,
-            raw_payload={"income_statement": dict(income), "cash_flow": dict(cash_flow)},
-            data_quality="complete" if available == 4 else "partial" if available else "unavailable",
-            fetched_at=datetime.now(UTC),
+            quarterly_income=dict(quarterly_income) if isinstance(quarterly_income, Mapping) else {},
+            annual_income=dict(annual_income) if isinstance(annual_income, Mapping) else {},
+            annual_cash_flow=dict(annual_cash_flow) if isinstance(annual_cash_flow, Mapping) else {},
+            annual_balance_sheet=dict(annual_balance_sheet) if isinstance(annual_balance_sheet, Mapping) else {},
+            key_ratios=list(key_ratios) if isinstance(key_ratios, list) else [],
         )
 
     def _get(self, path: str) -> dict[str, Any]:

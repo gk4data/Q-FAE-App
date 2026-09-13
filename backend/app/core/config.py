@@ -3,6 +3,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -58,6 +59,13 @@ class Settings(BaseSettings):
     qfae_corporate_documents_enabled: bool = True
     qfae_corporate_action_lookback_days: int = 365
     qfae_corporate_action_ai_enabled: bool = False
+    qfae_financial_results_cache_days: int = 30
+    qfae_score_weight_price_trend: float = Field(default=30.0, ge=0)
+    qfae_score_weight_participation: float = Field(default=20.0, ge=0)
+    qfae_score_weight_market_sector: float = Field(default=20.0, ge=0)
+    qfae_score_weight_liquidity_execution: float = Field(default=15.0, ge=0)
+    qfae_score_weight_fundamental: float = Field(default=10.0, ge=0)
+    qfae_score_weight_catalyst: float = Field(default=5.0, ge=0)
     openai_api_key: str | None = None
     qfae_ai_model: str | None = None
 

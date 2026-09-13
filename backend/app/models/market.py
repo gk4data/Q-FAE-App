@@ -300,6 +300,51 @@ class EvidencePillar(FrozenModel):
     cautions: list[str] = Field(default_factory=list)
 
 
+class OpportunityScoreComponent(FrozenModel):
+    """One auditable contribution to the provisional opportunity score."""
+
+    key: str
+    label: str
+    weight_percent: float = Field(ge=0, le=100)
+    score: float | None = Field(default=None, ge=0, le=100)
+    coverage_percent: float = Field(ge=0, le=100)
+    contribution_points: float = Field(ge=0, le=100)
+    positive_factors: list[str] = Field(default_factory=list)
+    cautions: list[str] = Field(default_factory=list)
+    unavailable_inputs: list[str] = Field(default_factory=list)
+
+
+class OpportunityScoreSnapshot(FrozenModel):
+    """Explainable, coverage-adjusted score for the pilot long-continuation model."""
+
+    model_version: str
+    strategy: str
+    calibration_status: str
+    evidence_score: float = Field(ge=0, le=100)
+    coverage_percent: float = Field(ge=0, le=100)
+    coverage_adjusted_score: float = Field(ge=0, le=100)
+    persistence_multiplier: float = Field(ge=0, le=1)
+    final_score: float = Field(ge=0, le=100)
+    eligible: bool
+    status: str
+    weights: dict[str, float]
+    components: list[OpportunityScoreComponent]
+    top_positive_factors: list[str] = Field(default_factory=list)
+    top_cautions: list[str] = Field(default_factory=list)
+    invalidation_reasons: list[str] = Field(default_factory=list)
+
+
+class RankedOpportunity(FrozenModel):
+    rank: int | None = Field(default=None, ge=1)
+    instrument_key: str
+    symbol: str
+    sector: str | None = None
+    as_of: datetime
+    current_market_price: float | None = Field(default=None, gt=0)
+    session_return_percent: float | None = None
+    score: OpportunityScoreSnapshot
+
+
 class FlowLiquidityConfirmation(FrozenModel):
     """Joint interpretation of participation and execution-quality evidence."""
 
@@ -322,7 +367,7 @@ class FlowLiquidityConfirmation(FrozenModel):
 
 
 class OpportunityEvidenceSnapshot(FrozenModel):
-    """Unweighted confluence view combining validated technical and market evidence."""
+    """Validated evidence plus an optional versioned opportunity score."""
 
     instrument_key: str
     symbol: str
@@ -337,7 +382,9 @@ class OpportunityEvidenceSnapshot(FrozenModel):
     derivatives_confirmation: DerivativesConfirmation = Field(
         default_factory=lambda: DerivativesConfirmation()
     )
+    market_regime: MarketRegimeSnapshot | None = None
     corporate_action_context: CorporateActionContext | None = None
+    opportunity_score: OpportunityScoreSnapshot | None = None
     validation_notes: list[str] = Field(default_factory=list)
 
 
@@ -541,6 +588,103 @@ class CorporateFinancialContext(FrozenModel):
     raw_payload: dict[str, object]
     data_quality: str
     fetched_at: datetime
+
+
+class FinancialResultSnapshot(FrozenModel):
+    """Content-versioned Upstox quarterly and annual financial-result payload."""
+
+    snapshot_id: str
+    isin: str
+    instrument_key: str
+    symbol: str
+    statement_type: str = "consolidated"
+    quarterly_period: str | None = None
+    annual_period: str | None = None
+    quarterly_available: bool
+    annual_available: bool
+    raw_payload: dict[str, object]
+    captured_at: datetime
+    last_seen_at: datetime
+
+
+class FinancialResultAvailability(FrozenModel):
+    instrument_key: str
+    symbol: str
+    isin: str | None = None
+    state: str
+    reason: str
+    quarterly_period: str | None = None
+    annual_period: str | None = None
+    quarterly_available: bool = False
+    annual_available: bool = False
+    snapshot_at: datetime | None = None
+    cache_fresh: bool = False
+
+
+class FinancialResultCheckReport(FrozenModel):
+    generated_at: datetime
+    cache_days: int = Field(ge=1)
+    total: int = Field(ge=0)
+    fetched: int = Field(ge=0)
+    reused: int = Field(ge=0)
+    unavailable: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    items: list[FinancialResultAvailability] = Field(default_factory=list)
+
+
+class FinancialGrowthMetrics(FrozenModel):
+    revenue_qoq_percent: float | None = None
+    revenue_yoy_percent: float | None = None
+    operating_profit_qoq_percent: float | None = None
+    operating_profit_yoy_percent: float | None = None
+    net_profit_qoq_percent: float | None = None
+    net_profit_yoy_percent: float | None = None
+
+
+class FinancialMarginMetrics(FrozenModel):
+    operating_margin_percent: float | None = None
+    operating_margin_qoq_change_pp: float | None = None
+    operating_margin_yoy_change_pp: float | None = None
+    net_margin_percent: float | None = None
+    net_margin_qoq_change_pp: float | None = None
+    net_margin_yoy_change_pp: float | None = None
+
+
+class FinancialCapitalMetrics(FrozenModel):
+    operating_cash_conversion_percent: float | None = None
+    total_debt_crore: float | None = None
+    debt_yoy_change_percent: float | None = None
+    debt_to_equity: float | None = None
+    total_liabilities_crore: float | None = None
+    liabilities_yoy_change_percent: float | None = None
+    roe_percent: float | None = None
+    roce_percent: float | None = None
+
+
+class FinancialEpsMetrics(FrozenModel):
+    latest_basic_eps: float | None = None
+    latest_period: str | None = None
+    yoy_growth_percent: float | None = None
+    history: list[dict[str, float | str]] = Field(default_factory=list)
+
+
+class FinancialMetricSnapshot(FrozenModel):
+    source_snapshot_id: str
+    calculation_version: int = Field(default=1, ge=1)
+    isin: str
+    instrument_key: str
+    symbol: str
+    latest_quarter: str | None = None
+    latest_annual_period: str | None = None
+    growth: FinancialGrowthMetrics
+    margins: FinancialMarginMetrics
+    capital: FinancialCapitalMetrics
+    eps: FinancialEpsMetrics
+    data_quality: str
+    unavailable: list[str] = Field(default_factory=list)
+    cautions: list[str] = Field(default_factory=list)
+    formulas: dict[str, str] = Field(default_factory=dict)
+    calculated_at: datetime
 
 
 class CorporateActionAIAnalysis(FrozenModel):

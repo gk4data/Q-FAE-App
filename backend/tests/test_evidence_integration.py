@@ -17,13 +17,13 @@ def test_supportive_intraday_daily_and_relative_inputs_form_confluence() -> None
             "candle_timestamp": as_of - timedelta(minutes=1),
             "data_quality": "complete",
             "vwap": {"position_percent": 1.2, "slope_5m_percent_per_minute": 0.1, "state": "above"},
-            "gap": {"gap_percent": 1, "retention_percent": 90, "state": "retained"},
+            "gap": {"gap_percent": 1, "retention_percent": 90, "state": "holding"},
             "opening_ranges": [{"minutes": 15, "ready": True, "position": "above"}],
             "relative_strength": {"session_return_percent": 2, "versus_nifty_percent": 2.5, "sector_index": "Nifty Auto", "versus_sector_percent": 1.5},
             "momentum": {"return_5m_percent": 0.8, "efficiency_ratio_15m": 0.7, "state": "strong_up"},
             "volume": {"relative_volume": 2, "acceleration_ratio": 1.4, "state": "high_relative"},
             "pullback": {"direction": "up", "quality": "holding_extreme"},
-            "volatility": {"atr_sessions": 14, "state": "normal"},
+            "volatility": {"atr_sessions": 14, "session_range_atr": 0.8, "state": "elevated"},
             "liquidity": {"passes_spread_filter": True, "passes_traded_value_filter": True, "state": "pass"},
         }
     )
@@ -64,6 +64,10 @@ def test_supportive_intraday_daily_and_relative_inputs_form_confluence() -> None
     assert result.confluence == "strong_support"
     assert result.data_quality == "partial"
     assert "market_context_unavailable" in result.validation_notes
+    intraday = next(pillar for pillar in result.pillars if pillar.key == "intraday")
+    assert "positive_gap_retained" in intraday.evidence
+    assert "constructive_uptrend_pullback" in intraday.evidence
+    assert "positive_volatility_expansion" in intraday.evidence
 
 
 def test_stale_intraday_inputs_are_not_classified_as_current_evidence() -> None:
@@ -89,4 +93,3 @@ def test_stale_intraday_inputs_are_not_classified_as_current_evidence() -> None:
     assert result.confluence == "insufficient"
     assert result.pillars[0].state == "unavailable"
     assert "intraday_evidence_stale" in result.validation_notes
-

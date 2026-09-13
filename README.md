@@ -99,6 +99,7 @@ Read the normalized state through:
 - `GET /api/v1/market/daily-regimes`
 - `GET /api/v1/market/minute-profiles?instrument_key=NSE_EQ%7C...`
 - `GET /api/v1/market/evidence`
+- `GET /api/v1/market/opportunities`
 - `GET /api/v1/market/confirmations`
 - `GET /api/v1/market/risk`
 - `GET /api/v1/market/regime`
@@ -110,6 +111,8 @@ Read the normalized state through:
 - `GET /api/v1/market/corporate-action-ai`
 - `GET /api/v1/market/corporate-action-outcomes`
 - `GET /api/v1/market/corporate-action-calibration`
+- `POST /api/v1/market/financial-results/check?limit=20`
+- `GET /api/v1/market/financial-metrics`
 - `POST /api/v1/market/reconcile?session_date=YYYY-MM-DD`
 - `GET /api/v1/market/reconciliations?session_date=YYYY-MM-DD`
 - `WS /api/v1/market/stream`
@@ -120,14 +123,18 @@ The [intraday feature engine](docs/intraday-feature-engine.md) calculates VWAP, 
 
 The [daily regime engine](docs/daily-regime-engine.md) adds independent 5/20/60/120/250-session performance, moving-average trend, price structure, daily participation, volatility, and benchmark-relative evidence. Older weak performance is retained as context and never used as an automatic veto against fresh strength.
 
-The [validated evidence-confluence layer](docs/evidence-confluence.md) integrates current intraday technicals, daily regime, NIFTY/sector relative strength, and volume/liquidity confirmation without applying strategy weights. The [after-market reconciliation flow](docs/after-market-reconciliation.md) replaces provisional daily evidence with the official provider candle and records data-quality differences.
+The [validated evidence-confluence layer](docs/evidence-confluence.md) integrates current intraday technicals, daily regime, NIFTY/sector relative strength, and volume/liquidity confirmation as transparent raw inputs. The [provisional opportunity-ranking layer](docs/opportunity-ranking.md) applies explicit, configurable pilot weights, data-coverage penalties, persistence confirmation, and hard risk invalidations to rank long-continuation candidates. The [after-market reconciliation flow](docs/after-market-reconciliation.md) replaces provisional daily evidence with the official provider candle and records data-quality differences.
 
 The [volume and liquidity confirmation contract](docs/volume-liquidity-confirmation.md) combines RVOL and acceleration with spread and traded-value gates. High activity cannot be labelled confirmed when execution quality is rejected.
 
 The [decision-quality layer](docs/decision-quality-layer.md) adds two-of-three-minute signal persistence, D5 slippage/circuit/tradability checks, persistent market regime, point-in-time forward-outcome tracking, safe corporate-action adjustments, official filing evidence, optional citation-grounded AI interpretation, and event calibration. NSE surveillance synchronization, global context and mapped F&O confirmation remain explicit staged inputs rather than silently assumed data.
 
+The [financial-result caching policy](docs/financial-result-caching.md) stores content-versioned quarterly and annual Upstox statements. **Prepare 20 stocks** and the dashboard utility reuse a latest-quarter snapshot for 30 days, while older-quarter, stale or missing data triggers a provider refresh.
+
+The [financial-metric layer](docs/financial-metrics.md) calculates versioned QoQ/YoY growth, margins, cash conversion, explicit debt measures, ROE/ROCE and EPS history. Available metrics now feed the bounded fundamental component of the provisional pilot score; missing fields reduce coverage instead of becoming favourable values.
+
 The first preparation backfills configured daily and one-minute history into PostgreSQL. Later preparations hydrate Redis from PostgreSQL and request only overlapping updates: five days for daily candles and two days for one-minute candles. Completed live minutes are persisted once per minute, while the still-forming candle remains only in Redis. One-minute rows have configurable 35-day retention and produce per-stock minute-of-session profiles used as the durable RVOL baseline. See the [historical-data storage policy](docs/historical-data-storage.md) for the implemented boundary and remaining full-universe work.
 
 Order placement, scoring, ML predictions, and automated trading are intentionally outside this phase.
 
-The approved candidate inputs for the future explainable opportunity model are maintained in [the model factor register](docs/model-factor-register.md). All listed factors should be retained for evaluation, while their direction, weights, and interactions remain subject to point-in-time backtesting on Indian-market data.
+The approved candidate inputs are maintained in [the model factor register](docs/model-factor-register.md). Pilot-v1 implements only the available long-continuation inputs. Its direction, weights, thresholds and interactions remain provisional until point-in-time Indian-market backtesting supports calibration.

@@ -91,6 +91,20 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .table-card { border: 1px solid #253141; border-radius: .65rem; background: #101720; overflow: hidden; }
 .feature-card { margin-bottom: 1.2rem; }
 .evidence-card { margin-bottom: 1.2rem; }
+.opportunity-card { margin-bottom: 1.2rem; border-color: #2c493f; }
+.opportunity-table { min-width: 2200px; }
+.opportunity-table td { min-width: 155px; vertical-align: top; white-space: normal; }
+.opportunity-table td:nth-child(2), .opportunity-table td:nth-last-child(-n+2) { min-width: 220px; }
+.rank-cell { color: #61d3a4; font-size: 1.05rem; font-weight: 850; text-align: center; }
+.opportunity-score { display: block; color: #61d3a4; font-size: 1.35rem; font-variant-numeric: tabular-nums; }
+.cmp-cell .cmp-price { display: block; font-size: .9rem; font-variant-numeric: tabular-nums; }
+.cmp-change { display: block; margin-top: .2rem; font-size: .75rem; font-weight: 750; font-variant-numeric: tabular-nums; }
+.cmp-cell .cmp-price.positive, .cmp-change.positive { color: #61d3a4; }
+.cmp-cell .cmp-price.negative, .cmp-change.negative { color: #ff7f8c; }
+.score-status { display: inline-block; margin-top: .45rem; border-radius: 999px; padding: .22rem .43rem; background: #283342; color: #a5b3c6; font-size: .56rem; letter-spacing: .05em; text-transform: uppercase; }
+.score-status.high_priority, .score-status.promising { background: #15382d; color: #8ce4bc; }
+.score-status.watch { background: #3d331d; color: #e4c87e; }
+.score-status.low_conviction, .score-status.ineligible, .score-status.insufficient_data { background: #43232b; color: #ffacb5; }
 .corporate-action-card { margin-bottom: 1.2rem; }
 .corporate-action-table { min-width: 1550px; }
 .corporate-action-table td { min-width: 140px; vertical-align: top; white-space: normal; }
@@ -148,6 +162,12 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .table-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; padding: 1.1rem 1.25rem; border-bottom: 1px solid #253141; }
 .table-heading h2 { margin: 0; font-size: 1.15rem; letter-spacing: -.01em; }
 .table-heading p, .table-heading > span { margin: .25rem 0 0; color: #8291a5; font-size: .75rem; }
+.table-heading-actions { display: flex; align-items: center; justify-content: flex-end; gap: .75rem; }
+.table-heading-actions > span { color: #8291a5; font-size: .75rem; text-align: right; }
+.section-toggle { display: inline-flex; align-items: center; gap: .4rem; flex: 0 0 auto; border: 1px solid #344255; padding: .48rem .68rem; background: #17212d; color: #c7d3e1; font-size: .7rem; font-weight: 700; }
+.section-toggle:hover { border-color: #4e6b63; background: #1b2933; color: #e7f6ef; }
+.section-toggle:focus-visible { outline: 2px solid #61d3a4; outline-offset: 2px; }
+.section-toggle span { display: inline-grid; place-items: center; width: 1rem; color: #61d3a4; font-size: 1rem; line-height: 1; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 1080px; }
 th { padding: .78rem 1rem; color: #7f8ea3; background: #0e141c; font-size: .68rem; letter-spacing: .08em; text-align: left; text-transform: uppercase; white-space: nowrap; }
@@ -163,6 +183,21 @@ td small { display: block; max-width: 170px; margin-top: .2rem; color: #748398; 
 .data-badge.live { background: #15382d; color: #8ce4bc; }
 .data-badge.cached { background: #3d331d; color: #e4c87e; }
 .data-badge.history { background: #273348; color: #b7c8e5; }
+.data-badge.fetched { background: #15382d; color: #8ce4bc; }
+.data-badge.reused { background: #273348; color: #b7c8e5; }
+.data-badge.unavailable, .data-badge.failed { background: #43232b; color: #ffacb5; }
+.financial-utility-card { display: flex; align-items: center; justify-content: space-between; gap: 2rem; margin-top: 1.2rem; padding: 1.25rem; border: 1px solid #253141; border-radius: .65rem; background: #101720; }
+.financial-utility-card h2 { margin: 0; font-size: 1.15rem; }
+.financial-utility-card p:not(.eyebrow) { margin: .4rem 0 0; max-width: 760px; color: #8291a5; font-size: .78rem; line-height: 1.5; }
+.dialog-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 1.5rem; background: rgb(4 8 12 / 78%); backdrop-filter: blur(5px); }
+.results-dialog { width: min(1100px, 100%); max-height: min(760px, 90vh); overflow: hidden; border: 1px solid #344255; border-radius: .75rem; background: #111821; box-shadow: 0 24px 80px rgb(0 0 0 / 45%); }
+.dialog-heading { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 1.2rem 1.3rem; border-bottom: 1px solid #253141; }
+.dialog-heading .eyebrow { margin-bottom: .25rem; }
+.dialog-heading h2 { margin: 0; font-size: 1.25rem; }
+.dialog-summary { margin: 1rem 1.3rem .6rem; color: #cbd5e3; font-size: .85rem; }
+.cache-guard-note { margin: 0 1.3rem 1rem; padding: .7rem .8rem; border-radius: .4rem; background: #273348; color: #b7c8e5; font-size: .76rem; }
+.dialog-table-scroll { max-height: 520px; overflow: auto; }
+.financial-results-table { min-width: 900px; }
 
 @media (max-width: 760px) {
   .auth-shell { grid-template-columns: 1fr; }
@@ -172,6 +207,7 @@ td small { display: block; max-width: 170px; margin-top: .2rem; color: #748398; 
   .dashboard-intro { align-items: stretch; flex-direction: column; }
   .actions { justify-content: flex-start; }
   .summary-grid { grid-template-columns: repeat(2, 1fr); }
+  .financial-utility-card { align-items: flex-start; flex-direction: column; }
   .context-placeholder { align-items: flex-start; flex-direction: column; gap: .8rem; }
   .context-heading { align-items: flex-start; flex-direction: column; }
   .index-grid { grid-template-columns: repeat(2, 1fr); }
@@ -180,6 +216,7 @@ td small { display: block; max-width: 170px; margin-top: .2rem; color: #748398; 
   .context-section + .context-section { border-left: 0; border-top: 1px solid #253141; }
   .sector-list { grid-template-columns: 1fr; }
   .table-heading > span { display: none; }
+  .table-heading-actions > span { display: none; }
 }
 
 @media (min-width: 761px) and (max-width: 1180px) {

@@ -257,6 +257,52 @@ class CorporateFinancialContextRecord(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
 
 
+class FinancialResultSnapshotRecord(Base):
+    __tablename__ = "financial_result_snapshots"
+
+    snapshot_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    isin: Mapped[str] = mapped_column(String(20), nullable=False)
+    instrument_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False)
+    statement_type: Mapped[str] = mapped_column(String(24), nullable=False)
+    quarterly_period: Mapped[str | None] = mapped_column(String(40))
+    annual_period: Mapped[str | None] = mapped_column(String(40))
+    quarterly_available: Mapped[bool] = mapped_column(nullable=False)
+    annual_available: Mapped[bool] = mapped_column(nullable=False)
+    raw_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_financial_result_snapshots_instrument", "instrument_key", "last_seen_at"),
+        Index("ix_financial_result_snapshots_isin", "isin", "last_seen_at"),
+    )
+
+
+class FinancialMetricSnapshotRecord(Base):
+    __tablename__ = "financial_metric_snapshots"
+
+    source_snapshot_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    calculation_version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    isin: Mapped[str] = mapped_column(String(20), nullable=False)
+    instrument_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False)
+    latest_quarter: Mapped[str | None] = mapped_column(String(40))
+    latest_annual_period: Mapped[str | None] = mapped_column(String(40))
+    metrics_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    data_quality: Mapped[str] = mapped_column(String(24), nullable=False)
+    unavailable: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    cautions: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    formulas: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_financial_metric_snapshots_instrument", "instrument_key", "calculated_at"),
+    )
+
+
 class CorporateActionAIAnalysisRecord(Base):
     __tablename__ = "corporate_action_ai_analyses"
     event_id: Mapped[str] = mapped_column(String(32), primary_key=True)
