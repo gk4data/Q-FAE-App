@@ -21,7 +21,7 @@ The latest quarterly revenue, operating profit and net profit plus annual operat
 1. the stored quarterly period is the most recently completed calendar quarter; and
 2. the snapshot was last confirmed within the configured cache window.
 
-A recent snapshot containing an older quarter does not block a refresh. This permits Q-FAE to discover a newly published result. The cache rule is applied both by **Prepare 20 stocks** and by the financial-results utility.
+A recent snapshot containing an older quarter does not block a refresh. This permits Q-FAE to discover a newly published result. The cache rule is applied both by the configured **Prepare stocks** workflow and by the financial-results utility.
 
 ## Frontend utility
 
@@ -29,7 +29,7 @@ The **Check financial results** button appears below the market tables. Its resu
 
 ## API
 
-- `POST /api/v1/market/financial-results/check?limit=20`
+- `POST /api/v1/market/financial-results/check?limit=100`
 
 The normal application endpoint does not expose a force-refresh switch.
 

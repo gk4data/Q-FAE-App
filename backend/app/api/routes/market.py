@@ -342,12 +342,14 @@ def check_financial_results(
 def get_financial_metrics(
     instrument_key: str | None = None,
     limit: Annotated[int, Query(ge=1, le=5000)] = 500,
+    latest_only: bool = False,
 ) -> list[FinancialMetricSnapshot]:
     """Return versioned, deterministic statement-derived metrics without model weights."""
     try:
         return get_market_runtime().get_financial_metrics(
             instrument_key=instrument_key,
             limit=limit,
+            latest_only=latest_only,
         )
     except MarketRuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc

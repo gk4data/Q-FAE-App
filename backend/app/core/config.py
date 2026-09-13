@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     qfae_market_request_rate_per_second: int = 8
     qfae_market_request_rate_per_minute: int = 450
     qfae_market_snapshot_interval_seconds: int = 60
-    qfae_market_pilot_size: int = 20
+    qfae_market_pilot_size: int = Field(default=100, ge=1, le=500)
     qfae_feature_max_spread_bps: float = 25.0
     qfae_feature_min_traded_value_inr: float = 10_000_000.0
     qfae_confirmation_active_rvol: float = 1.0

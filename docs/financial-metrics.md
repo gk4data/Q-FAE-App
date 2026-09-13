@@ -26,8 +26,11 @@ Q-FAE calculates financial metrics deterministically from each immutable Upstox 
 
 - `GET /api/v1/market/financial-metrics`
 - `GET /api/v1/market/financial-metrics?instrument_key=NSE_EQ%7C...`
+- `GET /api/v1/market/financial-metrics?latest_only=true` for one latest snapshot per stock
 
-Both **Prepare 20 stocks** and **Check financial results** calculate and persist metrics after fetching or reusing a financial-result snapshot.
+Both **Prepare 100 stocks** and **Check financial results** calculate and persist metrics after fetching or reusing a financial-result snapshot.
+
+The dashboard's **Financials (Qtrly/Yearly)** tab reads the latest stored snapshot for each pilot stock when the tab is opened. The five-second live-market refresh does not reload these stable metrics, and opening the tab does not call Upstox; provider requests occur only through the preparation and financial-result-check workflows.
 
 ## Provider contracts
 

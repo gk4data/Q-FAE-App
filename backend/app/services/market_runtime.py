@@ -601,14 +601,21 @@ class MarketRuntime:
         *,
         instrument_key: str | None = None,
         limit: int = 500,
+        latest_only: bool = False,
     ) -> list[FinancialMetricSnapshot]:
         if self.historical_repository is None:
             raise MarketRuntimeError("PostgreSQL historical storage is not configured")
         try:
-            return self.historical_repository.get_financial_metric_snapshots(
+            snapshots = self.historical_repository.get_financial_metric_snapshots(
                 instrument_key=instrument_key,
                 limit=limit,
             )
+            if not latest_only:
+                return snapshots
+            latest_by_instrument: dict[str, FinancialMetricSnapshot] = {}
+            for snapshot in snapshots:
+                latest_by_instrument.setdefault(snapshot.instrument_key, snapshot)
+            return sorted(latest_by_instrument.values(), key=lambda item: item.symbol)
         except Exception as exc:
             raise MarketRuntimeError("Financial metric snapshots are unavailable") from exc
 

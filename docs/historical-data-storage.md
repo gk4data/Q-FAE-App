@@ -70,4 +70,19 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 - Provider corrections, symbol changes, instrument-key changes, splits, bonuses, and other corporate actions must be handled without destroying the original observations.
 - Daily history is broad and permanent; raw minute retention is selective and bounded.
 
-Before full-universe expansion, benchmark PostgreSQL write/query throughput, partition minute candles if justified, and implement the research archive and corporate-action adjustment layers.
+## Capacity and operational limits
+
+PostgreSQL does not impose a small fixed database quota; practical capacity is governed by the host/Docker disk, write throughput, indexes, vacuuming and backup time. The local Docker database was approximately 48 MB at the start of the 100-stock phase, and its container filesystem reported approximately 950 GB available. These figures are observations, not reserved capacity or a storage guarantee.
+
+At 100 stocks and 375 normal NSE minutes, Q-FAE can create up to 37,500 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Raw one-minute candles retain the configured 35-day boundary; evidence observations intended for backtesting require a deliberate longer-term retention and archive policy.
+
+Before moving from 100 to 200 stocks:
+
+- record per-minute calculation and persistence latency;
+- add database-size, table-size, latest-evidence and disk-usage health reporting;
+- set warning thresholds at 70% disk use and a critical threshold at 85%;
+- confirm autovacuum keeps up with progressively updated evidence outcomes;
+- partition `evidence_observations` by month when measured size/query plans justify it;
+- back up durable evidence and move long-horizon raw research data to compressed archive storage.
+
+Before full-universe expansion, benchmark PostgreSQL write/query throughput, partition high-growth tables if justified, and implement the research archive policy.

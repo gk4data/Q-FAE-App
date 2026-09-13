@@ -43,3 +43,6 @@ The current version does not rank short opportunities. A short model requires se
 
 - `GET /api/v1/market/opportunities`
 - The dashboard displays rank, final score, evidence strength, coverage, persistence multiplier, every component contribution, leading evidence and invalidations.
+- The **Alpha Matrix** plots the current final Opportunity Score on the horizontal axis and a provisional confidence proxy on the vertical axis. The confidence proxy is score coverage multiplied by the persistence multiplier; an active hard invalidation caps it in the low-confidence region.
+- Bubble size represents the liquidity/execution component, colour represents opportunity status, and selecting a bubble opens the consolidated stock-detail view.
+- The provisional quadrant boundary is Opportunity Score 70 and confidence proxy 65. These are visual research thresholds rather than buy instructions and must be recalibrated from point-in-time outcomes.

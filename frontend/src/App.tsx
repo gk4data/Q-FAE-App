@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { ReactNode } from "react";
+import * as echarts from "echarts/core";
+import { ScatterChart } from "echarts/charts";
+import { AriaComponent, GridComponent, MarkAreaComponent, TooltipComponent } from "echarts/components";
+import { LabelLayout } from "echarts/features";
+import { CanvasRenderer } from "echarts/renderers";
+
+echarts.use([ScatterChart, AriaComponent, GridComponent, MarkAreaComponent, TooltipComponent, LabelLayout, CanvasRenderer]);
 
 type AuthStatus = { configured: boolean; authenticated: boolean; expires_at: string | null };
 
@@ -341,6 +349,53 @@ type FinancialResultCheckReport = {
   }>;
 };
 
+type FinancialMetricSnapshot = {
+  source_snapshot_id: string;
+  calculation_version: number;
+  isin: string;
+  instrument_key: string;
+  symbol: string;
+  latest_quarter: string | null;
+  latest_annual_period: string | null;
+  growth: {
+    revenue_qoq_percent: number | null;
+    revenue_yoy_percent: number | null;
+    operating_profit_qoq_percent: number | null;
+    operating_profit_yoy_percent: number | null;
+    net_profit_qoq_percent: number | null;
+    net_profit_yoy_percent: number | null;
+  };
+  margins: {
+    operating_margin_percent: number | null;
+    operating_margin_qoq_change_pp: number | null;
+    operating_margin_yoy_change_pp: number | null;
+    net_margin_percent: number | null;
+    net_margin_qoq_change_pp: number | null;
+    net_margin_yoy_change_pp: number | null;
+  };
+  capital: {
+    operating_cash_conversion_percent: number | null;
+    total_debt_crore: number | null;
+    debt_yoy_change_percent: number | null;
+    debt_to_equity: number | null;
+    total_liabilities_crore: number | null;
+    liabilities_yoy_change_percent: number | null;
+    roe_percent: number | null;
+    roce_percent: number | null;
+  };
+  eps: {
+    latest_basic_eps: number | null;
+    latest_period: string | null;
+    yoy_growth_percent: number | null;
+    history: Array<{ period: string; value: number | string }>;
+  };
+  data_quality: string;
+  unavailable: string[];
+  cautions: string[];
+  formulas: Record<string, string>;
+  calculated_at: string;
+};
+
 const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api/v1";
 
 const number = (value: number | null, digits = 2) =>
@@ -658,7 +713,170 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
   );
 }
 
-function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
+type AlphaMatrixDatum = {
+  value: [number, number, number];
+  name: string;
+  instrumentKey: string;
+  sector: string;
+  finalScore: number;
+  evidenceStrength: number;
+  coverage: number;
+  persistence: number;
+  status: RankedOpportunity["score"]["status"];
+  sessionReturn: number | null;
+  participationScore: number | null;
+  liquidityScore: number | null;
+};
+
+const MATRIX_STATUS_COLORS: Record<RankedOpportunity["score"]["status"], string> = {
+  high_priority: "#61d3a4",
+  promising: "#76a9ff",
+  watch: "#e4c87e",
+  low_conviction: "#a0aebe",
+  ineligible: "#ff7f8c",
+  insufficient_data: "#8c6f9e",
+};
+
+const escapeTooltip = (value: string) => value.replace(/[&<>"']/g, (character) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+}[character] ?? character));
+
+function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void }) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const chartRef = useRef<echarts.EChartsType | null>(null);
+
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const chart = echarts.init(containerRef.current, undefined, { renderer: "canvas" });
+    chartRef.current = chart;
+    const resizeObserver = new ResizeObserver(() => chart.resize());
+    resizeObserver.observe(containerRef.current);
+    chart.on("click", (params) => {
+      const datum = params.data as AlphaMatrixDatum | undefined;
+      if (datum?.instrumentKey) onSelectStock(datum.instrumentKey);
+    });
+    return () => {
+      resizeObserver.disconnect();
+      chart.dispose();
+      chartRef.current = null;
+    };
+  }, [onSelectStock]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+    const data: AlphaMatrixDatum[] = rows.map((row) => {
+      const componentByKey = Object.fromEntries(row.score.components.map((component) => [component.key, component]));
+      const confidenceBeforeGates = row.score.coverage_percent * row.score.persistence_multiplier;
+      const confidenceProxy = row.score.eligible ? confidenceBeforeGates : Math.min(confidenceBeforeGates, 30);
+      const liquidityScore = componentByKey.liquidity_execution?.score ?? null;
+      return {
+        value: [row.score.final_score, Math.max(0, Math.min(100, confidenceProxy)), liquidityScore ?? 0],
+        name: row.symbol,
+        instrumentKey: row.instrument_key,
+        sector: row.sector ?? "Sector unavailable",
+        finalScore: row.score.final_score,
+        evidenceStrength: row.score.evidence_score,
+        coverage: row.score.coverage_percent,
+        persistence: row.score.persistence_multiplier,
+        status: row.score.status,
+        sessionReturn: row.session_return_percent,
+        participationScore: componentByKey.participation?.score ?? null,
+        liquidityScore,
+      };
+    });
+
+    chart.setOption({
+      animationDuration: 350,
+      animationDurationUpdate: 500,
+      aria: { enabled: true, description: "Opportunity matrix of stock evidence strength and provisional confidence." },
+      grid: { left: 66, right: 28, top: 30, bottom: 68 },
+      tooltip: {
+        trigger: "item",
+        backgroundColor: "#111b26",
+        borderColor: "#34465a",
+        textStyle: { color: "#dce6f2", fontSize: 12 },
+        formatter: (params: { data?: AlphaMatrixDatum }) => {
+          const item = params.data;
+          if (!item) return "";
+          return [
+            `<strong>${escapeTooltip(item.name)}</strong> · ${escapeTooltip(item.sector)}`,
+            `Final opportunity score: ${item.finalScore.toFixed(1)}`,
+            `Evidence strength: ${item.evidenceStrength.toFixed(1)}`,
+            `Confidence proxy: ${item.value[1].toFixed(1)}`,
+            `Coverage: ${item.coverage.toFixed(0)}% · persistence ${item.persistence.toFixed(2)}x`,
+            `Liquidity score: ${item.liquidityScore == null ? "N/A" : item.liquidityScore.toFixed(0)}`,
+            `Participation score: ${item.participationScore == null ? "N/A" : item.participationScore.toFixed(0)}`,
+            `Session: ${item.sessionReturn == null ? "N/A" : `${item.sessionReturn > 0 ? "+" : ""}${item.sessionReturn.toFixed(2)}%`}`,
+            `<span style="color:#91a0b5">Click for the consolidated stock view</span>`,
+          ].join("<br/>");
+        },
+      },
+      xAxis: {
+        type: "value",
+        min: 0,
+        max: 100,
+        name: "OPPORTUNITY SCORE →",
+        nameLocation: "middle",
+        nameGap: 42,
+        nameTextStyle: { color: "#8291a5", fontSize: 11, fontWeight: 700 },
+        axisLabel: { color: "#718095" },
+        axisLine: { lineStyle: { color: "#344255" } },
+        splitLine: { lineStyle: { color: "#202b39", type: "dashed" } },
+      },
+      yAxis: {
+        type: "value",
+        min: 0,
+        max: 100,
+        name: "CONFIDENCE PROXY →",
+        nameLocation: "middle",
+        nameGap: 48,
+        nameTextStyle: { color: "#8291a5", fontSize: 11, fontWeight: 700 },
+        axisLabel: { color: "#718095" },
+        axisLine: { show: true, lineStyle: { color: "#344255" } },
+        splitLine: { lineStyle: { color: "#202b39", type: "dashed" } },
+      },
+      series: [{
+        type: "scatter",
+        data: data.map((item) => ({
+          ...item,
+          symbol: item.status === "ineligible" || item.status === "insufficient_data" ? "diamond" : "circle",
+          itemStyle: { color: MATRIX_STATUS_COLORS[item.status], borderColor: "#dce6f2", borderWidth: 1, opacity: .88 },
+          label: { show: true, formatter: item.name, position: "top", color: "#d7e1ed", fontSize: 9, fontWeight: 700 },
+        })),
+        symbolSize: (value: number[]) => 11 + Math.max(0, Math.min(100, value[2] ?? 20)) * .25,
+        emphasis: { focus: "self", scale: 1.3, label: { show: true, color: "#ffffff", fontSize: 11 } },
+        labelLayout: { hideOverlap: true },
+        markArea: {
+          silent: true,
+          label: { color: "#8291a5", fontSize: 10, fontWeight: 700 },
+          data: [
+            [{ name: "AVOID / INCOMPLETE", xAxis: 0, yAxis: 0, itemStyle: { color: "rgba(255,127,140,.045)" } }, { xAxis: 70, yAxis: 65 }],
+            [{ name: "RELIABLE · LOWER SCORE", xAxis: 0, yAxis: 65, itemStyle: { color: "rgba(118,169,255,.045)" } }, { xAxis: 70, yAxis: 100 }],
+            [{ name: "EMERGING · NEEDS CONFIRMATION", xAxis: 70, yAxis: 0, itemStyle: { color: "rgba(228,200,126,.055)" } }, { xAxis: 100, yAxis: 65 }],
+            [{ name: "STRONG OPPORTUNITY", xAxis: 70, yAxis: 65, itemStyle: { color: "rgba(97,211,164,.065)" } }, { xAxis: 100, yAxis: 100 }],
+          ],
+        },
+      }],
+    }, { notMerge: true });
+  }, [rows]);
+
+  return (
+    <div className="alpha-matrix-shell">
+      <div className="alpha-matrix-heading">
+        <div><h3>Alpha Matrix</h3><p>Opportunity Score versus a provisional coverage-and-persistence confidence proxy</p></div>
+        <div className="alpha-matrix-legend" aria-label="Opportunity status colours">
+          {Object.entries(MATRIX_STATUS_COLORS).map(([status, color]) => <span key={status}><i style={{ background: color }} />{status.replaceAll("_", " ")}</span>)}
+        </div>
+      </div>
+      <div className="alpha-matrix-chart" ref={containerRef} role="img" aria-label="Interactive Alpha Matrix. Select a stock bubble to open its detailed view." />
+      {!rows.length && <p className="alpha-matrix-empty">Waiting for completed-minute opportunities.</p>}
+      <p className="alpha-matrix-note">Bubble size represents liquidity/execution score. Ineligible stocks are pulled into the low-confidence region. Axes and quadrant boundaries are provisional until backtested.</p>
+    </div>
+  );
+}
+
+function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void }) {
   const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental", "catalyst"];
   return (
     <section className="table-card opportunity-card">
@@ -666,6 +884,7 @@ function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
         <div><h2>Explainable opportunity ranking</h2><p>Coverage-adjusted long-continuation candidates, recalculated every completed minute</p></div>
         <span>Pilot v1 · provisional weights · not yet backtested</span>
       </div>
+      <AlphaMatrix rows={rows} onSelectStock={onSelectStock} />
       <div className="table-scroll">
         <table className="opportunity-table">
           <thead><tr><th>Rank</th><th>Stock</th><th>CMP</th><th>Opportunity score</th>{componentKeys.map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}<th>Why it ranks</th><th>Risk / missing</th></tr></thead>
@@ -675,7 +894,13 @@ function OpportunityRankingBoard({ rows }: { rows: RankedOpportunity[] }) {
               return (
                 <tr key={row.instrument_key}>
                   <td className="rank-cell">{row.rank ?? "—"}</td>
-                  <td><strong>{row.symbol}</strong><small>{row.sector ?? "Sector unavailable"}</small><span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span></td>
+                  <td>
+                    <button className="stock-detail-link" type="button" onClick={() => onSelectStock(row.instrument_key)}>
+                      <strong>{row.symbol}</strong><small>View details →</small>
+                    </button>
+                    <small>{row.sector ?? "Sector unavailable"}</small>
+                    <span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span>
+                  </td>
                   <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong><span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span><small>Current market session</small></td>
                   <td><strong className="opportunity-score">{number(row.score.final_score, 1)}</strong><small>Evidence {number(row.score.evidence_score, 1)} · coverage {number(row.score.coverage_percent, 0)}%</small><small>Persistence ×{number(row.score.persistence_multiplier, 2)}</small></td>
                   {componentKeys.map((key) => {
@@ -813,6 +1038,263 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
   );
 }
 
+function FinancialsPanel({ rows }: { rows: FinancialMetricSnapshot[] }) {
+  const crore = (value: number | null) => value == null ? "N/A" : `Rs ${number(value)} cr`;
+  const points = (value: number | null) => value == null ? "N/A" : `${value > 0 ? "+" : ""}${number(value)} pp`;
+
+  return (
+    <section className="table-card financials-card">
+      <div className="table-heading">
+        <div><h2>Financials (Quarterly / Yearly)</h2><p>Latest stored statement-derived metrics for each pilot stock</p></div>
+        <span>Versioned Upstox snapshots · missing values remain N/A</span>
+      </div>
+      <div className="table-scroll">
+        <table className="financials-table">
+          <thead>
+            <tr><th>Stock / reporting</th><th>Revenue growth</th><th>Operating profit</th><th>Net profit</th><th>Margins</th><th>Cash / balance sheet</th><th>Returns</th><th>EPS trend</th><th>Coverage notes</th></tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={`${row.source_snapshot_id}-${row.calculation_version}`}>
+                <td>
+                  <strong>{row.symbol}</strong>
+                  <MetricLine label="Latest quarter" value={row.latest_quarter ?? "N/A"} />
+                  <MetricLine label="Latest annual" value={row.latest_annual_period ?? "N/A"} />
+                  <span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span>
+                </td>
+                <td>
+                  <MetricLine label="QoQ" value={signedPercent(row.growth.revenue_qoq_percent)} valueClass={tone(row.growth.revenue_qoq_percent)} />
+                  <MetricLine label="YoY" value={signedPercent(row.growth.revenue_yoy_percent)} valueClass={tone(row.growth.revenue_yoy_percent)} />
+                </td>
+                <td>
+                  <MetricLine label="QoQ" value={signedPercent(row.growth.operating_profit_qoq_percent)} valueClass={tone(row.growth.operating_profit_qoq_percent)} />
+                  <MetricLine label="YoY" value={signedPercent(row.growth.operating_profit_yoy_percent)} valueClass={tone(row.growth.operating_profit_yoy_percent)} />
+                </td>
+                <td>
+                  <MetricLine label="QoQ" value={signedPercent(row.growth.net_profit_qoq_percent)} valueClass={tone(row.growth.net_profit_qoq_percent)} />
+                  <MetricLine label="YoY" value={signedPercent(row.growth.net_profit_yoy_percent)} valueClass={tone(row.growth.net_profit_yoy_percent)} />
+                </td>
+                <td>
+                  <MetricLine label="Operating" value={percent(row.margins.operating_margin_percent)} />
+                  <MetricLine label="Op QoQ / YoY" value={`${points(row.margins.operating_margin_qoq_change_pp)} / ${points(row.margins.operating_margin_yoy_change_pp)}`} />
+                  <MetricLine label="Net" value={percent(row.margins.net_margin_percent)} />
+                  <MetricLine label="Net QoQ / YoY" value={`${points(row.margins.net_margin_qoq_change_pp)} / ${points(row.margins.net_margin_yoy_change_pp)}`} />
+                </td>
+                <td>
+                  <MetricLine label="Cash conversion" value={percent(row.capital.operating_cash_conversion_percent)} />
+                  <MetricLine label="Debt" value={crore(row.capital.total_debt_crore)} />
+                  <MetricLine label="Debt YoY" value={signedPercent(row.capital.debt_yoy_change_percent)} valueClass={tone(row.capital.debt_yoy_change_percent == null ? null : -row.capital.debt_yoy_change_percent)} />
+                  <MetricLine label="Debt / equity" value={ratio(row.capital.debt_to_equity)} />
+                  <MetricLine label="Liabilities" value={crore(row.capital.total_liabilities_crore)} />
+                  <MetricLine label="Liabilities YoY" value={signedPercent(row.capital.liabilities_yoy_change_percent)} valueClass={tone(row.capital.liabilities_yoy_change_percent == null ? null : -row.capital.liabilities_yoy_change_percent)} />
+                </td>
+                <td>
+                  <MetricLine label="ROE" value={percent(row.capital.roe_percent)} />
+                  <MetricLine label="ROCE" value={percent(row.capital.roce_percent)} />
+                </td>
+                <td>
+                  <MetricLine label={`Basic EPS${row.eps.latest_period ? ` · ${row.eps.latest_period}` : ""}`} value={row.eps.latest_basic_eps == null ? "N/A" : number(row.eps.latest_basic_eps)} />
+                  <MetricLine label="EPS YoY" value={signedPercent(row.eps.yoy_growth_percent)} valueClass={tone(row.eps.yoy_growth_percent)} />
+                  {row.eps.history.length > 0 && <small className="financial-history">{row.eps.history.slice(0, 5).map((item) => `${item.period}: ${typeof item.value === "number" ? number(item.value) : item.value}`).join(" · ")}</small>}
+                </td>
+                <td className="tag-cell">
+                  <MetricLine label="Calculated" value={new Date(row.calculated_at).toLocaleDateString("en-IN")} />
+                  <MetricLine label="Unavailable" value={String(row.unavailable.length)} />
+                  {row.unavailable.slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+                  {row.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+                  {!row.unavailable.length && !row.cautions.length && <span className="evidence-tag">complete inputs</span>}
+                </td>
+              </tr>
+            ))}
+            {!rows.length && <tr><td className="feature-empty" colSpan={9}>No stored financial metrics are available. Use Prepare stocks or Check financial results to populate them.</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
+}
+
+function DetailCard({ title, subtitle, children, wide = false }: { title: string; subtitle?: string; children: ReactNode; wide?: boolean }) {
+  return (
+    <article className={`stock-detail-card ${wide ? "wide" : ""}`}>
+      <div className="stock-detail-card-heading"><h3>{title}</h3>{subtitle && <span>{subtitle}</span>}</div>
+      <div className="stock-detail-card-body">{children}</div>
+    </article>
+  );
+}
+
+type StockDetailPanelProps = {
+  instrumentKey: string;
+  stocks: WatchlistItem[];
+  opportunities: RankedOpportunity[];
+  features: StockFeatures[];
+  regimes: DailyRegime[];
+  evidenceRows: OpportunityEvidence[];
+  financialRows: FinancialMetricSnapshot[];
+  corporateRows: CorporateActionAssessment[];
+  corporateAI: CorporateActionAIAnalysis[];
+  context: MarketContext | null;
+  onBack: () => void;
+};
+
+function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regimes, evidenceRows, financialRows, corporateRows, corporateAI, context, onBack }: StockDetailPanelProps) {
+  const stock = stocks.find((item) => item.instrument_key === instrumentKey);
+  const opportunity = opportunities.find((item) => item.instrument_key === instrumentKey);
+  const feature = features.find((item) => item.instrument_key === instrumentKey);
+  const regime = regimes.find((item) => item.instrument_key === instrumentKey);
+  const evidence = evidenceRows.find((item) => item.instrument_key === instrumentKey);
+  const financial = financialRows.find((item) => item.instrument_key === instrumentKey);
+  const actions = corporateRows.filter((item) => item.instrument_key === instrumentKey);
+  const aiByEvent = Object.fromEntries(corporateAI.map((item) => [item.event_id, item]));
+  const symbol = opportunity?.symbol ?? stock?.symbol ?? feature?.symbol ?? regime?.symbol ?? "Selected stock";
+  const sector = opportunity?.sector ?? stock?.sector ?? feature?.sector ?? regime?.sector;
+
+  return (
+    <section className="stock-detail-shell">
+      <div className="stock-detail-header">
+        <div>
+          <p className="eyebrow">CONSOLIDATED STOCK VIEW</p>
+          <h2>{symbol}</h2>
+          <p>{sector ?? "Sector unavailable"} · information combined from every Q-FAE evidence section</p>
+        </div>
+        <button className="secondary" type="button" onClick={onBack}>← Back to ranking</button>
+      </div>
+
+      <div className="stock-detail-grid">
+        <DetailCard title="Market snapshot" subtitle={stock?.data_state ?? "waiting"}>
+          <div className="detail-hero-metric">
+            <strong className={tone(stock?.change_percent ?? opportunity?.session_return_percent ?? null)}>{stock?.ltp == null ? opportunity?.current_market_price == null ? "N/A" : `₹${number(opportunity.current_market_price)}` : `₹${number(stock.ltp)}`}</strong>
+            <span className={tone(stock?.change_percent ?? opportunity?.session_return_percent ?? null)}>{signedPercent(stock?.change_percent ?? opportunity?.session_return_percent ?? null)}</span>
+          </div>
+          <MetricLine label="Open" value={stock?.open == null ? "N/A" : number(stock.open)} />
+          <MetricLine label="High / low" value={`${stock?.high == null ? "N/A" : number(stock.high)} / ${stock?.low == null ? "N/A" : number(stock.low)}`} />
+          <MetricLine label="Latest minute volume" value={integer(stock?.volume ?? null)} />
+          <MetricLine label="Updated" value={stock?.updated_at ? new Date(stock.updated_at).toLocaleTimeString("en-IN") : "N/A"} />
+        </DetailCard>
+
+        <DetailCard title="Opportunity ranking" subtitle={opportunity ? `Rank ${opportunity.rank ?? "—"}` : "Not ranked"}>
+          {opportunity ? <>
+            <div className="detail-score-row"><strong>{number(opportunity.score.final_score, 1)}</strong><span className={`score-status ${opportunity.score.status}`}>{opportunity.score.status.replaceAll("_", " ")}</span></div>
+            <MetricLine label="Evidence score" value={number(opportunity.score.evidence_score, 1)} />
+            <MetricLine label="Coverage" value={`${number(opportunity.score.coverage_percent, 0)}%`} />
+            <MetricLine label="Persistence" value={`${number(opportunity.score.persistence_multiplier, 2)}x`} />
+            <MetricLine label="Eligible" value={opportunity.score.eligible ? "Yes" : "No"} />
+          </> : <p className="detail-empty">No current opportunity score.</p>}
+        </DetailCard>
+
+        <DetailCard title="Market context" subtitle={context ? new Date(context.as_of).toLocaleTimeString("en-IN") : "Unavailable"}>
+          <MetricLine label="NIFTY 50" value={context?.nifty_50.ltp == null ? "N/A" : number(context.nifty_50.ltp)} />
+          <MetricLine label="NIFTY change" value={signedPercent(context?.nifty_50.change_percent ?? null)} valueClass={tone(context?.nifty_50.change_percent ?? null)} />
+          <MetricLine label="India VIX" value={context?.india_vix.ltp == null ? "N/A" : number(context.india_vix.ltp)} />
+          <MetricLine label="Advance / decline" value={`${context?.advancers ?? 0} / ${context?.decliners ?? 0}`} />
+          <MetricLine label="Median spread" value={context?.median_spread_bps == null ? "N/A" : `${number(context.median_spread_bps)} bps`} />
+        </DetailCard>
+
+        <DetailCard title="VWAP, gap and opening ranges" subtitle={feature?.data_quality ?? "Unavailable"}>
+          {feature ? <>
+            <MetricLine label="VWAP position" value={signedPercent(feature.vwap.position_percent)} valueClass={tone(feature.vwap.position_percent)} />
+            <MetricLine label="VWAP 5m slope/min" value={signedPercent(feature.vwap.slope_5m_percent_per_minute)} valueClass={tone(feature.vwap.slope_5m_percent_per_minute)} />
+            <MetricLine label="Opening gap" value={signedPercent(feature.gap.gap_percent)} valueClass={tone(feature.gap.gap_percent)} />
+            <MetricLine label="Gap retention" value={signedPercent(feature.gap.retention_percent)} valueClass={tone(feature.gap.retention_percent)} />
+            <div className="detail-range-list">{feature.opening_ranges.map((range) => <span key={range.minutes}><b>{range.minutes}m</b>{range.ready ? `${range.position} · ${signedPercent(range.breakout_percent)}` : "forming"}</span>)}</div>
+          </> : <p className="detail-empty">Intraday features will appear after a completed market minute.</p>}
+        </DetailCard>
+
+        <DetailCard title="Momentum and relative strength" subtitle={feature?.momentum.state.replaceAll("_", " ")}>
+          {feature ? <>
+            <MetricLine label="1m / 5m return" value={`${signedPercent(feature.momentum.return_1m_percent)} / ${signedPercent(feature.momentum.return_5m_percent)}`} />
+            <MetricLine label="15m / 30m return" value={`${signedPercent(feature.momentum.return_15m_percent)} / ${signedPercent(feature.momentum.return_30m_percent)}`} />
+            <MetricLine label="15m efficiency" value={ratio(feature.momentum.efficiency_ratio_15m)} />
+            <MetricLine label="Bullish candles (10m)" value={percent(feature.momentum.bullish_candle_ratio_10m == null ? null : feature.momentum.bullish_candle_ratio_10m * 100)} />
+            <MetricLine label="Versus NIFTY" value={signedPercent(feature.relative_strength.versus_nifty_percent)} valueClass={tone(feature.relative_strength.versus_nifty_percent)} />
+            <MetricLine label="Versus sector" value={signedPercent(feature.relative_strength.versus_sector_percent)} valueClass={tone(feature.relative_strength.versus_sector_percent)} />
+            <MetricLine label="Pilot percentile" value={feature.relative_strength.universe_percentile == null ? "N/A" : `${number(feature.relative_strength.universe_percentile, 0)} pct`} />
+          </> : <p className="detail-empty">No current-session momentum evidence.</p>}
+        </DetailCard>
+
+        <DetailCard title="Volume and liquidity" subtitle={evidence?.flow_liquidity.confirmation.replaceAll("_", " ") ?? feature?.liquidity.state ?? "Unavailable"}>
+          <MetricLine label="Intraday RVOL" value={multiple(feature?.volume.relative_volume ?? stock?.relative_volume ?? null)} />
+          <MetricLine label="Volume acceleration" value={multiple(feature?.volume.acceleration_ratio ?? null)} />
+          <MetricLine label="Traded value" value={tradedValue(feature?.liquidity.total_traded_value_inr ?? null)} />
+          <MetricLine label="Spread" value={(feature?.liquidity.spread_bps ?? stock?.spread_bps) == null ? "N/A" : `${number((feature?.liquidity.spread_bps ?? stock?.spread_bps) as number)} bps`} />
+          <MetricLine label="Depth imbalance" value={ratio(feature?.liquidity.depth_imbalance ?? null)} valueClass={tone(feature?.liquidity.depth_imbalance ?? null)} />
+          <MetricLine label="Spread filter" value={feature?.liquidity.passes_spread_filter == null ? "N/A" : feature.liquidity.passes_spread_filter ? "Pass" : "Reject"} />
+          <MetricLine label="Traded-value filter" value={feature?.liquidity.passes_traded_value_filter == null ? "N/A" : feature.liquidity.passes_traded_value_filter ? "Pass" : "Reject"} />
+        </DetailCard>
+
+        <DetailCard title="Daily trend and structure" subtitle={regime ? `${regime.sessions_available} sessions · ${regime.trend.regime.replaceAll("_", " ")}` : "Unavailable"} wide>
+          {regime ? <div className="detail-two-column">
+            <div>
+              <MetricLine label="Versus SMA20" value={signedPercent(regime.trend.above_sma_20_percent)} valueClass={tone(regime.trend.above_sma_20_percent)} />
+              <MetricLine label="Versus SMA50" value={signedPercent(regime.trend.above_sma_50_percent)} valueClass={tone(regime.trend.above_sma_50_percent)} />
+              <MetricLine label="SMA20 slope (5d)" value={signedPercent(regime.trend.sma_20_slope_5d_percent)} valueClass={tone(regime.trend.sma_20_slope_5d_percent)} />
+              <MetricLine label="SMA50 slope (10d)" value={signedPercent(regime.trend.sma_50_slope_10d_percent)} valueClass={tone(regime.trend.sma_50_slope_10d_percent)} />
+              <MetricLine label="From 252d high" value={signedPercent(regime.structure.drawdown_from_252d_high_percent)} />
+              <MetricLine label="Daily RVOL" value={multiple(regime.participation.relative_volume)} />
+              <MetricLine label="ATR14" value={percent(regime.volatility.atr_14_percent)} />
+            </div>
+            <div className="detail-horizons">{regime.horizon_performance.map((horizon) => <span key={horizon.sessions}><b>{horizon.sessions} sessions</b><strong className={tone(horizon.stock_return_percent)}>{signedPercent(horizon.stock_return_percent)}</strong><small className={tone(horizon.versus_nifty_percent)}>vs NIFTY {signedPercent(horizon.versus_nifty_percent)}</small><small className={tone(horizon.versus_sector_percent)}>vs sector {signedPercent(horizon.versus_sector_percent)}</small></span>)}</div>
+          </div> : <p className="detail-empty">Prepare daily history to calculate the stock regime.</p>}
+        </DetailCard>
+
+        <DetailCard title="Evidence, persistence and risk" subtitle={evidence?.confluence.replaceAll("_", " ") ?? "Unavailable"} wide>
+          {evidence ? <>
+            <div className="detail-pillar-grid">{evidence.pillars.map((pillar) => <div key={pillar.key}><span className={`pillar-state ${pillar.state}`}>{pillar.label}</span><small>{pillar.supportive_checks} supportive · {pillar.caution_checks} cautions</small></div>)}</div>
+            <div className="detail-two-column detail-tag-groups">
+              <div><h4>Positive evidence</h4>{evidence.pillars.flatMap((pillar) => pillar.evidence).slice(0, 8).map((item, index) => <span className="evidence-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div>
+              <div><h4>Risk and cautions</h4>{[...evidence.validation_notes, ...evidence.pillars.flatMap((pillar) => pillar.cautions), ...(evidence.risk_assessment?.gates.filter((gate) => gate.status !== "pass").map((gate) => `${gate.key}_${gate.status}`) ?? [])].slice(0, 8).map((item, index) => <span className="caution-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div>
+            </div>
+            {evidence.signal_persistence && <MetricLine label="Signal persistence" value={`${evidence.signal_persistence.state} · ${evidence.signal_persistence.supportive_minutes}/${evidence.signal_persistence.observed_minutes} supportive minutes`} />}
+          </> : <p className="detail-empty">No validated confluence snapshot is available.</p>}
+        </DetailCard>
+
+        <DetailCard title="Financial growth and profitability" subtitle={financial ? `${financial.latest_quarter ?? "Quarter N/A"} · ${financial.data_quality}` : "Loading or unavailable"}>
+          {financial ? <>
+            <MetricLine label="Revenue QoQ / YoY" value={`${signedPercent(financial.growth.revenue_qoq_percent)} / ${signedPercent(financial.growth.revenue_yoy_percent)}`} />
+            <MetricLine label="Operating profit QoQ / YoY" value={`${signedPercent(financial.growth.operating_profit_qoq_percent)} / ${signedPercent(financial.growth.operating_profit_yoy_percent)}`} />
+            <MetricLine label="Net profit QoQ / YoY" value={`${signedPercent(financial.growth.net_profit_qoq_percent)} / ${signedPercent(financial.growth.net_profit_yoy_percent)}`} />
+            <MetricLine label="Operating margin" value={percent(financial.margins.operating_margin_percent)} />
+            <MetricLine label="Net margin" value={percent(financial.margins.net_margin_percent)} />
+            <MetricLine label="EPS / EPS YoY" value={`${financial.eps.latest_basic_eps == null ? "N/A" : number(financial.eps.latest_basic_eps)} / ${signedPercent(financial.eps.yoy_growth_percent)}`} />
+          </> : <p className="detail-empty">No stored financial metric snapshot for this stock.</p>}
+        </DetailCard>
+
+        <DetailCard title="Financial quality and capital" subtitle={financial?.latest_annual_period ?? "Annual period unavailable"}>
+          {financial ? <>
+            <MetricLine label="Cash conversion" value={percent(financial.capital.operating_cash_conversion_percent)} />
+            <MetricLine label="Debt" value={financial.capital.total_debt_crore == null ? "N/A" : `Rs ${number(financial.capital.total_debt_crore)} cr`} />
+            <MetricLine label="Debt / equity" value={ratio(financial.capital.debt_to_equity)} />
+            <MetricLine label="Liabilities" value={financial.capital.total_liabilities_crore == null ? "N/A" : `Rs ${number(financial.capital.total_liabilities_crore)} cr`} />
+            <MetricLine label="ROE / ROCE" value={`${percent(financial.capital.roe_percent)} / ${percent(financial.capital.roce_percent)}`} />
+            <MetricLine label="Missing inputs" value={String(financial.unavailable.length)} />
+            {financial.unavailable.slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+          </> : <p className="detail-empty">Use Check financial results to populate available provider data.</p>}
+        </DetailCard>
+
+        <DetailCard title="Corporate actions and catalysts" subtitle={`${actions.length} stored assessment${actions.length === 1 ? "" : "s"}`} wide>
+          {actions.length ? <div className="detail-action-list">{actions.map((action) => {
+            const ai = aiByEvent[action.event_id];
+            return <div key={action.event_id}>
+              <span className={`direction-badge ${action.direction}`}>{action.direction}</span>
+              <strong>{action.category.replaceAll("_", " ")}</strong>
+              <MetricLine label="Materiality / sentiment" value={`${number(action.materiality_score, 0)} / ${action.sentiment_score > 0 ? "+" : ""}${number(action.sentiment_score, 0)}`} />
+              <MetricLine label="Horizon / confidence" value={`${action.impact_horizon.replaceAll("_", " ")} / ${number(action.confidence * 100, 0)}%`} />
+              {ai?.grounded && <MetricLine label="Grounded AI impact" value={ai.impact_score == null ? "N/A" : `${ai.impact_score > 0 ? "+" : ""}${number(ai.impact_score, 0)}`} valueClass={tone(ai.impact_score)} />}
+              {action.evidence.slice(0, 2).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+              {action.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+            </div>;
+          })}</div> : <p className="detail-empty">No active corporate-action assessment for this stock.</p>}
+        </DetailCard>
+
+        {opportunity && <DetailCard title="Why it ranks" subtitle={opportunity.score.model_version} wide>
+          <div className="detail-component-grid">{opportunity.score.components.map((component) => <div key={component.key}><strong>{component.label}</strong><span>{component.score == null ? "N/A" : number(component.score, 0)}</span><small>{number(component.weight_percent, 0)}% weight · {number(component.coverage_percent, 0)}% covered · {number(component.contribution_points, 1)} points</small></div>)}</div>
+          <div className="detail-two-column detail-tag-groups"><div><h4>Top positives</h4>{opportunity.score.top_positive_factors.map((item, index) => <span className="evidence-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div><div><h4>Cautions / invalidations</h4>{[...opportunity.score.invalidation_reasons, ...opportunity.score.top_cautions].map((item, index) => <span className="caution-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div></div>
+        </DetailCard>}
+      </div>
+    </section>
+  );
+}
+
 function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCheckReport; onClose: () => void }) {
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
@@ -843,7 +1325,7 @@ function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCh
   );
 }
 
-type AnalysisTab = "opportunities" | "intraday" | "corporate" | "evidence" | "daily" | "stocks";
+type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "corporate" | "evidence" | "daily" | "financials" | "stocks";
 
 const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "opportunities", label: "Opportunity Ranking" },
@@ -851,6 +1333,7 @@ const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "corporate", label: "Corporate Actions" },
   { id: "evidence", label: "Evidence Confluence" },
   { id: "daily", label: "Daily Regime" },
+  { id: "financials", label: "Financials (Qtrly/Yearly)" },
   { id: "stocks", label: "Approved Stocks" },
 ];
 
@@ -865,7 +1348,9 @@ function Dashboard() {
   const [opportunities, setOpportunities] = useState<RankedOpportunity[]>([]);
   const [corporateActions, setCorporateActions] = useState<CorporateActionAssessment[]>([]);
   const [corporateActionAI, setCorporateActionAI] = useState<CorporateActionAIAnalysis[]>([]);
+  const [financialMetrics, setFinancialMetrics] = useState<FinancialMetricSnapshot[]>([]);
   const [financialResultReport, setFinancialResultReport] = useState<FinancialResultCheckReport | null>(null);
+  const [selectedInstrumentKey, setSelectedInstrumentKey] = useState<string | null>(null);
   const [activeAnalysisTab, setActiveAnalysisTab] = useState<AnalysisTab>("opportunities");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -901,11 +1386,24 @@ function Dashboard() {
     }
   }, []);
 
+  const loadFinancialMetrics = useCallback(async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/market/financial-metrics?limit=5000&latest_only=true`);
+      setFinancialMetrics(response.ok ? await response.json() as FinancialMetricSnapshot[] : []);
+    } catch {
+      setFinancialMetrics([]);
+    }
+  }, []);
+
   useEffect(() => {
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (activeAnalysisTab === "financials" || activeAnalysisTab === "stock_detail") void loadFinancialMetrics();
+  }, [activeAnalysisTab, loadFinancialMetrics]);
 
   const runAction = async (action: "bootstrap" | "live/start" | "live/stop" | "reconcile") => {
     setBusy(action);
@@ -928,13 +1426,14 @@ function Dashboard() {
     setBusy("financial-results");
     setError(null);
     try {
-      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 20}`, { method: "POST" });
+      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 100}`, { method: "POST" });
       if (!response.ok) {
         const payload = await response.json() as { detail?: string };
         throw new Error(payload.detail ?? "Financial results could not be checked");
       }
       setFinancialResultReport(await response.json() as FinancialResultCheckReport);
       await refresh();
+      await loadFinancialMetrics();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Financial results could not be checked");
     } finally {
@@ -946,7 +1445,16 @@ function Dashboard() {
   const reconciling = runtime?.reconciliation.state === "running";
   const live = runtime?.live.connected === true;
   const liveStarting = ["connecting", "reconnecting"].includes(runtime?.live.state ?? "");
-  const pilotSize = runtime?.pilot_size ?? 20;
+  const pilotSize = runtime?.pilot_size ?? 100;
+  const selectedOpportunity = opportunities.find((item) => item.instrument_key === selectedInstrumentKey);
+  const analysisTabs = selectedInstrumentKey
+    ? [ANALYSIS_TABS[0], { id: "stock_detail" as const, label: `${selectedOpportunity?.symbol ?? "Stock"} Detail` }, ...ANALYSIS_TABS.slice(1)]
+    : ANALYSIS_TABS;
+
+  const openStockDetail = useCallback((instrumentKey: string) => {
+    setSelectedInstrumentKey(instrumentKey);
+    setActiveAnalysisTab("stock_detail");
+  }, []);
 
   return (
     <main className="dashboard-shell">
@@ -1003,7 +1511,7 @@ function Dashboard() {
 
       <section className="analysis-workspace" aria-label="Market analysis workspace">
         <div className="analysis-tabs" role="tablist" aria-label="Analysis sections">
-          {ANALYSIS_TABS.map((tab) => (
+          {analysisTabs.map((tab) => (
             <button
               className={`analysis-tab ${activeAnalysisTab === tab.id ? "active" : ""}`}
               id={`analysis-tab-${tab.id}`}
@@ -1020,11 +1528,27 @@ function Dashboard() {
           ))}
         </div>
         <div className="analysis-tab-panel" id={`analysis-panel-${activeAnalysisTab}`} role="tabpanel" aria-labelledby={`analysis-tab-${activeAnalysisTab}`}>
-          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} />}
+          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} onSelectStock={openStockDetail} />}
+          {activeAnalysisTab === "stock_detail" && selectedInstrumentKey && (
+            <StockDetailPanel
+              instrumentKey={selectedInstrumentKey}
+              stocks={stocks}
+              opportunities={opportunities}
+              features={features}
+              regimes={regimes}
+              evidenceRows={evidence}
+              financialRows={financialMetrics}
+              corporateRows={corporateActions}
+              corporateAI={corporateActionAI}
+              context={context}
+              onBack={() => setActiveAnalysisTab("opportunities")}
+            />
+          )}
           {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} />}
           {activeAnalysisTab === "corporate" && <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />}
           {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} />}
           {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} />}
+          {activeAnalysisTab === "financials" && <FinancialsPanel rows={financialMetrics} />}
           {activeAnalysisTab === "stocks" && <ApprovedStocksPanel stocks={stocks} />}
         </div>
       </section>
