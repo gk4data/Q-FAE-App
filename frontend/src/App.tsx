@@ -275,6 +275,11 @@ type RankedOpportunity = {
   as_of: string;
   current_market_price: number | null;
   session_return_percent: number | null;
+  day_open: number | null;
+  day_high: number | null;
+  day_low: number | null;
+  day_close: number | null;
+  price_trace: number[];
   score: {
     model_version: string;
     strategy: string;
@@ -413,6 +418,93 @@ const tradedValue = (value: number | null) => {
   return `Rs ${integer(value)}`;
 };
 
+type SortDirection = "asc" | "desc";
+type SortValue = number | string | boolean | null | undefined;
+type SortState = { key: string; direction: SortDirection };
+
+function useSortableRows<T>(
+  rows: T[],
+  accessors: Record<string, (row: T) => SortValue>,
+  initialKey: string,
+  initialDirection: SortDirection = "desc",
+) {
+  const [sort, setSort] = useState<SortState>({ key: initialKey, direction: initialDirection });
+  const sortedRows = [...rows].sort((left, right) => {
+    const leftValue = accessors[sort.key]?.(left);
+    const rightValue = accessors[sort.key]?.(right);
+    const leftMissing = leftValue == null || leftValue === "";
+    const rightMissing = rightValue == null || rightValue === "";
+    if (leftMissing || rightMissing) {
+      if (leftMissing && rightMissing) return 0;
+      return leftMissing ? 1 : -1;
+    }
+    const comparison = typeof leftValue === "number" && typeof rightValue === "number"
+      ? leftValue - rightValue
+      : String(leftValue).localeCompare(String(rightValue), "en-IN", { numeric: true, sensitivity: "base" });
+    return sort.direction === "asc" ? comparison : -comparison;
+  });
+  const requestSort = (key: string, defaultDirection: SortDirection = "desc") => {
+    setSort((current) => current.key === key
+      ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: defaultDirection });
+  };
+  return { sortedRows, sort, requestSort };
+}
+
+function SortableHeader({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  defaultDirection = "desc",
+}: {
+  label: string;
+  sortKey: string;
+  sort: SortState;
+  onSort: (key: string, defaultDirection?: SortDirection) => void;
+  defaultDirection?: SortDirection;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <th aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}>
+      <button className={`sort-header ${active ? "active" : ""}`} type="button" onClick={() => onSort(sortKey, defaultDirection)}>
+        <span>{label}</span><i aria-hidden="true">{active ? (sort.direction === "asc" ? "↑" : "↓") : "↕"}</i>
+      </button>
+    </th>
+  );
+}
+
+function PriceSparkline({ values, instrumentKey, sessionReturn }: { values: number[]; instrumentKey: string; sessionReturn: number | null }) {
+  const series = values.filter((value) => Number.isFinite(value));
+  if (series.length < 2) return <span className="sparkline-empty">Waiting for minute trace</span>;
+  const width = 132;
+  const height = 48;
+  const padding = 3;
+  const minimum = Math.min(...series);
+  const maximum = Math.max(...series);
+  const range = maximum - minimum || Math.max(Math.abs(maximum) * .002, 1);
+  const coordinates = series.map((value, index) => ({
+    x: padding + (index / (series.length - 1)) * (width - padding * 2),
+    y: padding + ((maximum - value) / range) * (height - padding * 2),
+  }));
+  const points = coordinates.map(({ x, y }) => `${x.toFixed(2)},${y.toFixed(2)}`).join(" ");
+  const area = `M ${coordinates.map(({ x, y }) => `${x.toFixed(2)} ${y.toFixed(2)}`).join(" L ")} L ${width - padding} ${height - padding} L ${padding} ${height - padding} Z`;
+  const rising = series.at(-1)! > series[0] || (series.at(-1) === series[0] && (sessionReturn ?? 0) >= 0);
+  const gradientId = `spark-${instrumentKey.replace(/[^a-zA-Z0-9]/g, "")}`;
+  return (
+    <svg className={`price-sparkline ${rising ? "rising" : "falling"}`} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Recent ${series.length}-minute price trace`} preserveAspectRatio="none">
+      <defs>
+        <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0%" stopColor="currentColor" stopOpacity=".4" />
+          <stop offset="100%" stopColor="currentColor" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <path className="sparkline-area" d={area} fill={`url(#${gradientId})`} />
+      <polyline className="sparkline-line" points={points} />
+    </svg>
+  );
+}
+
 function Brand() {
   return (
     <div className="brand-lockup">
@@ -543,6 +635,15 @@ function MetricLine({ label, value, valueClass = "" }: { label: string; value: s
 }
 
 function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
+  const { sortedRows, sort, requestSort } = useSortableRows(regimes, {
+    symbol: (row) => row.symbol,
+    horizons: (row) => row.horizon_performance.find((item) => item.sessions === 20)?.stock_return_percent,
+    trend: (row) => row.trend.above_sma_20_percent,
+    structure: (row) => row.structure.distance_to_20d_high_percent,
+    participation: (row) => row.participation.relative_volume,
+    volatility: (row) => row.volatility.atr_14_percent,
+    evidence: (row) => row.evidence.length - row.cautions.length,
+  }, "horizons");
   return (
     <section className="table-card regime-card">
       <div className="table-heading">
@@ -551,9 +652,17 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
       </div>
       <div className="table-scroll">
         <table className="regime-table">
-          <thead><tr><th>Stock</th><th>5 / 20 / 60 / 120 / 250 sessions</th><th>Trend alignment</th><th>Price structure</th><th>Participation</th><th>Volatility</th><th>Evidence and cautions</th></tr></thead>
+          <thead><tr>
+            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="5 / 20 / 60 / 120 / 250 sessions" sortKey="horizons" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Trend alignment" sortKey="trend" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Price structure" sortKey="structure" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Participation" sortKey="participation" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Volatility" sortKey="volatility" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Evidence and cautions" sortKey="evidence" sort={sort} onSort={requestSort} />
+          </tr></thead>
           <tbody>
-            {regimes.map((regime) => (
+            {sortedRows.map((regime) => (
               <tr key={regime.instrument_key}>
                 <td>
                   <strong>{regime.symbol}</strong>
@@ -620,6 +729,18 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
 function FeatureMatrix({ features }: { features: StockFeatures[] }) {
   const openingRange = (feature: StockFeatures, minutes: number) =>
     feature.opening_ranges.find((range) => range.minutes === minutes);
+  const { sortedRows, sort, requestSort } = useSortableRows(features, {
+    symbol: (row) => row.symbol,
+    vwap: (row) => row.vwap.position_percent,
+    gap: (row) => row.gap.gap_percent,
+    opening_ranges: (row) => openingRange(row, 30)?.breakout_percent,
+    relative_strength: (row) => row.relative_strength.versus_nifty_percent,
+    momentum: (row) => row.momentum.return_15m_percent,
+    volume: (row) => row.volume.relative_volume,
+    pullback: (row) => row.pullback.recovery_fraction,
+    volatility: (row) => row.volatility.atr_percent,
+    liquidity: (row) => row.liquidity.spread_bps,
+  }, "relative_strength");
 
   return (
     <section className="table-card feature-card">
@@ -631,12 +752,20 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
         <table className="feature-table">
           <thead>
             <tr>
-              <th>Stock</th><th>VWAP</th><th>Opening gap</th><th>Opening ranges</th><th>Relative strength</th>
-              <th>Momentum</th><th>Volume</th><th>Pullback</th><th>ATR / volatility</th><th>Liquidity</th>
+              <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+              <SortableHeader label="VWAP" sortKey="vwap" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Opening gap" sortKey="gap" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Opening ranges" sortKey="opening_ranges" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Relative strength" sortKey="relative_strength" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Momentum" sortKey="momentum" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Volume" sortKey="volume" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Pullback" sortKey="pullback" sort={sort} onSort={requestSort} />
+              <SortableHeader label="ATR / volatility" sortKey="volatility" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Liquidity" sortKey="liquidity" sort={sort} onSort={requestSort} defaultDirection="asc" />
             </tr>
           </thead>
           <tbody>
-            {features.map((feature) => {
+            {sortedRows.map((feature) => {
               const ranges = [5, 15, 30].map((minutes) => ({ minutes, range: openingRange(feature, minutes) }));
               return (
                 <tr key={feature.instrument_key}>
@@ -878,6 +1007,25 @@ function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSel
 
 function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void }) {
   const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental", "catalyst"];
+  const componentScore = (row: RankedOpportunity, key: string) => row.score.components.find((item) => item.key === key)?.score;
+  const traceReturn = (row: RankedOpportunity) => row.price_trace.length > 1 && row.price_trace[0] > 0
+    ? ((row.price_trace.at(-1)! - row.price_trace[0]) / row.price_trace[0]) * 100
+    : null;
+  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
+    rank: (row) => row.rank,
+    symbol: (row) => row.symbol,
+    setup: traceReturn,
+    cmp: (row) => row.session_return_percent,
+    score: (row) => row.score.final_score,
+    price_trend: (row) => componentScore(row, "price_trend"),
+    participation: (row) => componentScore(row, "participation"),
+    market_sector: (row) => componentScore(row, "market_sector"),
+    liquidity_execution: (row) => componentScore(row, "liquidity_execution"),
+    fundamental: (row) => componentScore(row, "fundamental"),
+    catalyst: (row) => componentScore(row, "catalyst"),
+    positives: (row) => row.score.top_positive_factors.length,
+    risks: (row) => row.score.invalidation_reasons.length + row.score.top_cautions.length,
+  }, "score");
   return (
     <section className="table-card opportunity-card">
       <div className="table-heading">
@@ -887,9 +1035,18 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
       <AlphaMatrix rows={rows} onSelectStock={onSelectStock} />
       <div className="table-scroll">
         <table className="opportunity-table">
-          <thead><tr><th>Rank</th><th>Stock</th><th>CMP</th><th>Opportunity score</th>{componentKeys.map((key) => <th key={key}>{key.replaceAll("_", " ")}</th>)}<th>Why it ranks</th><th>Risk / missing</th></tr></thead>
+          <thead><tr>
+            <SortableHeader label="Rank" sortKey="rank" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Current setup" sortKey="setup" sort={sort} onSort={requestSort} />
+            <SortableHeader label="CMP" sortKey="cmp" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Opportunity score" sortKey="score" sort={sort} onSort={requestSort} />
+            {componentKeys.map((key) => <SortableHeader key={key} label={key.replaceAll("_", " ")} sortKey={key} sort={sort} onSort={requestSort} />)}
+            <SortableHeader label="Why it ranks" sortKey="positives" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Risk / missing" sortKey="risks" sort={sort} onSort={requestSort} defaultDirection="asc" />
+          </tr></thead>
           <tbody>
-            {rows.map((row) => {
+            {sortedRows.map((row) => {
               const components = Object.fromEntries(row.score.components.map((component) => [component.key, component]));
               return (
                 <tr key={row.instrument_key}>
@@ -901,7 +1058,17 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
                     <small>{row.sector ?? "Sector unavailable"}</small>
                     <span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span>
                   </td>
-                  <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong><span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span><small>Current market session</small></td>
+                  <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
+                  <td className="numeric cmp-cell">
+                    <strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong>
+                    <span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span>
+                    <div className="day-ohlc" aria-label="Current trading day OHLC">
+                      <span><b>O</b>{row.day_open == null ? "—" : number(row.day_open)}</span>
+                      <span><b>H</b>{row.day_high == null ? "—" : number(row.day_high)}</span>
+                      <span><b>L</b>{row.day_low == null ? "—" : number(row.day_low)}</span>
+                      <span><b>C</b>{row.day_close == null ? "—" : number(row.day_close)}</span>
+                    </div>
+                  </td>
                   <td><strong className="opportunity-score">{number(row.score.final_score, 1)}</strong><small>Evidence {number(row.score.evidence_score, 1)} · coverage {number(row.score.coverage_percent, 0)}%</small><small>Persistence ×{number(row.score.persistence_multiplier, 2)}</small></td>
                   {componentKeys.map((key) => {
                     const component = components[key];
@@ -912,7 +1079,7 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
                 </tr>
               );
             })}
-            {!rows.length && <tr><td className="feature-empty" colSpan={12}>Waiting for completed-minute evidence and risk checks before ranking opportunities.</td></tr>}
+            {!rows.length && <tr><td className="feature-empty" colSpan={13}>Waiting for completed-minute evidence and risk checks before ranking opportunities.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -921,6 +1088,25 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
 }
 
 function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
+  const confluenceOrder: Record<OpportunityEvidence["confluence"], number> = {
+    strong_support: 5, supportive: 4, mixed: 3, caution: 2, insufficient: 1,
+  };
+  const pillarStrength = (row: OpportunityEvidence, key: string) => {
+    const pillar = row.pillars.find((item) => item.key === key);
+    return pillar ? pillar.supportive_checks - pillar.caution_checks : null;
+  };
+  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
+    symbol: (row) => row.symbol,
+    confluence: (row) => confluenceOrder[row.confluence],
+    persistence: (row) => row.signal_persistence?.supportive_minutes,
+    risk: (row) => row.risk_assessment?.eligible,
+    intraday: (row) => pillarStrength(row, "intraday"),
+    daily: (row) => pillarStrength(row, "daily"),
+    relative_strength: (row) => pillarStrength(row, "relative_strength"),
+    confirmation: (row) => row.flow_liquidity.relative_volume,
+    corporate: (row) => row.corporate_action_context?.effective_score,
+    validation: (row) => row.validation_notes.length,
+  }, "confluence");
   return (
     <section className="table-card evidence-card">
       <div className="table-heading">
@@ -929,9 +1115,20 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
       </div>
       <div className="table-scroll">
         <table className="evidence-table">
-          <thead><tr><th>Stock</th><th>Confluence</th><th>Persistence</th><th>Risk gates</th><th>Intraday</th><th>Daily regime</th><th>NIFTY / sector</th><th>Volume / liquidity</th><th>Corporate event</th><th>Validation</th></tr></thead>
+          <thead><tr>
+            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Confluence" sortKey="confluence" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Persistence" sortKey="persistence" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Risk gates" sortKey="risk" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Intraday" sortKey="intraday" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Daily regime" sortKey="daily" sort={sort} onSort={requestSort} />
+            <SortableHeader label="NIFTY / sector" sortKey="relative_strength" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Volume / liquidity" sortKey="confirmation" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Corporate event" sortKey="corporate" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Validation" sortKey="validation" sort={sort} onSort={requestSort} defaultDirection="asc" />
+          </tr></thead>
           <tbody>
-            {rows.map((row) => {
+            {sortedRows.map((row) => {
               const pillars = Object.fromEntries(row.pillars.map((pillar) => [pillar.key, pillar]));
               return (
                 <tr key={row.instrument_key}>
@@ -972,6 +1169,17 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
 
 function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessment[]; analyses: CorporateActionAIAnalysis[] }) {
   const aiByEvent = Object.fromEntries(analyses.map((item) => [item.event_id, item]));
+  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
+    symbol: (row) => row.symbol,
+    action: (row) => row.category,
+    direction: (row) => row.sentiment_score,
+    materiality: (row) => row.materiality_score,
+    sentiment: (row) => row.sentiment_score,
+    metrics: (row) => Object.keys(row.derived_metrics).length,
+    confidence: (row) => row.confidence,
+    ai: (row) => aiByEvent[row.event_id]?.impact_score,
+    review: (row) => row.cautions.length,
+  }, "materiality");
   return (
     <section className="table-card corporate-action-card">
       <div className="table-heading">
@@ -980,8 +1188,18 @@ function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessm
       </div>
       <div className="table-scroll">
         <table className="corporate-action-table">
-          <thead><tr><th>Stock</th><th>Action</th><th>Direction</th><th>Materiality</th><th>Sentiment</th><th>Derived metrics</th><th>Confidence</th><th>Grounded AI</th><th>Review notes</th></tr></thead>
-          <tbody>{rows.map((row) => {
+          <thead><tr>
+            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Action" sortKey="action" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Direction" sortKey="direction" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Materiality" sortKey="materiality" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Sentiment" sortKey="sentiment" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Derived metrics" sortKey="metrics" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Confidence" sortKey="confidence" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Grounded AI" sortKey="ai" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Review notes" sortKey="review" sort={sort} onSort={requestSort} defaultDirection="asc" />
+          </tr></thead>
+          <tbody>{sortedRows.map((row) => {
             const ai = aiByEvent[row.event_id];
             return <tr key={`${row.event_id}-${row.assessment_version}`}>
               <td><strong>{row.symbol}</strong><small>{row.reference_price_date ? `Reference ${row.reference_price_date}` : "Reference price unavailable"}</small></td>
@@ -1003,17 +1221,38 @@ function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessm
 }
 
 function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
+  const { sortedRows, sort, requestSort } = useSortableRows(stocks, {
+    symbol: (row) => row.symbol,
+    sector: (row) => row.sector,
+    ltp: (row) => row.ltp,
+    change: (row) => row.change_percent,
+    candle: (row) => row.close,
+    volume: (row) => row.volume,
+    rvol: (row) => row.relative_volume,
+    spread: (row) => row.spread_bps,
+    state: (row) => row.data_state,
+  }, "change");
   return (
     <section className="table-card">
       <div className="table-heading">
         <div><h2>Approved stocks</h2><p>Latest available one-minute values</p></div>
-        <span>Refreshes every 5 seconds · calculations every 60 seconds</span>
+        <span>Live quotes refresh every 5 seconds · analysis refreshes every 15 seconds · calculations every 60 seconds</span>
       </div>
       <div className="table-scroll">
         <table>
-          <thead><tr><th>Stock</th><th>Sector</th><th>LTP</th><th>Change</th><th>1m O / H / L / C</th><th>Volume</th><th>RVOL</th><th>Spread</th><th>State</th></tr></thead>
+          <thead><tr>
+            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Sector" sortKey="sector" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="LTP" sortKey="ltp" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Change" sortKey="change" sort={sort} onSort={requestSort} />
+            <SortableHeader label="1m O / H / L / C" sortKey="candle" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Volume" sortKey="volume" sort={sort} onSort={requestSort} />
+            <SortableHeader label="RVOL" sortKey="rvol" sort={sort} onSort={requestSort} />
+            <SortableHeader label="Spread" sortKey="spread" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="State" sortKey="state" sort={sort} onSort={requestSort} defaultDirection="asc" />
+          </tr></thead>
           <tbody>
-            {stocks.map((stock) => (
+            {sortedRows.map((stock) => (
               <tr key={stock.instrument_key}>
                 <td><strong>{stock.symbol}</strong><small>{stock.company_name}</small></td>
                 <td>{stock.sector ?? "—"}</td>
@@ -1041,6 +1280,17 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
 function FinancialsPanel({ rows }: { rows: FinancialMetricSnapshot[] }) {
   const crore = (value: number | null) => value == null ? "N/A" : `Rs ${number(value)} cr`;
   const points = (value: number | null) => value == null ? "N/A" : `${value > 0 ? "+" : ""}${number(value)} pp`;
+  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
+    symbol: (row) => row.symbol,
+    revenue: (row) => row.growth.revenue_yoy_percent,
+    operating_profit: (row) => row.growth.operating_profit_yoy_percent,
+    net_profit: (row) => row.growth.net_profit_yoy_percent,
+    margins: (row) => row.margins.operating_margin_percent,
+    balance_sheet: (row) => row.capital.operating_cash_conversion_percent,
+    returns: (row) => row.capital.roce_percent,
+    eps: (row) => row.eps.yoy_growth_percent,
+    coverage: (row) => row.unavailable.length + row.cautions.length,
+  }, "revenue");
 
   return (
     <section className="table-card financials-card">
@@ -1051,10 +1301,20 @@ function FinancialsPanel({ rows }: { rows: FinancialMetricSnapshot[] }) {
       <div className="table-scroll">
         <table className="financials-table">
           <thead>
-            <tr><th>Stock / reporting</th><th>Revenue growth</th><th>Operating profit</th><th>Net profit</th><th>Margins</th><th>Cash / balance sheet</th><th>Returns</th><th>EPS trend</th><th>Coverage notes</th></tr>
+            <tr>
+              <SortableHeader label="Stock / reporting" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+              <SortableHeader label="Revenue growth" sortKey="revenue" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Operating profit" sortKey="operating_profit" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Net profit" sortKey="net_profit" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Margins" sortKey="margins" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Cash / balance sheet" sortKey="balance_sheet" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Returns" sortKey="returns" sort={sort} onSort={requestSort} />
+              <SortableHeader label="EPS trend" sortKey="eps" sort={sort} onSort={requestSort} />
+              <SortableHeader label="Coverage notes" sortKey="coverage" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            </tr>
           </thead>
           <tbody>
-            {rows.map((row) => (
+            {sortedRows.map((row) => (
               <tr key={`${row.source_snapshot_id}-${row.calculation_version}`}>
                 <td>
                   <strong>{row.symbol}</strong>
@@ -1355,36 +1615,58 @@ function Dashboard() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const refresh = useCallback(async () => {
+  const refreshLive = useCallback(async () => {
     try {
-      const [statusResponse, watchlistResponse, contextResponse, marketRegimeResponse, featuresResponse, regimesResponse, evidenceResponse, opportunitiesResponse, corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
+      const [statusResponse, watchlistResponse] = await Promise.all([
         fetch(`${apiBaseUrl}/market/status`),
         fetch(`${apiBaseUrl}/market/watchlist`),
+      ]);
+      if (!statusResponse.ok || !watchlistResponse.ok) throw new Error("Market service is unavailable");
+      setRuntime(await statusResponse.json() as RuntimeStatus);
+      setStocks(await watchlistResponse.json() as WatchlistItem[]);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not load live market data");
+    }
+  }, []);
+
+  const refreshAnalysis = useCallback(async () => {
+    try {
+      const [contextResponse, marketRegimeResponse, featuresResponse, regimesResponse, evidenceResponse, opportunitiesResponse] = await Promise.all([
         fetch(`${apiBaseUrl}/market/context`),
         fetch(`${apiBaseUrl}/market/regime`),
         fetch(`${apiBaseUrl}/market/features`),
         fetch(`${apiBaseUrl}/market/daily-regimes`),
         fetch(`${apiBaseUrl}/market/evidence`),
         fetch(`${apiBaseUrl}/market/opportunities`),
-        fetch(`${apiBaseUrl}/market/corporate-action-assessments?limit=100`),
-        fetch(`${apiBaseUrl}/market/corporate-action-ai`),
       ]);
-      if (!statusResponse.ok || !watchlistResponse.ok) throw new Error("Market service is unavailable");
-      setRuntime(await statusResponse.json() as RuntimeStatus);
-      setStocks(await watchlistResponse.json() as WatchlistItem[]);
       setContext(contextResponse.ok ? await contextResponse.json() as MarketContext : null);
       setMarketRegime(marketRegimeResponse.ok ? await marketRegimeResponse.json() as MarketRegime : null);
       setFeatures(featuresResponse.ok ? await featuresResponse.json() as StockFeatures[] : []);
       setRegimes(regimesResponse.ok ? await regimesResponse.json() as DailyRegime[] : []);
       setEvidence(evidenceResponse.ok ? await evidenceResponse.json() as OpportunityEvidence[] : []);
       setOpportunities(opportunitiesResponse.ok ? await opportunitiesResponse.json() as RankedOpportunity[] : []);
-      setCorporateActions(corporateActionsResponse.ok ? await corporateActionsResponse.json() as CorporateActionAssessment[] : []);
-      setCorporateActionAI(corporateActionAIResponse.ok ? await corporateActionAIResponse.json() as CorporateActionAIAnalysis[] : []);
-      setError(null);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not load market data");
+      setError(reason instanceof Error ? reason.message : "Could not load minute analysis");
     }
   }, []);
+
+  const refreshReferenceData = useCallback(async () => {
+    try {
+      const [corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
+        fetch(`${apiBaseUrl}/market/corporate-action-assessments?limit=100`),
+        fetch(`${apiBaseUrl}/market/corporate-action-ai`),
+      ]);
+      setCorporateActions(corporateActionsResponse.ok ? await corporateActionsResponse.json() as CorporateActionAssessment[] : []);
+      setCorporateActionAI(corporateActionAIResponse.ok ? await corporateActionAIResponse.json() as CorporateActionAIAnalysis[] : []);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "Could not load reference data");
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    await Promise.all([refreshLive(), refreshAnalysis(), refreshReferenceData()]);
+  }, [refreshAnalysis, refreshLive, refreshReferenceData]);
 
   const loadFinancialMetrics = useCallback(async () => {
     try {
@@ -1397,15 +1679,21 @@ function Dashboard() {
 
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => void refresh(), 5_000);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    const liveTimer = window.setInterval(() => void refreshLive(), 5_000);
+    const analysisTimer = window.setInterval(() => void refreshAnalysis(), 15_000);
+    const referenceTimer = window.setInterval(() => void refreshReferenceData(), 300_000);
+    return () => {
+      window.clearInterval(liveTimer);
+      window.clearInterval(analysisTimer);
+      window.clearInterval(referenceTimer);
+    };
+  }, [refresh, refreshAnalysis, refreshLive, refreshReferenceData]);
 
   useEffect(() => {
     if (activeAnalysisTab === "financials" || activeAnalysisTab === "stock_detail") void loadFinancialMetrics();
   }, [activeAnalysisTab, loadFinancialMetrics]);
 
-  const runAction = async (action: "bootstrap" | "live/start" | "live/stop" | "reconcile") => {
+  const runAction = async (action: "bootstrap" | "live/start" | "live/stop") => {
     setBusy(action);
     setError(null);
     try {
@@ -1442,7 +1730,6 @@ function Dashboard() {
   };
 
   const bootstrapping = runtime?.bootstrap.state === "running";
-  const reconciling = runtime?.reconciliation.state === "running";
   const live = runtime?.live.connected === true;
   const liveStarting = ["connecting", "reconnecting"].includes(runtime?.live.state ?? "");
   const pilotSize = runtime?.pilot_size ?? 100;
@@ -1462,7 +1749,7 @@ function Dashboard() {
         <Brand />
         <div className="connection-block">
           <div className="connection-state"><span className={`state-dot ${live ? "online" : ""}`} />{live ? "Live feed connected" : `Feed ${runtime?.live.state ?? "checking"}`}</div>
-          <small>Automatic stop at 3:30 PM IST</small>
+          <small>Automatic stop at 3:30 PM · close reconciliation from 3:40 PM IST</small>
         </div>
       </header>
 
@@ -1475,9 +1762,6 @@ function Dashboard() {
         <div className="actions">
           <button className="secondary" type="button" disabled={bootstrapping || busy !== null} onClick={() => void runAction("bootstrap")}>
             {bootstrapping ? `Preparing ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? pilotSize}` : `Prepare ${pilotSize} stocks`}
-          </button>
-          <button className="secondary" type="button" disabled={live || bootstrapping || reconciling || busy !== null || !runtime?.database_available} onClick={() => void runAction("reconcile")}>
-            {reconciling ? `Reconciling ${runtime?.reconciliation.processed ?? 0}/${runtime?.reconciliation.total ?? 35}` : "Reconcile close"}
           </button>
           {!live && !liveStarting ? (
             <button type="button" disabled={busy !== null || !runtime?.redis_available} onClick={() => void runAction("live/start")}>Start live feed</button>

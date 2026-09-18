@@ -127,3 +127,52 @@ def test_sector_mapping_is_explicit_and_can_remain_unavailable() -> None:
         "Nifty Consumer Durables",
     )
     assert sector_index_for("Miscellaneous") is None
+
+
+def test_daily_candles_supply_atr_without_loading_old_minute_history() -> None:
+    key = "NSE_EQ|TEST"
+    session_date = datetime(2026, 9, 8, tzinfo=IST)
+    daily_history = [
+        make_candle(
+            key,
+            (session_date - timedelta(days=offset)).replace(hour=15, minute=30),
+            98,
+            100,
+            10_000,
+        ).model_copy(update={"interval": "day"})
+        for offset in range(14, 0, -1)
+    ]
+    session = [
+        make_candle(
+            key,
+            session_date.replace(hour=9, minute=15) + timedelta(minutes=index),
+            101 + index * 0.1,
+            101.05 + index * 0.1,
+            500,
+        )
+        for index in range(16)
+    ]
+    completed = session[-1]
+    as_of = session_date.replace(hour=9, minute=31)
+    snapshot = LiveSnapshot(
+        instrument_key=key,
+        symbol="TEST",
+        received_at=as_of.astimezone(UTC),
+        ltp=completed.close,
+        previous_close=100,
+        current_candle=make_candle(key, as_of, completed.close, completed.close, 10),
+    )
+
+    features = build_stock_features(
+        snapshot,
+        completed,
+        session,
+        {key: snapshot},
+        None,
+        None,
+        as_of=as_of,
+        daily_history=daily_history,
+    )
+
+    assert features.volatility.atr_sessions == 14
+    assert features.volatility.atr is not None

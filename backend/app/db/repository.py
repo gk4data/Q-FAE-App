@@ -280,19 +280,16 @@ class HistoricalMarketRepository:
 
     def save_evidence_observation(self, observation: EvidenceOutcomeObservation) -> None:
         """Upsert immutable point-in-time inputs without erasing already known outcomes."""
-        values = observation.model_dump()
-        values["reference_price"] = Decimal(str(observation.reference_price))
-        values["evidence_payload"] = observation.evidence_payload
-        values["risk_payload"] = observation.risk_payload
-        values["market_regime_payload"] = observation.market_regime_payload
-        numeric_outcomes = (
-            "forward_return_5m_percent", "forward_return_15m_percent",
-            "forward_return_30m_percent", "forward_return_60m_percent",
-            "forward_return_eod_percent", "mfe_60m_percent", "mae_60m_percent",
-        )
-        for field in numeric_outcomes:
-            value = getattr(observation, field)
-            values[field] = Decimal(str(value)) if value is not None else None
+        self.save_evidence_observations([observation])
+
+    def save_evidence_observations(
+        self,
+        observations: Iterable[EvidenceOutcomeObservation],
+    ) -> int:
+        """Batch point-in-time evidence into one transaction per completed minute."""
+        values = [self._evidence_observation_values(item) for item in observations]
+        if not values:
+            return 0
         statement = insert(EvidenceObservationRecord).values(values)
         statement = statement.on_conflict_do_update(
             index_elements=["instrument_key", "candle_timestamp"],
@@ -312,6 +309,26 @@ class HistoricalMarketRepository:
         )
         with self.engine.begin() as connection:
             connection.execute(statement)
+        return len(values)
+
+    @staticmethod
+    def _evidence_observation_values(
+        observation: EvidenceOutcomeObservation,
+    ) -> dict[str, object]:
+        values = observation.model_dump()
+        values["reference_price"] = Decimal(str(observation.reference_price))
+        values["evidence_payload"] = observation.evidence_payload
+        values["risk_payload"] = observation.risk_payload
+        values["market_regime_payload"] = observation.market_regime_payload
+        numeric_outcomes = (
+            "forward_return_5m_percent", "forward_return_15m_percent",
+            "forward_return_30m_percent", "forward_return_60m_percent",
+            "forward_return_eod_percent", "mfe_60m_percent", "mae_60m_percent",
+        )
+        for field in numeric_outcomes:
+            value = getattr(observation, field)
+            values[field] = Decimal(str(value)) if value is not None else None
+        return values
 
     def upsert_corporate_actions(
         self,

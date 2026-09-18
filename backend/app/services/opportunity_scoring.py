@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from app.models.market import (
+    Candle,
     CorporateActionContext,
     EvidencePillar,
     FinancialMetricSnapshot,
@@ -425,12 +426,16 @@ def rank_opportunities(
     financial_metrics: dict[str, FinancialMetricSnapshot] | None = None,
     session_returns: dict[str, float | None] | None = None,
     current_prices: dict[str, float | None] | None = None,
+    session_candles: dict[str, Candle] | None = None,
+    price_traces: dict[str, list[float]] | None = None,
     *,
     weights: dict[str, float] | None = None,
 ) -> list[RankedOpportunity]:
     metrics = financial_metrics or {}
     returns = session_returns or {}
     prices = current_prices or {}
+    day_candles = session_candles or {}
+    traces = price_traces or {}
     scored = [
         RankedOpportunity(
             instrument_key=row.instrument_key,
@@ -439,6 +444,11 @@ def rank_opportunities(
             as_of=row.as_of,
             current_market_price=prices.get(row.instrument_key),
             session_return_percent=returns.get(row.instrument_key),
+            day_open=(day_candles[row.instrument_key].open if row.instrument_key in day_candles else None),
+            day_high=(day_candles[row.instrument_key].high if row.instrument_key in day_candles else None),
+            day_low=(day_candles[row.instrument_key].low if row.instrument_key in day_candles else None),
+            day_close=(day_candles[row.instrument_key].close if row.instrument_key in day_candles else None),
+            price_trace=traces.get(row.instrument_key, []),
             score=build_opportunity_score(row, metrics.get(row.instrument_key), weights=weights),
         )
         for row in evidence_rows

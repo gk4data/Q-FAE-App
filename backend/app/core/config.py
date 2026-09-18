@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     qfae_market_request_rate_per_minute: int = 450
     qfae_market_snapshot_interval_seconds: int = 60
     qfae_market_pilot_size: int = Field(default=100, ge=1, le=500)
+    qfae_reconciliation_delay_minutes: int = Field(default=10, ge=0, le=60)
+    qfae_reconciliation_retry_minutes: int = Field(default=5, ge=1, le=30)
+    qfae_reconciliation_max_attempts: int = Field(default=8, ge=1, le=24)
     qfae_feature_max_spread_bps: float = 25.0
     qfae_feature_min_traded_value_inr: float = 10_000_000.0
     qfae_confirmation_active_rvol: float = 1.0

@@ -16,8 +16,7 @@ from app.core.config import get_settings
 async def lifespan(_: FastAPI):
     yield
     runtime = get_market_runtime()
-    if runtime.status()["live"]["state"] != "stopped":
-        runtime.stop_live()
+    runtime.shutdown()
 
 
 def create_app() -> FastAPI:

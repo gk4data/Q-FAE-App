@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections import deque
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from typing import Any
 
@@ -83,6 +84,7 @@ from app.services.upstox_market import (
 
 logger = logging.getLogger(__name__)
 NSE_MARKET_CLOSE = datetime_time(hour=15, minute=30)
+NSE_SESSION_CANDLE_LIMIT = 400
 
 
 def nse_market_close_at(now: datetime) -> datetime:
@@ -117,7 +119,13 @@ class MarketRuntime:
         self._reconciliation_thread: threading.Thread | None = None
         self._streamer: Any | None = None
         self._context_timer: threading.Timer | None = None
+        self._context_calculation_lock = threading.Lock()
+        self._evidence_thread: threading.Thread | None = None
+        self._evidence_queue: deque[tuple[Any, ...]] = deque()
         self._market_close_timer: threading.Timer | None = None
+        self._reconciliation_schedule_timer: threading.Timer | None = None
+        self._reconciliation_monitor_timer: threading.Timer | None = None
+        self._automatic_reconciliation_attempts = 0
         self._last_context_bucket: int | None = None
         self._persisted_minute_watermarks: dict[str, datetime | None] = {}
         self._symbols: dict[str, str] = {}
@@ -152,6 +160,8 @@ class MarketRuntime:
             "subscribed": 0,
             "last_message_at": None,
             "last_context_at": None,
+            "last_evidence_at": None,
+            "evidence_queue_depth": 0,
             "scheduled_stop_at": None,
             "error": None,
         }
@@ -168,6 +178,9 @@ class MarketRuntime:
             "started_at": None,
             "finished_at": None,
             "recent_errors": [],
+            "automatic": False,
+            "attempt": 0,
+            "next_attempt_at": None,
         }
 
     def status(self) -> dict[str, Any]:
@@ -264,22 +277,41 @@ class MarketRuntime:
         for instrument in instruments:
             key = instrument["instrument_key"]
             snapshot = snapshots.get(key)
-            history = self.state_store.get_candles(key, limit=self._history_limit())
-            candle = snapshot.current_candle if snapshot and snapshot.current_candle else (
-                history[-1] if history else None
-            )
+            candle = snapshot.current_candle if snapshot and snapshot.current_candle else None
+            if candle is None:
+                latest = self.state_store.get_candles(key, limit=1)
+                candle = latest[-1] if latest else None
             ltp = snapshot.ltp if snapshot and snapshot.ltp is not None else (
                 candle.close if candle else None
             )
             previous_close = snapshot.previous_close if snapshot else None
             if previous_close is None:
-                previous_close = self._previous_session_close(history)
+                daily_history = self.state_store.get_daily_candles(key, limit=2)
+                reference_date = (
+                    candle.timestamp.astimezone(INDIA_TIMEZONE).date()
+                    if candle is not None
+                    else datetime.now(INDIA_TIMEZONE).date()
+                )
+                previous_close = next(
+                    (
+                        item.close
+                        for item in reversed(daily_history)
+                        if item.timestamp.astimezone(INDIA_TIMEZONE).date() < reference_date
+                    ),
+                    None,
+                )
             change_percent = None
             if ltp is not None and previous_close:
                 change_percent = ((ltp - previous_close) / previous_close) * 100
 
             spread_bps = None
-            if snapshot and snapshot.best_bid_price and snapshot.best_ask_price:
+            if (
+                snapshot
+                and snapshot.best_bid_price is not None
+                and snapshot.best_ask_price is not None
+                and snapshot.best_bid_price > 0
+                and snapshot.best_ask_price >= snapshot.best_bid_price
+            ):
                 midpoint = (snapshot.best_bid_price + snapshot.best_ask_price) / 2
                 if midpoint > 0:
                     spread_bps = ((snapshot.best_ask_price - snapshot.best_bid_price) / midpoint) * 10_000
@@ -420,6 +452,20 @@ class MarketRuntime:
             item.model_copy(update={"market_regime": market_regime})
             for item in evidence
         ]
+        recent_candles = self.state_store.get_candles_many(
+            (item.instrument_key for item in evidence),
+            limit=30,
+        )
+        price_traces: dict[str, list[float]] = {}
+        for instrument_key, candles in recent_candles.items():
+            if not candles:
+                continue
+            session_date = candles[-1].timestamp.astimezone(INDIA_TIMEZONE).date()
+            price_traces[instrument_key] = [
+                candle.close
+                for candle in candles
+                if candle.timestamp.astimezone(INDIA_TIMEZONE).date() == session_date
+            ][-30:]
         try:
             return rank_opportunities(
                 evidence,
@@ -432,6 +478,12 @@ class MarketRuntime:
                     key: snapshot.ltp if snapshot.ltp is not None and snapshot.ltp > 0 else None
                     for key, snapshot in snapshots.items()
                 },
+                {
+                    key: snapshot.session_candle
+                    for key, snapshot in snapshots.items()
+                    if snapshot.session_candle is not None
+                },
+                price_traces,
                 weights=self._opportunity_scoring_weights(),
             )
         except ValueError as exc:
@@ -711,8 +763,13 @@ class MarketRuntime:
             self._bootstrap_thread.start()
             return dict(self._bootstrap)
 
-    def start_reconciliation(self, session_date: date | None = None) -> dict[str, Any]:
-        """Start manual official daily-candle reconciliation after market close."""
+    def start_reconciliation(
+        self,
+        session_date: date | None = None,
+        *,
+        automatic: bool = False,
+    ) -> dict[str, Any]:
+        """Start official daily-candle reconciliation after market close."""
         self._require_access_token()
         self._require_state_store()
         repository = self.historical_repository
@@ -753,6 +810,9 @@ class MarketRuntime:
                 "started_at": datetime.now(UTC).isoformat(),
                 "finished_at": None,
                 "recent_errors": [],
+                "automatic": automatic,
+                "attempt": self._automatic_reconciliation_attempts if automatic else 0,
+                "next_attempt_at": None,
             }
             self._reconciliation_thread = threading.Thread(
                 target=self._run_reconciliation,
@@ -781,20 +841,33 @@ class MarketRuntime:
                     result_status: str | None = None
                     errors: list[str] = []
                     try:
-                        daily_candles = client.fetch_daily_history(
-                            instrument["instrument_key"],
-                            5,
-                            as_of=session_date,
-                            from_date=session_date - timedelta(days=4),
-                        )
-                        official = next(
-                            (
-                                candle
-                                for candle in reversed(daily_candles)
-                                if candle.timestamp.astimezone(INDIA_TIMEZONE).date() == session_date
-                            ),
-                            None,
-                        )
+                        if session_date == datetime.now(INDIA_TIMEZONE).date():
+                            candidate = client.fetch_intraday_daily_candle(
+                                instrument["instrument_key"]
+                            )
+                            official = (
+                                candidate
+                                if candidate is not None
+                                and candidate.timestamp.astimezone(INDIA_TIMEZONE).date()
+                                == session_date
+                                else None
+                            )
+                        else:
+                            daily_candles = client.fetch_daily_history(
+                                instrument["instrument_key"],
+                                5,
+                                as_of=session_date,
+                                from_date=session_date - timedelta(days=4),
+                            )
+                            official = next(
+                                (
+                                    candle
+                                    for candle in reversed(daily_candles)
+                                    if candle.timestamp.astimezone(INDIA_TIMEZONE).date()
+                                    == session_date
+                                ),
+                                None,
+                            )
                         if official is None:
                             result_status = "missing"
                             errors.append(f"{instrument['symbol']}: official daily candle unavailable")
@@ -1371,9 +1444,13 @@ class MarketRuntime:
                 "subscribed": len(instrument_keys),
                 "last_message_at": None,
                 "last_context_at": None,
+                "last_evidence_at": None,
+                "evidence_queue_depth": 0,
                 "scheduled_stop_at": market_close.isoformat(),
                 "error": None,
             }
+            self._last_context_bucket = None
+            self._evidence_queue.clear()
             configuration = upstox_client.Configuration()
             configuration.access_token = token
             api_client = upstox_client.ApiClient(configuration)
@@ -1393,6 +1470,7 @@ class MarketRuntime:
             )
             self._stream_thread.start()
             self._schedule_market_close(market_close, now)
+            self._schedule_after_market_reconciliation(market_close, now)
             return dict(self._live)
 
     def stop_live(self, *, reason: str = "manual") -> dict[str, Any]:
@@ -1423,12 +1501,134 @@ class MarketRuntime:
         self._market_close_timer = timer
         timer.start()
 
+    def _schedule_after_market_reconciliation(self, market_close: datetime, now: datetime) -> None:
+        reconciliation_at = market_close + timedelta(
+            minutes=self.settings.qfae_reconciliation_delay_minutes
+        )
+        delay_seconds = max(0.0, (reconciliation_at - now).total_seconds())
+        with self._lock:
+            if self._reconciliation_schedule_timer is not None:
+                self._reconciliation_schedule_timer.cancel()
+            if self._reconciliation_monitor_timer is not None:
+                self._reconciliation_monitor_timer.cancel()
+                self._reconciliation_monitor_timer = None
+            self._automatic_reconciliation_attempts = 0
+            self._reconciliation.update(
+                {
+                    "state": "scheduled",
+                    "session_date": market_close.date().isoformat(),
+                    "automatic": True,
+                    "attempt": 0,
+                    "next_attempt_at": reconciliation_at.isoformat(),
+                }
+            )
+            timer = threading.Timer(
+                delay_seconds,
+                self._run_automatic_reconciliation,
+                args=(market_close.date(),),
+            )
+            timer.name = "qfae-after-market-reconciliation-schedule"
+            timer.daemon = True
+            self._reconciliation_schedule_timer = timer
+            timer.start()
+
+    def _run_automatic_reconciliation(self, session_date: date) -> None:
+        with self._lock:
+            self._reconciliation_schedule_timer = None
+            self._automatic_reconciliation_attempts += 1
+        try:
+            self.start_reconciliation(session_date, automatic=True)
+        except Exception as exc:
+            logger.exception("Could not start automatic after-market reconciliation")
+            with self._lock:
+                self._reconciliation["state"] = "retry_scheduled"
+                self._reconciliation["errors"] += 1
+                self._reconciliation["recent_errors"] = (
+                    self._reconciliation["recent_errors"]
+                    + [f"automatic reconciliation: {exc}"]
+                )[-25:]
+            self._schedule_automatic_reconciliation_retry(session_date)
+            return
+        self._schedule_reconciliation_monitor(session_date)
+
+    def _schedule_reconciliation_monitor(self, session_date: date) -> None:
+        timer = threading.Timer(5.0, self._monitor_automatic_reconciliation, args=(session_date,))
+        timer.name = "qfae-after-market-reconciliation-monitor"
+        timer.daemon = True
+        with self._lock:
+            self._reconciliation_monitor_timer = timer
+        timer.start()
+
+    def _monitor_automatic_reconciliation(self, session_date: date) -> None:
+        with self._lock:
+            self._reconciliation_monitor_timer = None
+            running = bool(
+                self._reconciliation_thread and self._reconciliation_thread.is_alive()
+            )
+            state = self._reconciliation["state"]
+            missing = self._reconciliation["missing"]
+            errors = self._reconciliation["errors"]
+        if running:
+            self._schedule_reconciliation_monitor(session_date)
+        elif state == "completed" and missing == 0 and errors == 0:
+            logger.info(
+                "Automatic after-market reconciliation completed for %s on attempt %s",
+                session_date,
+                self._automatic_reconciliation_attempts,
+            )
+        else:
+            self._schedule_automatic_reconciliation_retry(session_date)
+
+    def _schedule_automatic_reconciliation_retry(self, session_date: date) -> None:
+        with self._lock:
+            if self._automatic_reconciliation_attempts >= self.settings.qfae_reconciliation_max_attempts:
+                self._reconciliation["next_attempt_at"] = None
+                logger.error(
+                    "Automatic after-market reconciliation exhausted %s attempts for %s",
+                    self._automatic_reconciliation_attempts,
+                    session_date,
+                )
+                return
+            retry_at = datetime.now(INDIA_TIMEZONE) + timedelta(
+                minutes=self.settings.qfae_reconciliation_retry_minutes
+            )
+            self._reconciliation["state"] = "retry_scheduled"
+            self._reconciliation["automatic"] = True
+            self._reconciliation["attempt"] = self._automatic_reconciliation_attempts
+            self._reconciliation["next_attempt_at"] = retry_at.isoformat()
+            timer = threading.Timer(
+                self.settings.qfae_reconciliation_retry_minutes * 60,
+                self._run_automatic_reconciliation,
+                args=(session_date,),
+            )
+            timer.name = "qfae-after-market-reconciliation-retry"
+            timer.daemon = True
+            self._reconciliation_schedule_timer = timer
+            timer.start()
+
     def _stop_at_market_close(self) -> None:
         try:
             self.stop_live(reason="market_close")
             logger.info("Upstox live feed stopped at the NSE cash-market close")
         except Exception:
             logger.exception("Could not stop the Upstox live feed at market close")
+
+    def shutdown(self) -> None:
+        """Stop live activity and cancel timers when the API process exits."""
+        with self._lock:
+            timers = (
+                self._market_close_timer,
+                self._context_timer,
+                self._reconciliation_schedule_timer,
+                self._reconciliation_monitor_timer,
+            )
+            self._reconciliation_schedule_timer = None
+            self._reconciliation_monitor_timer = None
+        for timer in timers:
+            if timer is not None:
+                timer.cancel()
+        if self._streamer is not None:
+            self.stop_live()
 
     def _connect_stream(self) -> None:
         try:
@@ -1464,7 +1664,10 @@ class MarketRuntime:
 
     def _queue_minute_context(self, bucket: int) -> None:
         with self._lock:
-            if self._last_context_bucket == bucket:
+            # Ignore delayed provider messages from an older minute. Allowing the
+            # bucket to move backwards repeatedly cancels the pending timer and
+            # can starve completed-minute publication on a busy universe.
+            if self._last_context_bucket is not None and bucket <= self._last_context_bucket:
                 return
             self._last_context_bucket = bucket
             if self._context_timer:
@@ -1474,6 +1677,15 @@ class MarketRuntime:
             self._context_timer.start()
 
     def _calculate_minute_context(self) -> None:
+        if not self._context_calculation_lock.acquire(blocking=False):
+            logger.warning("Skipped overlapping minute-context calculation")
+            return
+        try:
+            self._run_minute_context_calculation()
+        finally:
+            self._context_calculation_lock.release()
+
+    def _run_minute_context_calculation(self) -> None:
         try:
             as_of = datetime.now(UTC)
             all_snapshots = self.state_store.get_snapshots()
@@ -1500,6 +1712,7 @@ class MarketRuntime:
             sectors = self.state_store.get_sectors()
             enriched: list[LiveSnapshot] = []
             calculated_features: list[StockFeatureSnapshot] = []
+            session_histories: dict[str, list[Candle]] = {}
             completed_for_persistence: dict[tuple[str, datetime], Candle] = {}
             for snapshot in selected_snapshots:
                 if not snapshot.instrument_key.startswith("NSE_EQ|"):
@@ -1507,8 +1720,9 @@ class MarketRuntime:
                     continue
                 history = self.state_store.get_candles(
                     snapshot.instrument_key,
-                    limit=self._history_limit(),
+                    limit=NSE_SESSION_CANDLE_LIMIT,
                 )
+                session_histories[snapshot.instrument_key] = history
                 completed = self._latest_completed_candle(snapshot, history)
                 relative_volume = self._profile_relative_volume(completed) if completed else None
                 if completed and relative_volume is None:
@@ -1547,6 +1761,10 @@ class MarketRuntime:
                                 sectors.get(snapshot.instrument_key),
                                 relative_volume_metric,
                                 as_of=as_of,
+                                daily_history=self.state_store.get_daily_candles(
+                                    snapshot.instrument_key,
+                                    limit=20,
+                                ),
                                 max_spread_bps=self.settings.qfae_feature_max_spread_bps,
                                 min_traded_value_inr=self.settings.qfae_feature_min_traded_value_inr,
                             )
@@ -1589,7 +1807,7 @@ class MarketRuntime:
                     }
                 )
                 self.state_store.save_features(feature)
-            self._calculate_daily_regimes(as_of)
+            self._calculate_daily_regimes(as_of, session_histories=session_histories)
             context = build_market_context(
                 enriched,
                 sectors,
@@ -1600,18 +1818,57 @@ class MarketRuntime:
             context_history = self.state_store.get_context_history(limit=5)
             market_regime = build_market_regime(context, context_history[:-1])
             self.state_store.save_market_regime(market_regime)
-            self._record_minute_evidence(
+            with self._lock:
+                self._live["last_context_at"] = context.as_of.isoformat()
+            self._queue_minute_evidence(
                 list(self.state_store.get_features().values()),
                 snapshots_by_key,
                 context,
                 market_regime,
                 as_of,
             )
-            with self._lock:
-                self._live["last_context_at"] = context.as_of.isoformat()
         except Exception as exc:
             logger.exception("Minute-level market context calculation failed")
             self._on_stream_error(exc)
+
+    def _queue_minute_evidence(
+        self,
+        features: list[StockFeatureSnapshot],
+        snapshots: dict[str, LiveSnapshot],
+        context: Any,
+        market_regime: MarketRegimeSnapshot,
+        as_of: datetime,
+    ) -> None:
+        """Keep durable evidence work off the time-critical context publisher."""
+        with self._lock:
+            self._evidence_queue.append(
+                (features, snapshots, context, market_regime, as_of)
+            )
+            self._live["evidence_queue_depth"] = len(self._evidence_queue)
+            if self._evidence_thread and self._evidence_thread.is_alive():
+                return
+            self._evidence_thread = threading.Thread(
+                target=self._drain_evidence_queue,
+                name="qfae-minute-evidence",
+                daemon=True,
+            )
+            self._evidence_thread.start()
+
+    def _drain_evidence_queue(self) -> None:
+        while True:
+            with self._lock:
+                if not self._evidence_queue:
+                    self._evidence_thread = None
+                    self._live["evidence_queue_depth"] = 0
+                    return
+                payload = self._evidence_queue.popleft()
+                self._live["evidence_queue_depth"] = len(self._evidence_queue)
+            try:
+                self._record_minute_evidence(*payload)
+                with self._lock:
+                    self._live["last_evidence_at"] = payload[-1].isoformat()
+            except Exception:
+                logger.exception("Minute evidence worker failed")
 
     def _record_minute_evidence(
         self,
@@ -1626,6 +1883,7 @@ class MarketRuntime:
         corporate_contexts = self.state_store.get_corporate_action_contexts()
         repository = self.historical_repository
         financial_metrics = self._latest_financial_metrics_by_instrument()
+        observations: list[EvidenceOutcomeObservation] = []
         for feature in features:
             try:
                 if feature.as_of != as_of:
@@ -1715,13 +1973,14 @@ class MarketRuntime:
                     risk_payload=risk.model_dump(mode="json"),
                     market_regime_payload=market_regime.model_dump(mode="json"),
                 )
-                repository.save_evidence_observation(observation)
-                repository.evaluate_evidence_outcomes(
-                    feature.instrument_key,
-                    feature.candle_timestamp.astimezone(INDIA_TIMEZONE).date(),
-                )
+                observations.append(observation)
             except Exception:
                 logger.exception("Could not record minute evidence for %s", feature.symbol)
+        if repository is not None and observations:
+            try:
+                repository.save_evidence_observations(observations)
+            except Exception:
+                logger.exception("Could not persist minute evidence batch")
 
     def _opportunity_scoring_weights(self) -> dict[str, float]:
         return {
@@ -1799,6 +2058,7 @@ class MarketRuntime:
         as_of: datetime,
         *,
         include_provisional: bool = True,
+        session_histories: dict[str, list[Candle]] | None = None,
     ) -> None:
         instruments = self._resolved_instruments(None)
         sectors = self.state_store.get_sectors()
@@ -1818,6 +2078,7 @@ class MarketRuntime:
                     instrument_key,
                     snapshots.get(instrument_key),
                     as_of,
+                    history=(session_histories or {}).get(instrument_key),
                 )
                 if include_provisional
                 else (None, None)
@@ -1835,6 +2096,7 @@ class MarketRuntime:
                     instrument_key,
                     snapshots.get(instrument_key),
                     as_of,
+                    history=(session_histories or {}).get(instrument_key),
                 )
                 if include_provisional
                 else (None, None)
@@ -1856,10 +2118,15 @@ class MarketRuntime:
         instrument_key: str,
         snapshot: LiveSnapshot | None,
         as_of: datetime,
+        *,
+        history: list[Candle] | None = None,
     ) -> tuple[Candle | None, float | None]:
         if snapshot is None:
             return None, None
-        history = self.state_store.get_candles(instrument_key, limit=self._history_limit())
+        history = history if history is not None else self.state_store.get_candles(
+            instrument_key,
+            limit=NSE_SESSION_CANDLE_LIMIT,
+        )
         completed = self._latest_completed_candle(snapshot, history)
         if completed is None:
             return None, None

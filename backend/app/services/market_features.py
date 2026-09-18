@@ -396,6 +396,7 @@ def build_stock_features(
     relative_volume_metric: RelativeVolumeMetric | None,
     *,
     as_of: datetime,
+    daily_history: list[Candle] | None = None,
     max_spread_bps: float = 25.0,
     min_traded_value_inr: float = 10_000_000.0,
 ) -> StockFeatureSnapshot:
@@ -410,7 +411,12 @@ def build_stock_features(
         ),
         key=lambda candle: candle.timestamp,
     )
-    atr, atr_sessions = _daily_atr(history, session_date)
+    # Daily candles are a much smaller and more direct ATR source than repeatedly
+    # decoding several weeks of one-minute history for every live calculation.
+    atr, atr_sessions = _daily_atr(
+        daily_history if daily_history is not None else history,
+        session_date,
+    )
     vwap = _vwap(session, completed_candle.close)
     gap = _gap(session, completed_candle.close, snapshot.previous_close, atr)
     opening_ranges = [_opening_range(session, completed_candle, as_of, minutes) for minutes in (5, 15, 30)]

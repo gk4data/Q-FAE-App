@@ -66,6 +66,7 @@ class LiveSnapshot(FrozenModel):
     upper_circuit: float | None = None
     market_depth: list[MarketDepthLevel] = Field(default_factory=list)
     current_candle: Candle | None = None
+    session_candle: Candle | None = None
     completed_candle_relative_volume: float | None = Field(default=None, ge=0)
     completed_candle_timestamp: datetime | None = None
 
@@ -342,6 +343,11 @@ class RankedOpportunity(FrozenModel):
     as_of: datetime
     current_market_price: float | None = Field(default=None, gt=0)
     session_return_percent: float | None = None
+    day_open: float | None = Field(default=None, gt=0)
+    day_high: float | None = Field(default=None, gt=0)
+    day_low: float | None = Field(default=None, gt=0)
+    day_close: float | None = Field(default=None, gt=0)
+    price_trace: list[float] = Field(default_factory=list, max_length=30)
     score: OpportunityScoreSnapshot
 
 

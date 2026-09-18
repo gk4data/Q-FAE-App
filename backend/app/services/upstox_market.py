@@ -277,6 +277,7 @@ def normalize_feed_message(
             extended = market_data
 
         current_candle = None
+        session_candle = None
         market_ohlc = market_data.get("marketOHLC")
         ohlc_values = market_ohlc.get("ohlc") if isinstance(market_ohlc, Mapping) else []
         if isinstance(ohlc_values, list):
@@ -299,6 +300,26 @@ def normalize_feed_message(
                         )
                 except (KeyError, TypeError, ValueError):
                     current_candle = None
+            day_row = next(
+                (item for item in ohlc_values if isinstance(item, Mapping) and item.get("interval") == "1d"),
+                None,
+            )
+            if day_row:
+                timestamp = _milliseconds_to_datetime(day_row.get("ts"))
+                try:
+                    if timestamp is not None:
+                        session_candle = Candle(
+                            instrument_key=str(instrument_key),
+                            timestamp=timestamp,
+                            interval="day",
+                            open=float(day_row["open"]),
+                            high=float(day_row["high"]),
+                            low=float(day_row["low"]),
+                            close=float(day_row["close"]),
+                            volume=max(0, int(day_row.get("vol", 0))),
+                        )
+                except (KeyError, TypeError, ValueError):
+                    session_candle = None
 
         snapshots.append(
             LiveSnapshot(
@@ -321,6 +342,7 @@ def normalize_feed_message(
                 upper_circuit=_optional_float(extended.get("uc")),
                 market_depth=normalized_depth,
                 current_candle=current_candle,
+                session_candle=session_candle,
             )
         )
     return snapshots
@@ -392,6 +414,18 @@ class UpstoxMarketDataClient:
             raise UpstoxMarketDataError("Upstox daily historical response did not contain candles")
         candles = parse_candle_rows(instrument_key, rows, interval="day")
         return candles[-sessions:]
+
+    def fetch_intraday_daily_candle(self, instrument_key: str) -> Candle | None:
+        """Fetch Upstox's current-trading-day aggregate from the intraday API."""
+        encoded_key = quote(instrument_key, safe="")
+        payload = self._get(
+            f"/v3/historical-candle/intraday/{encoded_key}/days/1"
+        )
+        rows = payload.get("data", {}).get("candles")
+        if not isinstance(rows, list):
+            raise UpstoxMarketDataError("Upstox intraday daily response did not contain candles")
+        candles = parse_candle_rows(instrument_key, rows, interval="day")
+        return candles[-1] if candles else None
 
     def fetch_sector(self, isin: str) -> str | None:
         payload = self._get(f"/v2/fundamentals/{quote(isin, safe='')}/profile")

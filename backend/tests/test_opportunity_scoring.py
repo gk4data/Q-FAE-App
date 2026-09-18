@@ -1,6 +1,6 @@
 from datetime import datetime, timezone, timedelta
 
-from app.models.market import FinancialMetricSnapshot, OpportunityEvidenceSnapshot
+from app.models.market import Candle, FinancialMetricSnapshot, OpportunityEvidenceSnapshot
 from app.services.opportunity_scoring import build_opportunity_score, rank_opportunities
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -168,10 +168,30 @@ def test_ranking_orders_eligible_candidates_and_leaves_rejected_candidate_unrank
         },
         {good.instrument_key: 3.25, weak.instrument_key: -1.5},
         {good.instrument_key: 125.5, weak.instrument_key: 88.2},
+        {
+            good.instrument_key: Candle(
+                instrument_key=good.instrument_key,
+                timestamp=NOW,
+                interval="day",
+                open=120,
+                high=127,
+                low=119,
+                close=125.5,
+                volume=500_000,
+            )
+        },
+        {good.instrument_key: [120, 121.5, 123, 125.5]},
     )
 
     assert [item.symbol for item in rows] == ["GOOD", "WEAK", "REJECT"]
     assert [item.rank for item in rows] == [1, 2, None]
     assert rows[0].session_return_percent == 3.25
     assert rows[0].current_market_price == 125.5
+    assert (rows[0].day_open, rows[0].day_high, rows[0].day_low, rows[0].day_close) == (
+        120,
+        127,
+        119,
+        125.5,
+    )
+    assert rows[0].price_trace == [120, 121.5, 123, 125.5]
     assert rows[1].session_return_percent == -1.5

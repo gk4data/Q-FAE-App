@@ -11,6 +11,7 @@ from app.services.upstox_market import (
     INDIA_VIX_KEY,
     NIFTY_50_KEY,
     NIFTY_BANK_KEY,
+    UpstoxMarketDataClient,
     UpstoxMarketDataError,
     keep_latest_sessions,
     normalize_feed_message,
@@ -52,6 +53,31 @@ def test_invalid_candle_contract_is_rejected() -> None:
         parse_candle_rows("NSE_EQ|TEST", [["2026-09-01", 100]])
 
 
+def test_current_session_daily_candle_uses_intraday_v3_endpoint() -> None:
+    requested: list[str] = []
+    client = object.__new__(UpstoxMarketDataClient)
+    client._get = lambda path: (
+        requested.append(path)
+        or {
+            "data": {
+                "candles": [
+                    ["2026-09-15T00:00:00+05:30", 100, 105, 98, 104, 250_000, 0]
+                ]
+            }
+        }
+    )
+
+    result = client.fetch_intraday_daily_candle("NSE_EQ|TEST KEY")
+
+    assert requested == [
+        "/v3/historical-candle/intraday/NSE_EQ%7CTEST%20KEY/days/1"
+    ]
+    assert result is not None
+    assert result.interval == "day"
+    assert result.close == 104
+    assert result.volume == 250_000
+
+
 def test_full_feed_message_is_normalized() -> None:
     message = {
         "currentTs": "1788493625000",
@@ -76,7 +102,16 @@ def test_full_feed_message_is_normalized() -> None:
                                     "close": 101.5,
                                     "vol": "7250",
                                     "ts": "1788493560000",
-                                }
+                                },
+                                {
+                                    "interval": "1d",
+                                    "open": 99.5,
+                                    "high": 103,
+                                    "low": 98.75,
+                                    "close": 101.5,
+                                    "vol": "200000",
+                                    "ts": "1788451200000",
+                                },
                             ]
                         },
                         "eFeedDetails": {
@@ -105,6 +140,12 @@ def test_full_feed_message_is_normalized() -> None:
     assert snapshots[0].upper_circuit == 120
     assert snapshots[0].current_candle is not None
     assert snapshots[0].current_candle.volume == 7250
+    assert snapshots[0].session_candle is not None
+    assert snapshots[0].session_candle.interval == "day"
+    assert snapshots[0].session_candle.open == 99.5
+    assert snapshots[0].session_candle.high == 103
+    assert snapshots[0].session_candle.low == 98.75
+    assert snapshots[0].session_candle.close == 101.5
 
 
 def test_corporate_actions_preserve_facts_and_normalize_dates() -> None:
@@ -204,6 +245,24 @@ def test_in_memory_store_replaces_an_updating_minute_candle() -> None:
     assert stored[0].volume == 250
 
 
+def test_in_memory_store_reads_recent_candles_for_many_instruments() -> None:
+    store = InMemoryMarketStateStore()
+    timestamp = datetime(2026, 9, 4, 9, 30, tzinfo=IST)
+    store.save_candles(
+        [
+            candle("NSE_EQ|AAA", timestamp, 100),
+            candle("NSE_EQ|AAA", timestamp + timedelta(minutes=1), 200),
+            candle("NSE_EQ|BBB", timestamp, 300),
+        ]
+    )
+
+    result = store.get_candles_many(["NSE_EQ|AAA", "NSE_EQ|BBB"], limit=1)
+
+    assert list(result) == ["NSE_EQ|AAA", "NSE_EQ|BBB"]
+    assert result["NSE_EQ|AAA"][0].volume == 200
+    assert result["NSE_EQ|BBB"][0].volume == 300
+
+
 def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached() -> None:
     instruments = [
         {
@@ -223,7 +282,16 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
         def load() -> dict[str, list[dict[str, object]]]:
             return {"instruments": instruments}
 
-    store = InMemoryMarketStateStore()
+    class TrackingStore(InMemoryMarketStateStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.requested_candle_limits: list[int] = []
+
+        def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]:
+            self.requested_candle_limits.append(limit)
+            return super().get_candles(instrument_key, limit)
+
+    store = TrackingStore()
     completed = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 30, tzinfo=IST), 250)
     current = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 31, tzinfo=IST), 100)
     store.save_candles([completed, current])
@@ -242,6 +310,8 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
             received_at=datetime.now(UTC),
             ltp=101,
             previous_close=100,
+            best_bid_price=104,
+            best_ask_price=98,
             current_candle=current,
         )
     )
@@ -260,7 +330,10 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
     assert rows[0].symbol == "STOCK0"
     assert rows[0].change_percent == 1
     assert rows[0].relative_volume == 2.5
+    assert rows[0].spread_bps is None
     assert rows[0].data_state == "cached"
+    assert store.requested_candle_limits
+    assert max(store.requested_candle_limits) == 1
 
 
 def test_previous_session_candle_is_not_used_as_current_session_rvol() -> None:
@@ -287,6 +360,44 @@ def test_nse_market_close_is_scheduled_for_330_pm_ist() -> None:
     market_close = nse_market_close_at(now)
 
     assert market_close == datetime(2026, 9, 8, 15, 30, tzinfo=IST)
+
+
+def test_after_market_reconciliation_is_scheduled_ten_minutes_after_close(monkeypatch) -> None:
+    scheduled: list[object] = []
+
+    class FakeTimer:
+        def __init__(self, delay, callback, args=()):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.name = ""
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            scheduled.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    monkeypatch.setattr("app.services.market_runtime.threading.Timer", FakeTimer)
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(qfae_reconciliation_delay_minutes=10),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+    )
+    now = datetime(2026, 9, 8, 15, 0, tzinfo=IST)
+    market_close = nse_market_close_at(now)
+
+    runtime._schedule_after_market_reconciliation(market_close, now)
+
+    assert len(scheduled) == 1
+    assert scheduled[0].delay == 40 * 60
+    assert scheduled[0].started is True
+    assert runtime._reconciliation["state"] == "scheduled"
+    assert runtime._reconciliation["next_attempt_at"] == "2026-09-08T15:40:00+05:30"
 
 
 def test_live_persistence_collects_all_completed_minutes_after_watermark() -> None:
