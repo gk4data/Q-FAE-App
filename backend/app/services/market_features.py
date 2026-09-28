@@ -437,6 +437,13 @@ def build_stock_features(
     volatility = _volatility(session, completed_candle.close, atr, atr_sessions)
     liquidity = _liquidity(snapshot, max_spread_bps, min_traded_value_inr)
 
+    session_open = session[0].open if session else None
+    if (
+        snapshot.session_candle is not None
+        and snapshot.session_candle.timestamp.astimezone(INDIA_TIMEZONE).date() == session_date
+    ):
+        session_open = snapshot.session_candle.open
+
     unavailable = []
     if vwap.value is None:
         unavailable.append("vwap")
@@ -467,6 +474,11 @@ def build_stock_features(
         candle_timestamp=completed_candle.timestamp,
         data_quality=data_quality,
         unavailable=unavailable,
+        session_price_trace=(
+            [session_open, *(candle.close for candle in session)]
+            if session_open is not None
+            else []
+        ),
         vwap=vwap,
         gap=gap,
         opening_ranges=opening_ranges,

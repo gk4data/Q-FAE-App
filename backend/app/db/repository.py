@@ -14,6 +14,8 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session
 
 from app.db.models import (
+    BacktestRunRecord,
+    BacktestTradeRecord,
     DataSyncStateRecord,
     CorporateActionRecord,
     CorporateActionAssessmentRecord,
@@ -29,6 +31,7 @@ from app.db.models import (
     MinuteOfDayProfileRecord,
     SessionReconciliationRecord,
 )
+from app.models.backtest import BacktestRun, BacktestRunListItem
 from app.models.market import AdjustedCandle, Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, MinuteOfDayProfile
 from app.services.corporate_action_pipeline import adjust_candles
 from app.services.evidence_outcomes import evaluate_observation
@@ -240,6 +243,33 @@ class HistoricalMarketRepository:
         with Session(self.engine) as session:
             records = list(session.scalars(query))
         return [self._to_candle(record) for record in records]
+
+    def get_session_candles_many(
+        self,
+        instrument_keys: list[str],
+        session_date: date,
+    ) -> dict[str, list[Candle]]:
+        """Load one session for many instruments in a single indexed query."""
+        if not instrument_keys:
+            return {}
+        start = datetime.combine(session_date, time.min, tzinfo=INDIA_TIMEZONE).astimezone(UTC)
+        end = start + timedelta(days=1)
+        query = (
+            select(MarketCandleRecord)
+            .where(
+                MarketCandleRecord.instrument_key.in_(instrument_keys),
+                MarketCandleRecord.interval == "1minute",
+                MarketCandleRecord.timestamp >= start,
+                MarketCandleRecord.timestamp < end,
+            )
+            .order_by(MarketCandleRecord.instrument_key, MarketCandleRecord.timestamp)
+        )
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        grouped: dict[str, list[Candle]] = defaultdict(list)
+        for record in records:
+            grouped[record.instrument_key].append(self._to_candle(record))
+        return dict(grouped)
 
     def save_reconciliation(self, result: DailyReconciliationRecord) -> None:
         values = result.model_dump()
@@ -699,6 +729,192 @@ class HistoricalMarketRepository:
         with Session(self.engine) as session:
             records = list(session.scalars(query))
         return [self._to_evidence_observation(record) for record in records]
+
+    def get_evidence_observations_range(
+        self,
+        from_date: date,
+        to_date: date,
+    ) -> list[EvidenceOutcomeObservation]:
+        """Load point-in-time observations over an inclusive session-date range."""
+        start = datetime.combine(from_date, time.min, tzinfo=INDIA_TIMEZONE).astimezone(UTC)
+        end = datetime.combine(
+            to_date + timedelta(days=1), time.min, tzinfo=INDIA_TIMEZONE
+        ).astimezone(UTC)
+        query = (
+            select(EvidenceObservationRecord)
+            .where(
+                EvidenceObservationRecord.candle_timestamp >= start,
+                EvidenceObservationRecord.candle_timestamp < end,
+            )
+            .order_by(
+                EvidenceObservationRecord.candle_timestamp,
+                EvidenceObservationRecord.symbol,
+            )
+        )
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        return [self._to_evidence_observation(record) for record in records]
+
+    def get_backtest_observations(
+        self,
+        from_date: date,
+        to_date: date,
+        min_score: float,
+        signal_states: list[str],
+        require_eligible: bool,
+    ) -> tuple[int, int, list[EvidenceOutcomeObservation]]:
+        """Filter large evidence JSON in PostgreSQL before model validation."""
+        start = datetime.combine(from_date, time.min, tzinfo=INDIA_TIMEZONE).astimezone(UTC)
+        end = datetime.combine(
+            to_date + timedelta(days=1), time.min, tzinfo=INDIA_TIMEZONE
+        ).astimezone(UTC)
+        period_filters = (
+            EvidenceObservationRecord.candle_timestamp >= start,
+            EvidenceObservationRecord.candle_timestamp < end,
+        )
+        score = EvidenceObservationRecord.evidence_payload[
+            "opportunity_score"
+        ]["final_score"].as_float()
+        eligible = EvidenceObservationRecord.evidence_payload[
+            "opportunity_score"
+        ]["eligible"].as_boolean()
+        query = (
+            select(EvidenceObservationRecord)
+            .where(
+                *period_filters,
+                EvidenceObservationRecord.signal_state.in_(signal_states),
+                score >= min_score,
+            )
+            .order_by(
+                EvidenceObservationRecord.candle_timestamp,
+                EvidenceObservationRecord.symbol,
+            )
+        )
+        if require_eligible:
+            query = query.where(eligible.is_(True))
+        count_query = select(func.count()).select_from(EvidenceObservationRecord).where(
+            *period_filters
+        )
+        session_count_query = select(
+            func.count(func.distinct(func.date(EvidenceObservationRecord.candle_timestamp)))
+        ).where(*period_filters)
+        with Session(self.engine) as session:
+            total = int(session.scalar(count_query) or 0)
+            recorded_sessions = int(session.scalar(session_count_query) or 0)
+            records = list(session.scalars(query))
+        return total, recorded_sessions, [self._to_evidence_observation(record) for record in records]
+
+    def get_session_evidence_many(
+        self,
+        instrument_keys: list[str],
+        session_date: date,
+    ) -> dict[str, list[EvidenceOutcomeObservation]]:
+        """Load point-in-time evidence paths for model-managed exits."""
+        if not instrument_keys:
+            return {}
+        start = datetime.combine(session_date, time.min, tzinfo=INDIA_TIMEZONE).astimezone(UTC)
+        end = start + timedelta(days=1)
+        query = (
+            select(EvidenceObservationRecord)
+            .where(
+                EvidenceObservationRecord.instrument_key.in_(instrument_keys),
+                EvidenceObservationRecord.candle_timestamp >= start,
+                EvidenceObservationRecord.candle_timestamp < end,
+            )
+            .order_by(
+                EvidenceObservationRecord.instrument_key,
+                EvidenceObservationRecord.candle_timestamp,
+            )
+        )
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        grouped: dict[str, list[EvidenceOutcomeObservation]] = defaultdict(list)
+        for record in records:
+            grouped[record.instrument_key].append(self._to_evidence_observation(record))
+        return dict(grouped)
+
+    def save_backtest_run(self, result: BacktestRun) -> None:
+        """Persist run assumptions, aggregates and every simulated trade atomically."""
+        run_values = {
+            "run_id": result.run_id,
+            "status": result.status,
+            "from_date": result.config.from_date,
+            "to_date": result.config.to_date,
+            "config_payload": result.config.model_dump(mode="json"),
+            "summary_payload": result.summary.model_dump(mode="json"),
+            "breakdowns_payload": [item.model_dump(mode="json") for item in result.breakdowns],
+            "model_versions": result.model_versions,
+            "limitations": result.limitations,
+            "created_at": result.created_at,
+            "completed_at": result.completed_at,
+        }
+        trade_values = [
+            {
+                "run_id": result.run_id,
+                "trade_id": trade.trade_id,
+                "instrument_key": trade.instrument_key,
+                "symbol": trade.symbol,
+                "signal_timestamp": trade.signal_timestamp,
+                "entry_timestamp": trade.entry_timestamp,
+                "exit_timestamp": trade.exit_timestamp,
+                "opportunity_score": Decimal(str(trade.opportunity_score)),
+                "net_return_percent": Decimal(str(trade.net_return_percent)),
+                "pnl_inr": Decimal(str(trade.pnl_inr)),
+                "exit_reason": trade.exit_reason,
+                "trade_payload": trade.model_dump(mode="json"),
+            }
+            for trade in result.trades
+        ]
+        with self.engine.begin() as connection:
+            connection.execute(insert(BacktestRunRecord).values(run_values))
+            if trade_values:
+                connection.execute(insert(BacktestTradeRecord), trade_values)
+
+    def get_backtest_run(self, run_id: str) -> BacktestRun | None:
+        with Session(self.engine) as session:
+            record = session.get(BacktestRunRecord, run_id)
+            if record is None:
+                return None
+            trade_records = list(
+                session.scalars(
+                    select(BacktestTradeRecord)
+                    .where(BacktestTradeRecord.run_id == run_id)
+                    .order_by(BacktestTradeRecord.entry_timestamp, BacktestTradeRecord.symbol)
+                )
+            )
+        return BacktestRun.model_validate(
+            {
+                "run_id": record.run_id,
+                "status": record.status,
+                "created_at": record.created_at,
+                "completed_at": record.completed_at,
+                "config": record.config_payload,
+                "summary": record.summary_payload,
+                "breakdowns": record.breakdowns_payload,
+                "model_versions": record.model_versions,
+                "trades": [item.trade_payload for item in trade_records],
+                "limitations": record.limitations,
+            }
+        )
+
+    def list_backtest_runs(self, limit: int = 20) -> list[BacktestRunListItem]:
+        query = select(BacktestRunRecord).order_by(BacktestRunRecord.created_at.desc()).limit(limit)
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        return [
+            BacktestRunListItem.model_validate(
+                {
+                    "run_id": record.run_id,
+                    "status": record.status,
+                    "created_at": record.created_at,
+                    "completed_at": record.completed_at,
+                    "config": record.config_payload,
+                    "summary": record.summary_payload,
+                    "model_versions": record.model_versions,
+                }
+            )
+            for record in records
+        ]
 
     def evaluate_evidence_outcomes(
         self,

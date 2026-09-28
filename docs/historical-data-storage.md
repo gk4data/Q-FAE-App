@@ -1,10 +1,10 @@
 # Future historical-data storage policy
 
-Status: PostgreSQL daily candles, bounded pilot minute history, and rolling minute-of-day profiles are implemented. Full-universe scaling and research archives remain future phases.
+Status: PostgreSQL daily candles, durable pilot minute history, and rolling minute-of-day profiles are implemented. Full-universe scaling and compressed research archives remain future phases.
 
 Q-FAE must not download the complete historical dataset again every morning. Historical market data will use a rolling, incremental storage model with distinct policies for daily and one-minute data.
 
-The implemented foundation includes an Alembic-managed schema, idempotent candle upserts, per-instrument sync watermarks, Redis hydration from PostgreSQL, a five-day daily overlap, and a two-day one-minute overlap. Minute rows are retained for a configurable 35 calendar days. Profiles are rebuilt from retained prior sessions and deliberately exclude the current live date.
+The implemented foundation includes an Alembic-managed schema, idempotent candle upserts, per-instrument sync watermarks, Redis hydration from PostgreSQL, a five-day daily overlap, and a two-day one-minute overlap. PostgreSQL minute pruning is disabled by default so backtests remain reproducible. The 35-day setting applies only when `QFAE_PRUNE_PERSISTED_MINUTE_HISTORY=true`. Profiles are rebuilt from prior sessions and deliberately exclude the current live date.
 
 ## Required storage tiers
 
@@ -19,13 +19,13 @@ The implemented foundation includes an Alembic-managed schema, idempotent candle
 ### Raw one-minute OHLCV
 
 - Always retain the current market day's completed one-minute candles.
-- Retain approximately 14–30 recent sessions for approved/tradable stocks, rather than indefinitely retaining all raw minutes for every listed stock.
+- Retain approved-universe minute history for reproducible backtesting; introduce partitioning or archives as measured storage grows.
 - Use recent minutes for opening behaviour, VWAP development, same-time RVOL, pullback quality, liquidity analysis, and short-horizon validation.
-- Make the universe scope and retention period configurable after storage and provider-rate tests.
+- Keep destructive PostgreSQL pruning opt-in and separate from Redis cache expiry.
 
 ### Rolling minute-of-day profiles
 
-Before older raw minutes expire, update compact statistical profiles for each instrument and each normal NSE market minute. Profiles should retain:
+As new sessions arrive, update compact statistical profiles for each instrument and each normal NSE market minute. Profiles should retain:
 
 - minute-of-day bucket;
 - comparable-session count;
@@ -41,7 +41,7 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 
 ### Research archive
 
-- Longer raw one-minute history may be retained separately for strategy backtesting when justified.
+- Longer raw one-minute history is retained for strategy backtesting unless pruning is explicitly enabled.
 - Prefer compressed, partitioned archival storage such as Parquet by date/instrument group instead of the operational application database.
 - Archive retention must be a deliberate research requirement, not an accidental consequence of the live pipeline.
 
@@ -49,7 +49,7 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 
 | Component | Responsibility |
 | --- | --- |
-| PostgreSQL | Durable daily candles, limited operational minute history, calculated profiles, sync metadata, and point-in-time feature records. |
+| PostgreSQL | Durable daily/minute candles, calculated profiles, sync metadata, point-in-time evidence and saved backtest runs. |
 | Redis | Current quotes, forming/completed live minutes, latest feature snapshots, runtime status, and dashboard cache. |
 | Archive storage | Optional long-horizon raw minute data for reproducible research and backtesting. |
 
@@ -68,13 +68,13 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 - Calculations must record data-through time, source, adjustment status, and feature version.
 - Backtests must use only information available at that historical time and avoid survivorship/look-ahead bias.
 - Provider corrections, symbol changes, instrument-key changes, splits, bonuses, and other corporate actions must be handled without destroying the original observations.
-- Daily history is broad and permanent; raw minute retention is selective and bounded.
+- Daily history is broad and permanent; approved-universe raw minute history remains durable for reproducible backtesting.
 
 ## Capacity and operational limits
 
 PostgreSQL does not impose a small fixed database quota; practical capacity is governed by the host/Docker disk, write throughput, indexes, vacuuming and backup time. The local Docker database was approximately 48 MB at the start of the 100-stock phase, and its container filesystem reported approximately 950 GB available. These figures are observations, not reserved capacity or a storage guarantee.
 
-At 100 stocks and 375 normal NSE minutes, Q-FAE can create up to 37,500 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Raw one-minute candles retain the configured 35-day boundary; evidence observations intended for backtesting require a deliberate longer-term retention and archive policy.
+At 100 stocks and 375 normal NSE minutes, Q-FAE can create up to 37,500 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Both candles and evidence observations intended for backtesting now remain durable by default; retention and archival limits must be introduced deliberately as measured storage grows.
 
 Before moving from 100 to 200 stocks:
 

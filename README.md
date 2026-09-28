@@ -90,6 +90,8 @@ One hundred stocks is the application default during the expanded evidence-colle
 
 Each manually started live session schedules a backend safety stop for the normal NSE cash-market close at 3:30 PM IST. The API refuses to start a new normal live session after that time. Exchange holidays and announced special sessions will be handled by the future market-calendar controller.
 
+The next priority milestone is the [automated market-day operations plan](docs/market-day-automation-plan.md): long-lived read-only Upstox authentication, an idempotent market-calendar controller, restart/backfill recovery, production Docker services, Azure VM scheduling, and completeness monitoring. Its acceptance target is a full session that requires no VS Code window, terminal, browser, preparation button, or live-feed button.
+
 Read the normalized state through:
 
 - `GET /api/v1/market/candles?instrument_key=NSE_EQ%7C...`

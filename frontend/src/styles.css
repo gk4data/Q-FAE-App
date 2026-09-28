@@ -193,6 +193,28 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .analysis-tab:focus-visible { outline: 2px solid #61d3a4; outline-offset: -2px; }
 .analysis-tab-panel > .table-card { margin-bottom: 0; border-radius: 0 0 .65rem .65rem; }
 .analysis-tab-panel .table-heading { min-height: 4.6rem; }
+.backtest-card { overflow: hidden; border: 1px solid #253141; border-radius: 0 0 .65rem .65rem; background: #101821; }
+.backtest-controls { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); align-items: end; gap: .75rem; padding: 1rem 1.25rem; border-top: 1px solid #253141; border-bottom: 1px solid #253141; background: #0d141c; }
+.backtest-controls label { display: grid; gap: .38rem; color: #8594a8; font-size: .62rem; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
+.backtest-controls input, .backtest-controls select { width: 100%; min-height: 2.55rem; border: 1px solid #2a3748; border-radius: .4rem; padding: .55rem .65rem; background: #121c27; color: #dce6f2; font: inherit; font-size: .75rem; letter-spacing: normal; text-transform: none; }
+.backtest-controls input:focus, .backtest-controls select:focus { border-color: #61d3a4; outline: none; box-shadow: 0 0 0 2px rgba(97, 211, 164, .12); }
+.backtest-controls button { min-height: 2.55rem; }
+.recent-backtests { display: flex; align-items: center; gap: .45rem; overflow-x: auto; padding: .7rem 1.25rem; border-bottom: 1px solid #253141; }
+.recent-backtests > span { flex: 0 0 auto; color: #7f8ea3; font-size: .62rem; font-weight: 750; letter-spacing: .06em; text-transform: uppercase; }
+.recent-backtests button { flex: 0 0 auto; border: 1px solid #29384a; padding: .42rem .65rem; background: #131d28; color: #9eafc4; font-size: .64rem; }
+.backtest-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(145px, 1fr)); gap: .7rem; padding: 1rem 1.25rem; }
+.backtest-summary article { border: 1px solid #263546; border-radius: .48rem; padding: .8rem; background: #111b26; }
+.backtest-summary span { display: block; color: #8291a5; font-size: .62rem; letter-spacing: .06em; text-transform: uppercase; }
+.backtest-summary strong { display: block; margin: .35rem 0 .2rem; font-size: 1.15rem; }
+.backtest-summary small { display: block; color: #748399; font-size: .62rem; }
+.backtest-meta { display: flex; flex-wrap: wrap; gap: .55rem; padding: 0 1.25rem 1rem; }
+.backtest-meta span { border-radius: 999px; padding: .3rem .55rem; background: #1b2734; color: #91a2b8; font-size: .6rem; }
+.backtest-trades { border-top: 1px solid #253141; }
+.backtest-trades table { min-width: 1120px; }
+.backtest-trades td small { display: block; margin-top: .28rem; color: #718197; }
+.backtest-limitations { display: grid; gap: .35rem; padding: 1rem 1.25rem; border-top: 1px solid #253141; }
+.backtest-limitations span { color: #77879b; font-size: .64rem; }
+.backtest-limitations span::before { margin-right: .45rem; color: #d4a44e; content: "•"; }
 .table-scroll { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; min-width: 1080px; }
 th { padding: .78rem 1rem; color: #7f8ea3; background: #0e141c; font-size: .68rem; letter-spacing: .08em; text-align: left; text-transform: uppercase; white-space: nowrap; }

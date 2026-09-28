@@ -68,6 +68,9 @@ def test_feature_engine_builds_all_approved_minute_feature_groups() -> None:
         total_buy_quantity=120_000,
         total_sell_quantity=80_000,
         current_candle=make_candle(key, as_of, current.close, current.close, 10),
+        session_candle=make_candle(key, start, 99.5, current.close, 200_000).model_copy(
+            update={"interval": "day"}
+        ),
     )
     snapshots = {
         key: snapshot,
@@ -119,6 +122,9 @@ def test_feature_engine_builds_all_approved_minute_feature_groups() -> None:
     assert features.volatility.atr is not None
     assert features.liquidity.state == "pass"
     assert features.liquidity.depth_imbalance == 0.2
+    assert len(features.session_price_trace) == 32
+    assert features.session_price_trace[0] == 99.5
+    assert features.session_price_trace[-1] == current.close
 
 
 def test_sector_mapping_is_explicit_and_can_remain_unavailable() -> None:

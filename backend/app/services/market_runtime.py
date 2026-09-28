@@ -12,6 +12,7 @@ import upstox_client
 
 from app.core.config import Settings
 from app.db.repository import HistoricalMarketRepository
+from app.models.backtest import BacktestRun, BacktestRunListItem, BacktestRunRequest
 from app.models.market import (
     AdjustedCandle,
     Candle,
@@ -45,6 +46,7 @@ from app.services.daily_regime import (
     cumulative_relative_volume,
     merge_daily_history,
 )
+from app.services.backtesting import OpportunityBacktester
 from app.services.corporate_action_assessment import assess_corporate_action
 from app.services.corporate_action_ai import CorporateActionAIScorer, unavailable_ai_analysis
 from app.services.corporate_action_documents import NseAnnouncementClient
@@ -84,6 +86,7 @@ from app.services.upstox_market import (
 
 logger = logging.getLogger(__name__)
 NSE_MARKET_CLOSE = datetime_time(hour=15, minute=30)
+NSE_MARKET_OPEN = datetime_time(hour=9, minute=15)
 NSE_SESSION_CANDLE_LIMIT = 400
 
 
@@ -93,6 +96,27 @@ def nse_market_close_at(now: datetime) -> datetime:
         raise ValueError("market-clock timestamps must include a timezone")
     local_now = now.astimezone(INDIA_TIMEZONE)
     return datetime.combine(local_now.date(), NSE_MARKET_CLOSE, tzinfo=INDIA_TIMEZONE)
+
+
+def completed_regular_session_candles(
+    candles: list[Candle],
+    session_date: date,
+    as_of: datetime,
+) -> list[Candle]:
+    """Keep only completed one-minute candles from the requested NSE cash session."""
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("backfill timestamps must include a timezone")
+    local_as_of = as_of.astimezone(INDIA_TIMEZONE)
+    completed_before = local_as_of.replace(second=0, microsecond=0)
+    session_open = datetime.combine(session_date, NSE_MARKET_OPEN, tzinfo=INDIA_TIMEZONE)
+    session_close = datetime.combine(session_date, NSE_MARKET_CLOSE, tzinfo=INDIA_TIMEZONE)
+    completed_before = min(completed_before, session_close)
+    return [
+        candle
+        for candle in candles
+        if candle.interval == "1minute"
+        and session_open <= candle.timestamp.astimezone(INDIA_TIMEZONE) < completed_before
+    ]
 
 
 class MarketRuntimeError(RuntimeError):
@@ -116,6 +140,10 @@ class MarketRuntime:
         self._lock = threading.RLock()
         self._bootstrap_thread: threading.Thread | None = None
         self._stream_thread: threading.Thread | None = None
+        self._session_backfill_thread: threading.Thread | None = None
+        self._session_backfill_cancel: threading.Event | None = None
+        self._session_backfill_keys: list[str] = []
+        self._session_backfill_date: date | None = None
         self._reconciliation_thread: threading.Thread | None = None
         self._streamer: Any | None = None
         self._context_timer: threading.Timer | None = None
@@ -162,6 +190,15 @@ class MarketRuntime:
             "last_context_at": None,
             "last_evidence_at": None,
             "evidence_queue_depth": 0,
+            "backfill_state": "idle",
+            "backfill_total": 0,
+            "backfill_processed": 0,
+            "backfill_instruments_loaded": 0,
+            "backfill_candles_loaded": 0,
+            "backfill_errors": 0,
+            "backfill_started_at": None,
+            "backfill_finished_at": None,
+            "backfill_recent_errors": [],
             "scheduled_stop_at": None,
             "error": None,
         }
@@ -452,20 +489,6 @@ class MarketRuntime:
             item.model_copy(update={"market_regime": market_regime})
             for item in evidence
         ]
-        recent_candles = self.state_store.get_candles_many(
-            (item.instrument_key for item in evidence),
-            limit=30,
-        )
-        price_traces: dict[str, list[float]] = {}
-        for instrument_key, candles in recent_candles.items():
-            if not candles:
-                continue
-            session_date = candles[-1].timestamp.astimezone(INDIA_TIMEZONE).date()
-            price_traces[instrument_key] = [
-                candle.close
-                for candle in candles
-                if candle.timestamp.astimezone(INDIA_TIMEZONE).date() == session_date
-            ][-30:]
         try:
             return rank_opportunities(
                 evidence,
@@ -483,7 +506,11 @@ class MarketRuntime:
                     for key, snapshot in snapshots.items()
                     if snapshot.session_candle is not None
                 },
-                price_traces,
+                {
+                    key: feature.session_price_trace
+                    for key, feature in features.items()
+                    if feature.session_price_trace
+                },
                 weights=self._opportunity_scoring_weights(),
             )
         except ValueError as exc:
@@ -509,6 +536,36 @@ class MarketRuntime:
             return self.historical_repository.get_evidence_observations(session_date, instrument_key)
         except Exception as exc:
             raise MarketRuntimeError("Evidence outcome records are unavailable") from exc
+
+    def run_backtest(self, config: BacktestRunRequest) -> BacktestRun:
+        repository = self.historical_repository
+        if repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        try:
+            result = OpportunityBacktester(repository).run(config)
+            repository.save_backtest_run(result)
+            return result
+        except Exception as exc:
+            logger.exception("Opportunity backtest failed")
+            raise MarketRuntimeError(f"Backtest could not be completed: {exc}") from exc
+
+    def get_backtest_run(self, run_id: str) -> BacktestRun | None:
+        repository = self.historical_repository
+        if repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        try:
+            return repository.get_backtest_run(run_id)
+        except Exception as exc:
+            raise MarketRuntimeError("Backtest run is unavailable") from exc
+
+    def list_backtest_runs(self, limit: int = 20) -> list[BacktestRunListItem]:
+        repository = self.historical_repository
+        if repository is None:
+            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
+        try:
+            return repository.list_backtest_runs(limit)
+        except Exception as exc:
+            raise MarketRuntimeError("Backtest runs are unavailable") from exc
 
     def get_corporate_actions(
         self,
@@ -1363,10 +1420,11 @@ class MarketRuntime:
                 if downloaded:
                     repository.upsert_candles(downloaded)
                     persisted = True
-                cutoff = datetime.now(INDIA_TIMEZONE) - timedelta(
-                    days=self.settings.qfae_minute_history_retention_days
-                )
-                repository.prune_minute_candles(cutoff, [instrument_key])
+                if self.settings.qfae_prune_persisted_minute_history:
+                    cutoff = datetime.now(INDIA_TIMEZONE) - timedelta(
+                        days=self.settings.qfae_minute_history_retention_days
+                    )
+                    repository.prune_minute_candles(cutoff, [instrument_key])
                 profile_built = repository.refresh_minute_profiles(
                     instrument_key,
                     exclude_session_date=datetime.now(INDIA_TIMEZONE).date(),
@@ -1446,11 +1504,23 @@ class MarketRuntime:
                 "last_context_at": None,
                 "last_evidence_at": None,
                 "evidence_queue_depth": 0,
+                "backfill_state": "waiting_for_stream",
+                "backfill_total": len(instrument_keys),
+                "backfill_processed": 0,
+                "backfill_instruments_loaded": 0,
+                "backfill_candles_loaded": 0,
+                "backfill_errors": 0,
+                "backfill_started_at": None,
+                "backfill_finished_at": None,
+                "backfill_recent_errors": [],
                 "scheduled_stop_at": market_close.isoformat(),
                 "error": None,
             }
             self._last_context_bucket = None
             self._evidence_queue.clear()
+            self._session_backfill_keys = instrument_keys
+            self._session_backfill_date = now.date()
+            self._session_backfill_cancel = threading.Event()
             configuration = upstox_client.Configuration()
             configuration.access_token = token
             api_client = upstox_client.ApiClient(configuration)
@@ -1477,9 +1547,12 @@ class MarketRuntime:
         with self._lock:
             streamer = self._streamer
             market_close_timer = self._market_close_timer
+            backfill_cancel = self._session_backfill_cancel
             self._market_close_timer = None
         if market_close_timer is not None:
             market_close_timer.cancel()
+        if backfill_cancel is not None:
+            backfill_cancel.set()
         if streamer is not None:
             try:
                 streamer.disconnect()
@@ -1490,6 +1563,9 @@ class MarketRuntime:
             self._live["connected"] = False
             self._live["subscribed"] = 0
             self._live["scheduled_stop_at"] = None
+            if self._live.get("backfill_state") in {"waiting_for_stream", "running"}:
+                self._live["backfill_state"] = "cancelled"
+                self._live["backfill_finished_at"] = datetime.now(UTC).isoformat()
             self._streamer = None
             return dict(self._live)
 
@@ -1641,6 +1717,101 @@ class MarketRuntime:
             self._live["state"] = "connected"
             self._live["connected"] = True
             self._live["error"] = None
+            if (
+                self._live.get("backfill_state") == "waiting_for_stream"
+                and self._session_backfill_date is not None
+                and self._session_backfill_cancel is not None
+            ):
+                self._live["backfill_state"] = "running"
+                self._live["backfill_started_at"] = datetime.now(UTC).isoformat()
+                self._session_backfill_thread = threading.Thread(
+                    target=self._run_session_backfill,
+                    args=(
+                        list(self._session_backfill_keys),
+                        self._session_backfill_date,
+                        self._session_backfill_cancel,
+                    ),
+                    name="qfae-session-minute-backfill",
+                    daemon=True,
+                )
+                self._session_backfill_thread.start()
+
+    def _run_session_backfill(
+        self,
+        instrument_keys: list[str],
+        session_date: date,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Hydrate today's completed minutes after the stream is connected."""
+        limiter = RequestRateLimiter(
+            self.settings.qfae_market_request_rate_per_second,
+            self.settings.qfae_market_request_rate_per_minute,
+        )
+        try:
+            with UpstoxMarketDataClient(self._require_access_token(), limiter) as client:
+                for instrument_key in instrument_keys:
+                    if cancel_event.is_set():
+                        break
+                    error: str | None = None
+                    completed: list[Candle] = []
+                    try:
+                        downloaded = client.fetch_intraday_minute_history(instrument_key)
+                        completed = completed_regular_session_candles(
+                            downloaded,
+                            session_date,
+                            datetime.now(INDIA_TIMEZONE),
+                        )
+                        if completed:
+                            self.state_store.save_candles(completed)
+                            if self.historical_repository is not None:
+                                self.historical_repository.upsert_candles(completed)
+                                self._persisted_minute_watermarks[instrument_key] = (
+                                    completed[-1].timestamp
+                                )
+                    except Exception as exc:
+                        error = f"{self._symbols.get(instrument_key, instrument_key)}: {exc}"
+                        logger.warning(
+                            "Session minute backfill failed for %s: %s",
+                            instrument_key,
+                            exc,
+                        )
+                    with self._lock:
+                        if cancel_event is not self._session_backfill_cancel:
+                            continue
+                        self._live["backfill_processed"] += 1
+                        self._live["backfill_instruments_loaded"] += int(bool(completed))
+                        self._live["backfill_candles_loaded"] += len(completed)
+                        if error:
+                            self._live["backfill_errors"] += 1
+                            self._live["backfill_recent_errors"] = (
+                                self._live["backfill_recent_errors"] + [error]
+                            )[-25:]
+        except Exception as exc:
+            safe_error = str(exc).replace(self._access_token() or "<no-token>", "<redacted>")[:500]
+            logger.exception("Current-session minute backfill stopped unexpectedly")
+            with self._lock:
+                if cancel_event is self._session_backfill_cancel:
+                    self._live["backfill_errors"] += 1
+                    self._live["backfill_recent_errors"] = (
+                        self._live["backfill_recent_errors"] + [f"backfill: {safe_error}"]
+                    )[-25:]
+        finally:
+            with self._lock:
+                current_run = cancel_event is self._session_backfill_cancel
+                if current_run:
+                    errors = self._live["backfill_errors"]
+                    processed = self._live["backfill_processed"]
+                    total = self._live["backfill_total"]
+                    if cancel_event.is_set():
+                        state = "cancelled"
+                    elif errors:
+                        state = "partial" if processed else "failed"
+                    else:
+                        state = "completed" if processed == total else "partial"
+                    self._live["backfill_state"] = state
+                    self._live["backfill_finished_at"] = datetime.now(UTC).isoformat()
+            if current_run and not cancel_event.is_set() and self.state_store.get_snapshots():
+                self._calculate_minute_context()
 
     def _on_stream_message(self, message: dict[str, Any]) -> None:
         try:

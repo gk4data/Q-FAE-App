@@ -1,6 +1,6 @@
 # After-market daily-candle reconciliation
 
-Q-FAE provides a manual reconciliation step while market-day automation remains deferred. After a completed session, **Reconcile close** fetches the official Upstox daily candle for all 20 pilot equities and market-context indices, persists it idempotently, and replaces any same-date provisional daily candle in Redis.
+After a live session starts, Q-FAE schedules reconciliation automatically for 3:40 PM IST and safely retries delayed provider candles. It fetches the official Upstox daily candle for the configured equity universe and market-context indices, persists it idempotently, and replaces any same-date provisional daily candle in Redis. The remaining work is to automate the beginning of the market-day lifecycle; see the [automated market-day operations plan](market-day-automation-plan.md).
 
 For pilot equities, Q-FAE compares the official candle with retained regular-session one-minute candles and stores an audit record containing minute coverage, open/high/low/close consistency, volume difference, and explicit notes. A normal NSE session has 375 possible one-minute buckets from 09:15 through 15:29. An absent candle can mean either no trade or missing provider data, so Q-FAE reports the coverage gap without inventing a zero-volume candle or claiming a cause it cannot verify.
 

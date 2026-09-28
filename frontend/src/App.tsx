@@ -20,6 +20,86 @@ type RuntimeStatus = {
   reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
 
+type BacktestConfig = {
+  from_date: string;
+  to_date: string;
+  min_score: number;
+  required_signal_states: string[];
+  exit_policy: "fixed_minutes" | "end_of_day" | "bracket" | "model";
+  holding_minutes: number;
+  stop_loss_percent: number;
+  take_profit_percent: number;
+  model_exit_score: number;
+  model_exit_confirmation_minutes: number;
+  model_minimum_hold_minutes: number;
+  slippage_bps_per_side: number;
+  fees_bps_per_side: number;
+  initial_capital_inr: number;
+  position_size_inr: number;
+  max_candidates_per_minute: number;
+  max_trades_per_day: number;
+  max_concurrent_positions: number;
+  one_trade_per_stock_per_day: boolean;
+  require_eligible: boolean;
+};
+
+type BacktestTrade = {
+  trade_id: string;
+  symbol: string;
+  sector: string | null;
+  signal_timestamp: string;
+  entry_timestamp: string;
+  exit_timestamp: string;
+  opportunity_score: number;
+  entry_price: number;
+  exit_price: number;
+  gross_return_percent: number;
+  net_return_percent: number;
+  pnl_inr: number;
+  holding_minutes: number;
+  exit_reason: string;
+  market_regime: string | null;
+  exit_opportunity_score: number | null;
+  exit_signal_state: string | null;
+};
+
+type BacktestSummary = {
+  observations: number;
+  recorded_sessions: number | null;
+  traded_sessions: number | null;
+  qualifying_signals: number;
+  skipped_missing_candles: number;
+  trades: number;
+  wins: number;
+  losses: number;
+  win_rate_percent: number | null;
+  average_win_percent: number | null;
+  average_loss_percent: number | null;
+  average_net_return_percent: number | null;
+  expectancy_percent: number | null;
+  gross_return_percent: number;
+  net_return_percent: number;
+  net_profit_inr: number;
+  profit_factor: number | null;
+  maximum_drawdown_percent: number;
+  sharpe_like: number | null;
+};
+
+type BacktestRun = {
+  run_id: string;
+  status: string;
+  created_at: string;
+  completed_at: string;
+  config: BacktestConfig;
+  summary: BacktestSummary;
+  breakdowns: Array<{ dimension: string; bucket: string; trades: number; win_rate_percent: number | null; average_net_return_percent: number | null; total_pnl_inr: number }>;
+  model_versions: string[];
+  trades: BacktestTrade[];
+  limitations: string[];
+};
+
+type BacktestRunListItem = Pick<BacktestRun, "run_id" | "status" | "created_at" | "completed_at" | "config" | "summary" | "model_versions">;
+
 type WatchlistItem = {
   instrument_key: string;
   symbol: string;
@@ -476,7 +556,7 @@ function SortableHeader({
 
 function PriceSparkline({ values, instrumentKey, sessionReturn }: { values: number[]; instrumentKey: string; sessionReturn: number | null }) {
   const series = values.filter((value) => Number.isFinite(value));
-  if (series.length < 2) return <span className="sparkline-empty">Waiting for minute trace</span>;
+  if (series.length < 2) return <span className="sparkline-empty">Waiting for session trace</span>;
   const width = 132;
   const height = 48;
   const padding = 3;
@@ -492,7 +572,7 @@ function PriceSparkline({ values, instrumentKey, sessionReturn }: { values: numb
   const rising = series.at(-1)! > series[0] || (series.at(-1) === series[0] && (sessionReturn ?? 0) >= 0);
   const gradientId = `spark-${instrumentKey.replace(/[^a-zA-Z0-9]/g, "")}`;
   return (
-    <svg className={`price-sparkline ${rising ? "rising" : "falling"}`} viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Recent ${series.length}-minute price trace`} preserveAspectRatio="none">
+    <svg className={`price-sparkline ${rising ? "rising" : "falling"}`} viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Current-session price trace from the opening candle through the latest completed candle" preserveAspectRatio="none">
       <defs>
         <linearGradient id={gradientId} x1="0" y1="0" x2="0" y2="1">
           <stop offset="0%" stopColor="currentColor" stopOpacity=".4" />
@@ -1585,7 +1665,150 @@ function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCh
   );
 }
 
-type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "corporate" | "evidence" | "daily" | "financials" | "stocks";
+function localDate(offsetDays = 0) {
+  const value = new Date();
+  value.setDate(value.getDate() + offsetDays);
+  const year = value.getFullYear();
+  const month = String(value.getMonth() + 1).padStart(2, "0");
+  const day = String(value.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function BacktestPanel({ databaseAvailable }: { databaseAvailable: boolean }) {
+  const [fromDate, setFromDate] = useState(localDate(-30));
+  const [toDate, setToDate] = useState(localDate());
+  const [minScore, setMinScore] = useState(70);
+  const [exitPolicy, setExitPolicy] = useState<BacktestConfig["exit_policy"]>("model");
+  const [holdingMinutes, setHoldingMinutes] = useState(30);
+  const [stopLoss, setStopLoss] = useState(1);
+  const [takeProfit, setTakeProfit] = useState(2);
+  const [modelExitScore, setModelExitScore] = useState(55);
+  const [modelExitMinutes, setModelExitMinutes] = useState(2);
+  const [modelMinimumHold, setModelMinimumHold] = useState(3);
+  const [slippageBps, setSlippageBps] = useState(5);
+  const [feesBps, setFeesBps] = useState(10);
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<BacktestRun | null>(null);
+  const [recentRuns, setRecentRuns] = useState<BacktestRunListItem[]>([]);
+  const [panelError, setPanelError] = useState<string | null>(null);
+
+  const loadRuns = useCallback(async () => {
+    if (!databaseAvailable) return;
+    const response = await fetch(`${apiBaseUrl}/market/backtests?limit=8`);
+    if (response.ok) setRecentRuns(await response.json() as BacktestRunListItem[]);
+  }, [databaseAvailable]);
+
+  useEffect(() => { void loadRuns(); }, [loadRuns]);
+
+  const runBacktest = async () => {
+    setRunning(true);
+    setPanelError(null);
+    try {
+      const response = await fetch(`${apiBaseUrl}/market/backtests`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from_date: fromDate,
+          to_date: toDate,
+          min_score: minScore,
+          required_signal_states: ["confirmed"],
+          require_eligible: true,
+          max_candidates_per_minute: 3,
+          max_trades_per_day: 5,
+          max_concurrent_positions: 3,
+          one_trade_per_stock_per_day: true,
+          exit_policy: exitPolicy,
+          holding_minutes: holdingMinutes,
+          stop_loss_percent: stopLoss,
+          take_profit_percent: takeProfit,
+          model_exit_score: modelExitScore,
+          model_exit_confirmation_minutes: modelExitMinutes,
+          model_minimum_hold_minutes: modelMinimumHold,
+          slippage_bps_per_side: slippageBps,
+          fees_bps_per_side: feesBps,
+          initial_capital_inr: 1_000_000,
+          position_size_inr: 100_000,
+        }),
+      });
+      if (!response.ok) {
+        const payload = await response.json() as { detail?: string };
+        throw new Error(payload.detail ?? "Backtest could not be completed");
+      }
+      setResult(await response.json() as BacktestRun);
+      await loadRuns();
+    } catch (reason) {
+      setPanelError(reason instanceof Error ? reason.message : "Backtest could not be completed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const openRun = async (runId: string) => {
+    setPanelError(null);
+    const response = await fetch(`${apiBaseUrl}/market/backtests/${runId}`);
+    if (response.ok) setResult(await response.json() as BacktestRun);
+    else setPanelError("Saved backtest could not be loaded");
+  };
+
+  const { sortedRows: sortedTrades, sort, requestSort } = useSortableRows(
+    result?.trades ?? [],
+    {
+      time: (row) => row.entry_timestamp,
+      symbol: (row) => row.symbol,
+      score: (row) => row.opportunity_score,
+      return: (row) => row.net_return_percent,
+      pnl: (row) => row.pnl_inr,
+      holding: (row) => row.holding_minutes,
+    },
+    "time",
+    "asc",
+  );
+
+  return (
+    <section className="backtest-card">
+      <header className="table-heading">
+        <div><p className="eyebrow">POINT-IN-TIME RESEARCH</p><h2>Opportunity-model backtesting</h2><p>Signals use their recorded score and enter at the next candle. Costs are applied on both sides.</p></div>
+      </header>
+      <div className="backtest-controls">
+        <label>From<input type="date" value={fromDate} max={toDate} onChange={(event) => setFromDate(event.target.value)} /></label>
+        <label>To<input type="date" value={toDate} min={fromDate} max={localDate()} onChange={(event) => setToDate(event.target.value)} /></label>
+        <label>Minimum score<input type="number" min="0" max="100" step="1" value={minScore} onChange={(event) => setMinScore(Number(event.target.value))} /></label>
+        <label>Exit policy<select value={exitPolicy} onChange={(event) => setExitPolicy(event.target.value as BacktestConfig["exit_policy"])}><option value="model">Model-managed</option><option value="fixed_minutes">Fixed holding</option><option value="end_of_day">End of day</option><option value="bracket">Stop / target</option></select></label>
+        {exitPolicy === "fixed_minutes" && <label>Hold minutes<input type="number" min="1" max="360" value={holdingMinutes} onChange={(event) => setHoldingMinutes(Number(event.target.value))} /></label>}
+        {exitPolicy === "bracket" && <><label>Stop loss %<input type="number" min="0.1" max="20" step="0.1" value={stopLoss} onChange={(event) => setStopLoss(Number(event.target.value))} /></label><label>Target %<input type="number" min="0.1" max="50" step="0.1" value={takeProfit} onChange={(event) => setTakeProfit(Number(event.target.value))} /></label></>}
+        {exitPolicy === "model" && <><label>Model exit below<input type="number" min="0" max="100" step="1" value={modelExitScore} onChange={(event) => setModelExitScore(Number(event.target.value))} /></label><label>Confirm minutes<input type="number" min="1" max="10" value={modelExitMinutes} onChange={(event) => setModelExitMinutes(Number(event.target.value))} /></label><label>Minimum hold<input type="number" min="0" max="120" value={modelMinimumHold} onChange={(event) => setModelMinimumHold(Number(event.target.value))} /></label><label>Hard stop %<input type="number" min="0.1" max="20" step="0.1" value={stopLoss} onChange={(event) => setStopLoss(Number(event.target.value))} /></label></>}
+        <label>Slippage bps / side<input type="number" min="0" max="500" value={slippageBps} onChange={(event) => setSlippageBps(Number(event.target.value))} /></label>
+        <label>Fees bps / side<input type="number" min="0" max="500" value={feesBps} onChange={(event) => setFeesBps(Number(event.target.value))} /></label>
+        <button type="button" disabled={!databaseAvailable || running} onClick={() => void runBacktest()}>{running ? "Running…" : "Run backtest"}</button>
+      </div>
+      {!databaseAvailable && <p className="notice error">PostgreSQL must be available to run a backtest.</p>}
+      {panelError && <p className="notice error">{panelError}</p>}
+      {recentRuns.length > 0 && <div className="recent-backtests"><span>Saved runs</span>{recentRuns.map((run) => <button type="button" key={run.run_id} onClick={() => void openRun(run.run_id)}>{new Date(run.created_at).toLocaleDateString("en-IN")} · {run.summary.trades} trades · {signedPercent(run.summary.net_return_percent)}</button>)}</div>}
+      {result && <>
+        <div className="backtest-summary">
+          <article><span>Net return</span><strong className={tone(result.summary.net_return_percent)}>{signedPercent(result.summary.net_return_percent)}</strong><small>₹{integer(result.summary.net_profit_inr)}</small></article>
+          <article><span>Gross / cost drag</span><strong className={tone(result.summary.gross_return_percent)}>{signedPercent(result.summary.gross_return_percent)}</strong><small>{percent(Math.max(0, result.summary.gross_return_percent - result.summary.net_return_percent))} consumed by costs</small></article>
+          <article><span>Trades</span><strong>{result.summary.trades}</strong><small>{result.summary.qualifying_signals} qualifying signals</small></article>
+          <article><span>Win rate</span><strong>{percent(result.summary.win_rate_percent)}</strong><small>{result.summary.wins} wins · {result.summary.losses} losses</small></article>
+          <article><span>Expectancy</span><strong className={tone(result.summary.expectancy_percent)}>{signedPercent(result.summary.expectancy_percent)}</strong><small>Average net per trade</small></article>
+          <article><span>Profit factor</span><strong>{result.summary.profit_factor == null ? "N/A" : number(result.summary.profit_factor)}</strong><small>Gross profit / gross loss</small></article>
+          <article><span>Max drawdown</span><strong className="negative">{percent(result.summary.maximum_drawdown_percent)}</strong><small>Closed-trade equity curve</small></article>
+        </div>
+        <div className="backtest-meta"><span>Run {result.run_id.slice(0, 8)}</span><span>{result.config.from_date} to {result.config.to_date}</span><span>{result.summary.recorded_sessions == null ? "Session coverage unavailable for legacy run" : `${result.summary.recorded_sessions} recorded sessions · ${result.summary.traded_sessions ?? 0} traded`}</span><span>{result.model_versions.join(", ") || "No model version observed"}</span><span>{result.summary.observations} recorded observations</span></div>
+        {result.summary.recorded_sessions != null && result.summary.recorded_sessions < 20 && <p className="notice error">Small sample: only {result.summary.recorded_sessions} recorded market sessions. Treat these results as diagnostics, not model validation.</p>}
+        <div className="table-scroll backtest-trades">
+          <table><thead><tr><SortableHeader label="Time" sortKey="time" sort={sort} onSort={requestSort} defaultDirection="asc" /><SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" /><SortableHeader label="Score" sortKey="score" sort={sort} onSort={requestSort} /><th>Entry / Exit</th><SortableHeader label="Net return" sortKey="return" sort={sort} onSort={requestSort} /><SortableHeader label="P&L" sortKey="pnl" sort={sort} onSort={requestSort} /><SortableHeader label="Holding" sortKey="holding" sort={sort} onSort={requestSort} /><th>Exit</th></tr></thead>
+            <tbody>{sortedTrades.map((trade) => <tr key={trade.trade_id}><td>{new Date(trade.entry_timestamp).toLocaleString("en-IN")}</td><td><strong>{trade.symbol}</strong><small>{trade.sector ?? "Sector unavailable"}</small></td><td>{number(trade.opportunity_score)}</td><td>₹{number(trade.entry_price)}<small>to ₹{number(trade.exit_price)}</small></td><td className={tone(trade.net_return_percent)}>{signedPercent(trade.net_return_percent)}</td><td className={tone(trade.pnl_inr)}>₹{integer(trade.pnl_inr)}</td><td>{trade.holding_minutes}m</td><td>{trade.exit_reason.replaceAll("_", " ")}<small>{trade.exit_signal_state ? `${trade.exit_signal_state} · score ${number(trade.exit_opportunity_score)}` : "Mechanical/risk exit"}</small></td></tr>)}</tbody>
+          </table>
+          {!sortedTrades.length && <p className="feature-empty">No trades met these rules. This can also mean point-in-time evidence has not yet been recorded for the selected dates.</p>}
+        </div>
+        <div className="backtest-limitations">{result.limitations.map((item) => <span key={item}>{item}</span>)}</div>
+      </>}
+    </section>
+  );
+}
+
+type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "corporate" | "evidence" | "daily" | "financials" | "stocks" | "backtesting";
 
 const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "opportunities", label: "Opportunity Ranking" },
@@ -1595,6 +1818,7 @@ const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "daily", label: "Daily Regime" },
   { id: "financials", label: "Financials (Qtrly/Yearly)" },
   { id: "stocks", label: "Approved Stocks" },
+  { id: "backtesting", label: "Backtesting" },
 ];
 
 function Dashboard() {
@@ -1834,6 +2058,7 @@ function Dashboard() {
           {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} />}
           {activeAnalysisTab === "financials" && <FinancialsPanel rows={financialMetrics} />}
           {activeAnalysisTab === "stocks" && <ApprovedStocksPanel stocks={stocks} />}
+          {activeAnalysisTab === "backtesting" && <BacktestPanel databaseAvailable={runtime?.database_available === true} />}
         </div>
       </section>
 

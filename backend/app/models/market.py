@@ -209,6 +209,7 @@ class StockFeatureSnapshot(FrozenModel):
     candle_timestamp: datetime
     data_quality: str
     unavailable: list[str] = Field(default_factory=list)
+    session_price_trace: list[float] = Field(default_factory=list, max_length=390)
     vwap: VWAPFeatures
     gap: GapFeatures
     opening_ranges: list[OpeningRangeFeatures]
@@ -347,7 +348,7 @@ class RankedOpportunity(FrozenModel):
     day_high: float | None = Field(default=None, gt=0)
     day_low: float | None = Field(default=None, gt=0)
     day_close: float | None = Field(default=None, gt=0)
-    price_trace: list[float] = Field(default_factory=list, max_length=30)
+    price_trace: list[float] = Field(default_factory=list, max_length=390)
     score: OpportunityScoreSnapshot
 
 

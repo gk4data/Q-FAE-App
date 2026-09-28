@@ -29,7 +29,6 @@ class MarketStateStore(Protocol):
     def ping(self) -> bool: ...
     def save_candles(self, candles: Iterable[Candle]) -> int: ...
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]: ...
-    def get_candles_many(self, instrument_keys: Iterable[str], limit: int = 500) -> dict[str, list[Candle]]: ...
     def has_candles(self, instrument_key: str) -> bool: ...
     def save_daily_candles(self, candles: Iterable[Candle]) -> int: ...
     def get_daily_candles(self, instrument_key: str, limit: int = 300) -> list[Candle]: ...
@@ -123,23 +122,6 @@ class RedisMarketStateStore:
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]:
         values = self._redis.zrange(self._candle_key(instrument_key), -limit, -1)
         return [Candle.model_validate_json(value) for value in values]
-
-    def get_candles_many(
-        self,
-        instrument_keys: Iterable[str],
-        limit: int = 500,
-    ) -> dict[str, list[Candle]]:
-        keys = list(dict.fromkeys(instrument_keys))
-        if not keys:
-            return {}
-        with self._redis.pipeline(transaction=False) as pipeline:
-            for instrument_key in keys:
-                pipeline.zrange(self._candle_key(instrument_key), -limit, -1)
-            rows = pipeline.execute()
-        return {
-            instrument_key: [Candle.model_validate_json(value) for value in values]
-            for instrument_key, values in zip(keys, rows, strict=True)
-        }
 
     def has_candles(self, instrument_key: str) -> bool:
         return bool(self._redis.exists(self._candle_key(instrument_key)))
@@ -319,16 +301,6 @@ class InMemoryMarketStateStore:
         with self._lock:
             candles = sorted(self._candles.get(instrument_key, {}).values(), key=lambda item: item.timestamp)
         return candles[-limit:]
-
-    def get_candles_many(
-        self,
-        instrument_keys: Iterable[str],
-        limit: int = 500,
-    ) -> dict[str, list[Candle]]:
-        return {
-            instrument_key: self.get_candles(instrument_key, limit)
-            for instrument_key in dict.fromkeys(instrument_keys)
-        }
 
     def has_candles(self, instrument_key: str) -> bool:
         with self._lock:

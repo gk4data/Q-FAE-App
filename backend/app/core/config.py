@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     qfae_market_history_days: int = 14
     qfae_market_history_retention_days: int = 35
     qfae_minute_history_retention_days: int = 35
+    qfae_prune_persisted_minute_history: bool = False
     qfae_minute_profile_min_samples: int = 5
     qfae_daily_history_sessions: int = 300
     qfae_market_request_rate_per_second: int = 8

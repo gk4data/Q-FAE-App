@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Query, WebSocket, WebSocketDisconn
 from app.core.config import get_settings
 from app.db.engine import get_engine
 from app.db.repository import HistoricalMarketRepository
+from app.models.backtest import BacktestRun, BacktestRunListItem, BacktestRunRequest
 from app.models.market import (
     AdjustedCandle,
     Candle,
@@ -219,6 +220,27 @@ def get_evidence_outcomes(
         return get_market_runtime().get_evidence_outcomes(session_date, instrument_key)
     except MarketRuntimeError as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+
+
+@router.post("/backtests", response_model=BacktestRun)
+def run_opportunity_backtest(config: BacktestRunRequest) -> BacktestRun:
+    """Run and persist a point-in-time simulation of recorded recommendations."""
+    return _runtime_action(lambda: get_market_runtime().run_backtest(config))
+
+
+@router.get("/backtests", response_model=list[BacktestRunListItem])
+def list_opportunity_backtests(
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+) -> list[BacktestRunListItem]:
+    return _runtime_action(lambda: get_market_runtime().list_backtest_runs(limit))
+
+
+@router.get("/backtests/{run_id}", response_model=BacktestRun)
+def get_opportunity_backtest(run_id: str) -> BacktestRun:
+    result = _runtime_action(lambda: get_market_runtime().get_backtest_run(run_id))
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Backtest run not found")
+    return result
 
 
 @router.get("/corporate-actions", response_model=list[CorporateAction])

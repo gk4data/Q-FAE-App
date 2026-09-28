@@ -427,6 +427,19 @@ class UpstoxMarketDataClient:
         candles = parse_candle_rows(instrument_key, rows, interval="day")
         return candles[-1] if candles else None
 
+    def fetch_intraday_minute_history(self, instrument_key: str) -> list[Candle]:
+        """Fetch all one-minute candles currently available for today's session."""
+        encoded_key = quote(instrument_key, safe="")
+        payload = self._get(
+            f"/v3/historical-candle/intraday/{encoded_key}/minutes/1"
+        )
+        rows = payload.get("data", {}).get("candles")
+        if not isinstance(rows, list):
+            raise UpstoxMarketDataError(
+                "Upstox intraday minute response did not contain candles"
+            )
+        return parse_candle_rows(instrument_key, rows)
+
     def fetch_sector(self, isin: str) -> str | None:
         payload = self._get(f"/v2/fundamentals/{quote(isin, safe='')}/profile")
         data = payload.get("data")

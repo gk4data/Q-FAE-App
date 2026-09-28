@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, Index, Integer, JSON, Numeric, SmallInteger, String, Text, func
+from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, SmallInteger, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -144,6 +144,52 @@ class EvidenceObservationRecord(Base):
     __table_args__ = (
         Index("ix_evidence_observations_time", "candle_timestamp"),
         Index("ix_evidence_observations_signal", "signal_state", "outcome_status"),
+    )
+
+
+class BacktestRunRecord(Base):
+    """Saved assumptions and aggregate output for a reproducible research run."""
+
+    __tablename__ = "backtest_runs"
+
+    run_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    status: Mapped[str] = mapped_column(String(24), nullable=False)
+    from_date: Mapped[date] = mapped_column(Date, nullable=False)
+    to_date: Mapped[date] = mapped_column(Date, nullable=False)
+    config_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    summary_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+    breakdowns_payload: Mapped[list[dict[str, object]]] = mapped_column(JSON, nullable=False)
+    model_versions: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    limitations: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    __table_args__ = (Index("ix_backtest_runs_created", "created_at"),)
+
+
+class BacktestTradeRecord(Base):
+    """One simulated trade retained for audit and parameter comparison."""
+
+    __tablename__ = "backtest_trades"
+
+    run_id: Mapped[str] = mapped_column(
+        ForeignKey("backtest_runs.run_id", ondelete="CASCADE"), primary_key=True
+    )
+    trade_id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    instrument_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False)
+    signal_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    entry_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    exit_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    opportunity_score: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    net_return_percent: Mapped[Decimal] = mapped_column(Numeric(18, 6), nullable=False)
+    pnl_inr: Mapped[Decimal] = mapped_column(Numeric(20, 2), nullable=False)
+    exit_reason: Mapped[str] = mapped_column(String(48), nullable=False)
+    trade_payload: Mapped[dict[str, object]] = mapped_column(JSON, nullable=False)
+
+    __table_args__ = (
+        Index("ix_backtest_trades_run_entry", "run_id", "entry_timestamp"),
+        Index("ix_backtest_trades_symbol", "symbol", "signal_timestamp"),
     )
 
 

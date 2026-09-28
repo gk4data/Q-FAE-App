@@ -1,11 +1,16 @@
 from datetime import UTC, datetime, timedelta, timezone
 from types import SimpleNamespace
+import threading
 
 import pytest
 
 from app.models.market import Candle, LiveSnapshot, RelativeVolumeMetric
 from app.services.market_context import build_market_context, calculate_relative_volume
-from app.services.market_runtime import MarketRuntime, nse_market_close_at
+from app.services.market_runtime import (
+    MarketRuntime,
+    completed_regular_session_candles,
+    nse_market_close_at,
+)
 from app.services.market_state import InMemoryMarketStateStore
 from app.services.upstox_market import (
     INDIA_VIX_KEY,
@@ -76,6 +81,118 @@ def test_current_session_daily_candle_uses_intraday_v3_endpoint() -> None:
     assert result.interval == "day"
     assert result.close == 104
     assert result.volume == 250_000
+
+
+def test_current_session_minute_candles_use_intraday_v3_endpoint() -> None:
+    requested: list[str] = []
+    client = object.__new__(UpstoxMarketDataClient)
+    client._get = lambda path: (
+        requested.append(path)
+        or {
+            "data": {
+                "candles": [
+                    ["2026-09-15T09:16:00+05:30", 101, 103, 100, 102, 2_000, 0],
+                    ["2026-09-15T09:15:00+05:30", 100, 102, 99, 101, 1_000, 0],
+                ]
+            }
+        }
+    )
+
+    result = client.fetch_intraday_minute_history("NSE_EQ|TEST KEY")
+
+    assert requested == [
+        "/v3/historical-candle/intraday/NSE_EQ%7CTEST%20KEY/minutes/1"
+    ]
+    assert [item.timestamp.minute for item in result] == [15, 16]
+    assert all(item.interval == "1minute" for item in result)
+
+
+def test_session_backfill_keeps_regular_hours_and_completed_minutes_only() -> None:
+    key = "NSE_EQ|TEST"
+    session_date = datetime(2026, 9, 15, tzinfo=IST).date()
+    candles = [
+        candle(key, datetime(2026, 9, 14, 15, 29, tzinfo=IST), 100),
+        candle(key, datetime(2026, 9, 15, 9, 14, tzinfo=IST), 100),
+        candle(key, datetime(2026, 9, 15, 9, 15, tzinfo=IST), 100),
+        candle(key, datetime(2026, 9, 15, 10, 59, tzinfo=IST), 100),
+        candle(key, datetime(2026, 9, 15, 11, 0, tzinfo=IST), 100),
+    ]
+
+    result = completed_regular_session_candles(
+        candles,
+        session_date,
+        datetime(2026, 9, 15, 11, 0, 42, tzinfo=IST),
+    )
+
+    assert [item.timestamp.strftime("%H:%M") for item in result] == ["09:15", "10:59"]
+
+
+def test_session_backfill_merges_into_cache_and_database(monkeypatch) -> None:
+    key = "NSE_EQ|TEST"
+    session_date = datetime(2026, 9, 15, tzinfo=IST).date()
+    downloaded = [
+        candle(key, datetime(2026, 9, 15, 9, 15, tzinfo=IST), 100),
+        candle(key, datetime(2026, 9, 15, 9, 16, tzinfo=IST), 200),
+    ]
+
+    class Client:
+        def __init__(self, *_args):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        @staticmethod
+        def fetch_intraday_minute_history(instrument_key: str) -> list[Candle]:
+            assert instrument_key == key
+            return downloaded
+
+    class Repository:
+        def __init__(self):
+            self.saved: list[Candle] = []
+
+        def upsert_candles(self, candles):
+            self.saved.extend(candles)
+            return len(self.saved)
+
+    repository = Repository()
+    store = InMemoryMarketStateStore()
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(
+            qfae_market_request_rate_per_second=8,
+            qfae_market_request_rate_per_minute=450,
+        ),
+        state_store=store,
+        universe_service=SimpleNamespace(),
+        historical_repository=repository,
+    )
+    cancel_event = threading.Event()
+    runtime._session_backfill_cancel = cancel_event
+    runtime._symbols = {key: "TEST"}
+    runtime._live.update(
+        {
+            "backfill_state": "running",
+            "backfill_total": 1,
+            "backfill_processed": 0,
+            "backfill_instruments_loaded": 0,
+            "backfill_candles_loaded": 0,
+            "backfill_errors": 0,
+            "backfill_recent_errors": [],
+        }
+    )
+    monkeypatch.setattr("app.services.market_runtime.UpstoxMarketDataClient", Client)
+    monkeypatch.setattr(runtime, "_require_access_token", lambda: "token")
+
+    runtime._run_session_backfill([key], session_date, cancel_event)
+
+    assert store.get_candles(key) == downloaded
+    assert repository.saved == downloaded
+    assert runtime._live["backfill_state"] == "completed"
+    assert runtime._live["backfill_processed"] == 1
+    assert runtime._live["backfill_candles_loaded"] == 2
 
 
 def test_full_feed_message_is_normalized() -> None:
@@ -243,24 +360,6 @@ def test_in_memory_store_replaces_an_updating_minute_candle() -> None:
     stored = store.get_candles("NSE_EQ|TEST")
     assert len(stored) == 1
     assert stored[0].volume == 250
-
-
-def test_in_memory_store_reads_recent_candles_for_many_instruments() -> None:
-    store = InMemoryMarketStateStore()
-    timestamp = datetime(2026, 9, 4, 9, 30, tzinfo=IST)
-    store.save_candles(
-        [
-            candle("NSE_EQ|AAA", timestamp, 100),
-            candle("NSE_EQ|AAA", timestamp + timedelta(minutes=1), 200),
-            candle("NSE_EQ|BBB", timestamp, 300),
-        ]
-    )
-
-    result = store.get_candles_many(["NSE_EQ|AAA", "NSE_EQ|BBB"], limit=1)
-
-    assert list(result) == ["NSE_EQ|AAA", "NSE_EQ|BBB"]
-    assert result["NSE_EQ|AAA"][0].volume == 200
-    assert result["NSE_EQ|BBB"][0].volume == 300
 
 
 def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached() -> None:
