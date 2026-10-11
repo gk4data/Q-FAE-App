@@ -24,7 +24,7 @@ Time horizons are independent evidence, not a hierarchy of vetoes. Weak 120/250-
 
 ## Pre-open and opening factors
 
-- Official open versus corporate-action-adjusted previous close
+- Official open versus the provider's previous close
 - Raw gap percentage and gap size normalised by daily ATR
 - Stock gap relative to NIFTY and its sector
 - Indicative equilibrium price, tradable quantity, and buy/sell imbalance when reliably available
@@ -108,7 +108,6 @@ Weights, thresholds, interactions, and long/short direction will be decided only
 ## Validation requirements
 
 - Use point-in-time data and prevent look-ahead or survivorship bias.
-- Adjust historical reference prices for corporate actions.
 - Use same-time-of-day baselines for intraday volume and liquidity.
 - Include brokerage, fees, taxes, spread, slippage, and realistic execution delay.
 - Test out of sample, across market regimes, sectors, liquidity groups, and long/short directions.

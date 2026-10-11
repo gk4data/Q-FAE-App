@@ -26,8 +26,9 @@ class Settings(BaseSettings):
     upstox_redirect_uri: str | None = None
     upstox_token_cache_path: Path = PROJECT_ROOT / ".qfae" / "upstox_access_token.json"
     qfae_frontend_url: str = "http://localhost:3000"
-    qfae_stock_list_path: Path = PROJECT_ROOT / "Stock List.xlsx"
     qfae_equity_universe_path: Path = PROJECT_ROOT / "data" / "instruments" / "upstox_nse_equity_universe.json"
+    qfae_min_market_cap_crore: float = Field(default=500.0, ge=0)
+    qfae_min_share_price_inr: float = Field(default=20.0, ge=0)
     qfae_redis_url: str = "redis://localhost:6379/0"
     qfae_database_url: str | None = None
     postgres_host: str = "localhost"
@@ -44,7 +45,7 @@ class Settings(BaseSettings):
     qfae_market_request_rate_per_second: int = 8
     qfae_market_request_rate_per_minute: int = 450
     qfae_market_snapshot_interval_seconds: int = 60
-    qfae_market_pilot_size: int = Field(default=100, ge=1, le=500)
+    qfae_market_pilot_size: int = Field(default=139, ge=1, le=500)
     qfae_reconciliation_delay_minutes: int = Field(default=10, ge=0, le=60)
     qfae_reconciliation_retry_minutes: int = Field(default=5, ge=1, le=30)
     qfae_reconciliation_max_attempts: int = Field(default=8, ge=1, le=24)
@@ -60,18 +61,18 @@ class Settings(BaseSettings):
     qfae_risk_max_gap_atr: float = 2.0
     qfae_risk_max_spread_range_bps: float = 10.0
     qfae_risk_capital_inr: float | None = None
-    qfae_corporate_documents_enabled: bool = True
-    qfae_corporate_action_lookback_days: int = 365
-    qfae_corporate_action_ai_enabled: bool = False
     qfae_financial_results_cache_days: int = 30
+    qfae_liquidity_lookback_sessions: int = Field(default=20, ge=10, le=60)
+    qfae_liquidity_min_traded_sessions: int = Field(default=18, ge=1, le=60)
+    qfae_liquidity_active_median_traded_value_inr: float = Field(
+        default=50_000_000.0, gt=0
+    )
+    qfae_liquidity_max_median_spread_bps: float = Field(default=25.0, gt=0)
     qfae_score_weight_price_trend: float = Field(default=30.0, ge=0)
     qfae_score_weight_participation: float = Field(default=20.0, ge=0)
     qfae_score_weight_market_sector: float = Field(default=20.0, ge=0)
     qfae_score_weight_liquidity_execution: float = Field(default=15.0, ge=0)
-    qfae_score_weight_fundamental: float = Field(default=10.0, ge=0)
-    qfae_score_weight_catalyst: float = Field(default=5.0, ge=0)
-    openai_api_key: str | None = None
-    qfae_ai_model: str | None = None
+    qfae_score_weight_fundamental: float = Field(default=15.0, ge=0)
 
     @property
     def cors_origins(self) -> list[str]:

@@ -65,7 +65,7 @@ def build_risk_assessment(
     buy_slippage = estimate_slippage_bps(snapshot, reference_order_value_inr, side="buy") if snapshot else None
     sell_slippage = estimate_slippage_bps(snapshot, reference_order_value_inr, side="sell") if snapshot else None
     worst_slippage = max(value for value in (buy_slippage, sell_slippage) if value is not None) if buy_slippage is not None or sell_slippage is not None else None
-    gates.append(RiskGateResult(key="d5_slippage", status="unavailable" if worst_slippage is None else "pass" if worst_slippage <= max_slippage_bps else "reject", value=worst_slippage, threshold=max_slippage_bps, reason="visible_depth_supports_reference_order" if worst_slippage is not None and worst_slippage <= max_slippage_bps else "depth_insufficient_or_slippage_too_high"))
+    gates.append(RiskGateResult(key="d5_slippage", status="pass" if worst_slippage is not None and worst_slippage <= max_slippage_bps else "reject", value=worst_slippage, threshold=max_slippage_bps, reason="visible_depth_supports_reference_order" if worst_slippage is not None and worst_slippage <= max_slippage_bps else "depth_insufficient_or_slippage_too_high"))
 
     spreads = [value for value in (recent_spreads_bps or []) if value >= 0][-3:]
     spread_range = max(spreads) - min(spreads) if len(spreads) >= 3 else None

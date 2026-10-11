@@ -6,6 +6,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from statistics import median
 
 from sqlalchemy import Select, delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
@@ -24,6 +25,7 @@ from app.db.models import (
     CorporateActionDocumentRecord,
     CorporateActionOutcomeRecord,
     CorporateFinancialContextRecord,
+    DailyExecutionQualityRecord,
     EvidenceObservationRecord,
     FinancialResultSnapshotRecord,
     FinancialMetricSnapshotRecord,
@@ -32,8 +34,7 @@ from app.db.models import (
     SessionReconciliationRecord,
 )
 from app.models.backtest import BacktestRun, BacktestRunListItem
-from app.models.market import AdjustedCandle, Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, MinuteOfDayProfile
-from app.services.corporate_action_pipeline import adjust_candles
+from app.models.market import Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, MinuteOfDayProfile
 from app.services.evidence_outcomes import evaluate_observation
 from app.services.market_context import INDIA_TIMEZONE
 from app.services.minute_profiles import build_minute_profiles, minute_of_session
@@ -312,6 +313,130 @@ class HistoricalMarketRepository:
         """Upsert immutable point-in-time inputs without erasing already known outcomes."""
         self.save_evidence_observations([observation])
 
+    def refresh_daily_execution_quality(
+        self,
+        instrument_keys: Sequence[str],
+        from_date: date,
+        through_date: date,
+    ) -> int:
+        """Aggregate recorded minute spread/depth evidence into durable session medians."""
+        keys = list(dict.fromkeys(instrument_keys))
+        if not keys or through_date < from_date:
+            return 0
+        start = datetime.combine(from_date, time.min, tzinfo=INDIA_TIMEZONE).astimezone(UTC)
+        end = datetime.combine(
+            through_date + timedelta(days=1), time.min, tzinfo=INDIA_TIMEZONE
+        ).astimezone(UTC)
+        query = select(
+            EvidenceObservationRecord.instrument_key,
+            EvidenceObservationRecord.candle_timestamp,
+            EvidenceObservationRecord.evidence_payload,
+            EvidenceObservationRecord.risk_payload,
+        ).where(
+            EvidenceObservationRecord.instrument_key.in_(keys),
+            EvidenceObservationRecord.candle_timestamp >= start,
+            EvidenceObservationRecord.candle_timestamp < end,
+        )
+        grouped: dict[tuple[str, date], dict[str, list[float] | int]] = defaultdict(
+            lambda: {"spread": [], "buy": [], "sell": [], "observations": 0}
+        )
+
+        def number(value: object) -> float | None:
+            try:
+                parsed = float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed is not None and parsed >= 0 else None
+
+        with Session(self.engine) as session:
+            records = list(session.execute(query))
+        for instrument_key, timestamp, evidence_payload, risk_payload in records:
+            session_date = timestamp.astimezone(INDIA_TIMEZONE).date()
+            bucket = grouped[(instrument_key, session_date)]
+            bucket["observations"] = int(bucket["observations"]) + 1
+            evidence = evidence_payload if isinstance(evidence_payload, dict) else {}
+            flow = evidence.get("flow_liquidity")
+            flow = flow if isinstance(flow, dict) else {}
+            risk = risk_payload if isinstance(risk_payload, dict) else {}
+            for key, value in (
+                ("spread", number(flow.get("spread_bps"))),
+                ("buy", number(risk.get("estimated_buy_slippage_bps"))),
+                ("sell", number(risk.get("estimated_sell_slippage_bps"))),
+            ):
+                if value is not None:
+                    values = bucket[key]
+                    assert isinstance(values, list)
+                    values.append(value)
+
+        now = datetime.now(UTC)
+        values = []
+        for (instrument_key, session_date), bucket in grouped.items():
+            spread = bucket["spread"]
+            buy = bucket["buy"]
+            sell = bucket["sell"]
+            assert isinstance(spread, list) and isinstance(buy, list) and isinstance(sell, list)
+            values.append(
+                {
+                    "instrument_key": instrument_key,
+                    "session_date": session_date,
+                    "median_spread_bps": Decimal(str(median(spread))) if spread else None,
+                    "median_buy_slippage_bps": Decimal(str(median(buy))) if buy else None,
+                    "median_sell_slippage_bps": Decimal(str(median(sell))) if sell else None,
+                    "observations": int(bucket["observations"]),
+                    "calculated_at": now,
+                }
+            )
+        if not values:
+            return 0
+        statement = insert(DailyExecutionQualityRecord).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["instrument_key", "session_date"],
+            set_={
+                "median_spread_bps": statement.excluded.median_spread_bps,
+                "median_buy_slippage_bps": statement.excluded.median_buy_slippage_bps,
+                "median_sell_slippage_bps": statement.excluded.median_sell_slippage_bps,
+                "observations": statement.excluded.observations,
+                "calculated_at": statement.excluded.calculated_at,
+                "updated_at": func.now(),
+            },
+        )
+        with self.engine.begin() as connection:
+            connection.execute(statement)
+        return len(values)
+
+    def get_daily_median_spreads(
+        self,
+        instrument_keys: Sequence[str],
+        *,
+        before_date: date,
+        limit_sessions: int = 20,
+    ) -> dict[str, list[float]]:
+        """Return up to N completed-session spread medians per instrument."""
+        keys = list(dict.fromkeys(instrument_keys))
+        if not keys:
+            return {}
+        query = (
+            select(DailyExecutionQualityRecord)
+            .where(
+                DailyExecutionQualityRecord.instrument_key.in_(keys),
+                DailyExecutionQualityRecord.session_date < before_date,
+                DailyExecutionQualityRecord.session_date >= before_date - timedelta(days=45),
+            )
+            .order_by(
+                DailyExecutionQualityRecord.instrument_key,
+                DailyExecutionQualityRecord.session_date.desc(),
+            )
+        )
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        grouped: dict[str, list[float]] = defaultdict(list)
+        for record in records:
+            values = grouped[record.instrument_key]
+            if len(values) >= limit_sessions or record.median_spread_bps is None:
+                continue
+            values.append(float(record.median_spread_bps))
+        return {key: list(reversed(values)) for key, values in grouped.items()}
+
     def save_evidence_observations(
         self,
         observations: Iterable[EvidenceOutcomeObservation],
@@ -549,9 +674,6 @@ class HistoricalMarketRepository:
         with Session(self.engine) as session:
             records = list(session.scalars(query))
         return [CorporateActionAdjustment(event_id=r.event_id, calculation_version=r.calculation_version, instrument_key=r.instrument_key, category=r.category, effective_date=r.effective_date, price_factor=float(r.price_factor) if r.price_factor is not None else None, volume_factor=float(r.volume_factor) if r.volume_factor is not None else None, status=r.status, reason=r.reason, reference_close=float(r.reference_close) if r.reference_close is not None else None, calculated_at=r.calculated_at) for r in records]
-
-    def get_adjusted_candles(self, instrument_key: str, *, interval: str = "day", limit: int = 300) -> list[AdjustedCandle]:
-        return adjust_candles(self.get_candles(instrument_key, interval, limit), self.get_corporate_action_adjustments(instrument_key))
 
     def upsert_corporate_action_documents(self, rows: Iterable[CorporateActionDocument]) -> int:
         values = list(rows)

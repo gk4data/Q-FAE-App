@@ -12,7 +12,6 @@ from redis import Redis
 
 from app.models.market import (
     Candle,
-    CorporateActionContext,
     DailyRegimeSnapshot,
     LiveSnapshot,
     MarketContext,
@@ -56,8 +55,6 @@ class MarketStateStore(Protocol):
     def get_signals(self) -> dict[str, SignalPersistenceSnapshot]: ...
     def save_risk_assessment(self, risk: RiskAssessment) -> None: ...
     def get_risk_assessments(self) -> dict[str, RiskAssessment]: ...
-    def save_corporate_action_context(self, context: CorporateActionContext) -> None: ...
-    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]: ...
 
 
 class RedisMarketStateStore:
@@ -73,7 +70,6 @@ class RedisMarketStateStore:
     _MARKET_REGIME_KEY = "qfae:market:regime"
     _SIGNALS_KEY = "qfae:market:signals"
     _RISK_KEY = "qfae:market:risk"
-    _CORPORATE_ACTION_CONTEXT_KEY = "qfae:market:corporate-action-context"
 
     def __init__(self, redis_url: str, retention_days: int = 35) -> None:
         self._redis = Redis.from_url(
@@ -253,20 +249,6 @@ class RedisMarketStateStore:
     def get_risk_assessments(self) -> dict[str, RiskAssessment]:
         return {key: RiskAssessment.model_validate_json(value) for key, value in self._redis.hgetall(self._RISK_KEY).items()}
 
-    def save_corporate_action_context(self, context: CorporateActionContext) -> None:
-        self._redis.hset(
-            self._CORPORATE_ACTION_CONTEXT_KEY,
-            context.instrument_key,
-            context.model_dump_json(),
-        )
-
-    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]:
-        return {
-            key: CorporateActionContext.model_validate_json(value)
-            for key, value in self._redis.hgetall(self._CORPORATE_ACTION_CONTEXT_KEY).items()
-        }
-
-
 class InMemoryMarketStateStore:
     """Deterministic store used by unit tests and local calculations."""
 
@@ -284,7 +266,6 @@ class InMemoryMarketStateStore:
         self._evidence: dict[str, list[OpportunityEvidenceSnapshot]] = {}
         self._signals: dict[str, SignalPersistenceSnapshot] = {}
         self._risk: dict[str, RiskAssessment] = {}
-        self._corporate_action_contexts: dict[str, CorporateActionContext] = {}
         self._lock = threading.RLock()
 
     def ping(self) -> bool:
@@ -421,11 +402,3 @@ class InMemoryMarketStateStore:
     def get_risk_assessments(self) -> dict[str, RiskAssessment]:
         with self._lock:
             return dict(self._risk)
-
-    def save_corporate_action_context(self, context: CorporateActionContext) -> None:
-        with self._lock:
-            self._corporate_action_contexts[context.instrument_key] = context
-
-    def get_corporate_action_contexts(self) -> dict[str, CorporateActionContext]:
-        with self._lock:
-            return dict(self._corporate_action_contexts)

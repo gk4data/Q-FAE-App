@@ -105,6 +105,7 @@ class WatchlistItem(FrozenModel):
     instrument_key: str
     symbol: str
     company_name: str
+    display_name: str
     sector: str | None = None
     ltp: float | None = None
     previous_close: float | None = None
@@ -116,6 +117,14 @@ class WatchlistItem(FrozenModel):
     volume: int | None = Field(default=None, ge=0)
     relative_volume: float | None = Field(default=None, ge=0)
     spread_bps: float | None = Field(default=None, ge=0)
+    liquidity_tier: str = "watch_only"
+    liquidity_sessions_expected: int = Field(default=0, ge=0)
+    liquidity_sessions_traded: int = Field(default=0, ge=0)
+    median_daily_traded_value_inr: float | None = Field(default=None, ge=0)
+    latest_daily_traded_value_inr: float | None = Field(default=None, ge=0)
+    spread_sessions_available: int = Field(default=0, ge=0)
+    median_spread_bps_20d: float | None = Field(default=None, ge=0)
+    liquidity_tier_reason: str = "daily_liquidity_history_unavailable"
     updated_at: datetime | None = None
     data_state: str = "waiting"
 
@@ -390,7 +399,6 @@ class OpportunityEvidenceSnapshot(FrozenModel):
         default_factory=lambda: DerivativesConfirmation()
     )
     market_regime: MarketRegimeSnapshot | None = None
-    corporate_action_context: CorporateActionContext | None = None
     opportunity_score: OpportunityScoreSnapshot | None = None
     validation_notes: list[str] = Field(default_factory=list)
 
@@ -545,25 +553,6 @@ class CorporateActionAdjustment(FrozenModel):
     reason: str
     reference_close: float | None = Field(default=None, gt=0)
     calculated_at: datetime
-
-
-class AdjustedCandle(FrozenModel):
-    instrument_key: str
-    timestamp: datetime
-    interval: str
-    raw_open: float
-    raw_high: float
-    raw_low: float
-    raw_close: float
-    raw_volume: int = Field(ge=0)
-    adjusted_open: float
-    adjusted_high: float
-    adjusted_low: float
-    adjusted_close: float
-    adjusted_volume: int = Field(ge=0)
-    cumulative_price_factor: float = Field(gt=0)
-    cumulative_volume_factor: float = Field(gt=0)
-    adjustment_status: str
 
 
 class CorporateActionDocument(FrozenModel):
@@ -802,6 +791,8 @@ class SectorState(FrozenModel):
 class RelativeVolumeLeader(FrozenModel):
     instrument_key: str
     symbol: str
+    company_name: str | None = None
+    display_name: str | None = None
     relative_volume: float
     candle_timestamp: datetime
 

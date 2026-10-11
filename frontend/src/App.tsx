@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import * as echarts from "echarts/core";
 import { ScatterChart } from "echarts/charts";
@@ -15,8 +15,9 @@ type RuntimeStatus = {
   pilot_size: number;
   redis_available: boolean;
   database_available: boolean;
-  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; corporate_actions_synced: number; corporate_actions_stored: number; corporate_actions_assessed: number; corporate_adjustments_built: number; corporate_documents_stored: number; corporate_financial_contexts: number; financial_results_reused: number; corporate_ai_analyzed: number; corporate_outcomes_evaluated: number; errors: number };
-  live: { state: string; connected: boolean; subscribed: number; last_message_at: string | null; scheduled_stop_at: string | null; error: string | null };
+  liquidity_universe: { active: number; watch_only: number; dormant: number };
+  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; financial_results_fetched: number; financial_results_reused: number; errors: number; auto_start_live: boolean; live_start_error: string | null };
+  live: { state: string; connected: boolean; subscribed: number; liquidity_active: number; liquidity_watch_only: number; liquidity_dormant: number; last_message_at: string | null; scheduled_stop_at: string | null; error: string | null };
   reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
 
@@ -104,6 +105,7 @@ type WatchlistItem = {
   instrument_key: string;
   symbol: string;
   company_name: string;
+  display_name: string;
   sector: string | null;
   ltp: number | null;
   change_percent: number | null;
@@ -114,6 +116,14 @@ type WatchlistItem = {
   volume: number | null;
   relative_volume: number | null;
   spread_bps: number | null;
+  liquidity_tier: "active" | "watch_only" | "dormant";
+  liquidity_sessions_expected: number;
+  liquidity_sessions_traded: number;
+  median_daily_traded_value_inr: number | null;
+  latest_daily_traded_value_inr: number | null;
+  spread_sessions_available: number;
+  median_spread_bps_20d: number | null;
+  liquidity_tier_reason: string;
   updated_at: string | null;
   data_state: "live" | "cached" | "history" | "waiting";
 };
@@ -149,6 +159,8 @@ type MarketContext = {
   relative_volume_leaders: Array<{
     instrument_key: string;
     symbol: string;
+    company_name: string | null;
+    display_name: string | null;
     relative_volume: number;
     candle_timestamp: string;
   }>;
@@ -322,16 +334,6 @@ type OpportunityEvidence = {
     distance_to_lower_circuit_percent: number | null;
     gates: Array<{ key: string; status: string; reason: string }>;
   };
-  corporate_action_context: null | {
-    state: "positive" | "negative" | "neutral" | "unavailable";
-    active_events: number;
-    maximum_materiality: number | null;
-    deterministic_sentiment: number | null;
-    ai_impact_score: number | null;
-    effective_score: number | null;
-    evidence: string[];
-    cautions: string[];
-  };
   validation_notes: string[];
 };
 
@@ -377,39 +379,6 @@ type RankedOpportunity = {
     top_cautions: string[];
     invalidation_reasons: string[];
   };
-};
-
-type CorporateActionAssessment = {
-  event_id: string;
-  assessment_version: number;
-  instrument_key: string;
-  symbol: string;
-  category: string;
-  direction: "positive" | "negative" | "neutral" | "contextual";
-  materiality_score: number;
-  sentiment_score: number;
-  confidence: number;
-  impact_horizon: string;
-  reference_price: number | null;
-  reference_price_date: string | null;
-  derived_metrics: Record<string, number | string | null>;
-  evidence: string[];
-  cautions: string[];
-  requires_ai_review: boolean;
-};
-
-type CorporateActionAIAnalysis = {
-  event_id: string;
-  analysis_version: number;
-  status: "complete" | "unavailable";
-  impact_score: number | null;
-  impact_probability: number | null;
-  confidence: number | null;
-  impact_horizon: string | null;
-  rationale: string | null;
-  citation_document_ids: string[];
-  grounded: boolean;
-  error: string | null;
 };
 
 type FinancialResultCheckReport = {
@@ -497,6 +466,42 @@ const tradedValue = (value: number | null) => {
   if (value >= 100_000) return `Rs ${number(value / 100_000)} lakh`;
   return `Rs ${integer(value)}`;
 };
+
+type StockNameLookup = {
+  byInstrumentKey: Record<string, string>;
+  bySymbol: Record<string, string>;
+  legalByInstrumentKey: Record<string, string>;
+  legalBySymbol: Record<string, string>;
+};
+
+const companyNameFor = (
+  names: StockNameLookup,
+  instrumentKey: string | null | undefined,
+  symbol: string,
+) => (instrumentKey ? names.byInstrumentKey[instrumentKey] : undefined)
+  ?? names.bySymbol[symbol]
+  ?? symbol;
+
+function CompanyName({
+  names,
+  instrumentKey,
+  symbol,
+  displayName,
+  legalName,
+}: {
+  names: StockNameLookup;
+  instrumentKey?: string | null;
+  symbol: string;
+  displayName?: string | null;
+  legalName?: string | null;
+}) {
+  const resolvedDisplayName = displayName ?? companyNameFor(names, instrumentKey, symbol);
+  const resolvedLegalName = legalName
+    ?? (instrumentKey ? names.legalByInstrumentKey[instrumentKey] : undefined)
+    ?? names.legalBySymbol[symbol]
+    ?? resolvedDisplayName;
+  return <strong className="company-name" title={`${resolvedLegalName} · NSE symbol: ${symbol}`}>{resolvedDisplayName}</strong>;
+}
 
 type SortDirection = "asc" | "desc";
 type SortValue = number | string | boolean | null | undefined;
@@ -642,12 +647,12 @@ function IndexCard({ name, state }: { name: string; state: BenchmarkState }) {
   );
 }
 
-function MarketContextPanel({ context, regime }: { context: MarketContext | null; regime: MarketRegime | null }) {
+function MarketContextPanel({ context, regime, stockNames }: { context: MarketContext | null; regime: MarketRegime | null; stockNames: StockNameLookup }) {
   if (!context) {
     return (
       <section className="context-card context-placeholder">
         <div><p className="eyebrow">MARKET CONTEXT</p><h2>Waiting for the first complete market minute</h2></div>
-        <p>Start the live feed to calculate indices, breadth, sector strength, liquidity and RVOL leadership.</p>
+        <p>Prepare stocks and start live to calculate indices, breadth, sector strength, liquidity and RVOL leadership.</p>
       </section>
     );
   }
@@ -699,7 +704,7 @@ function MarketContextPanel({ context, regime }: { context: MarketContext | null
             <div className="leader-list">
               {context.relative_volume_leaders.slice(0, 6).map((leader, index) => (
                 <div className="leader-row" key={leader.instrument_key}>
-                  <b>{index + 1}</b><strong>{leader.symbol}</strong><span>{number(leader.relative_volume)}x</span>
+                  <b>{index + 1}</b><CompanyName names={stockNames} instrumentKey={leader.instrument_key} symbol={leader.symbol} displayName={leader.display_name} legalName={leader.company_name} /><span>{number(leader.relative_volume)}x</span>
                 </div>
               ))}
             </div>
@@ -714,9 +719,9 @@ function MetricLine({ label, value, valueClass = "" }: { label: string; value: s
   return <span className="metric-line"><small>{label}</small><b className={valueClass}>{value}</b></span>;
 }
 
-function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
+function DailyRegimePanel({ regimes, stockNames }: { regimes: DailyRegime[]; stockNames: StockNameLookup }) {
   const { sortedRows, sort, requestSort } = useSortableRows(regimes, {
-    symbol: (row) => row.symbol,
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     horizons: (row) => row.horizon_performance.find((item) => item.sessions === 20)?.stock_return_percent,
     trend: (row) => row.trend.above_sma_20_percent,
     structure: (row) => row.structure.distance_to_20d_high_percent,
@@ -745,7 +750,7 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
             {sortedRows.map((regime) => (
               <tr key={regime.instrument_key}>
                 <td>
-                  <strong>{regime.symbol}</strong>
+                  <CompanyName names={stockNames} instrumentKey={regime.instrument_key} symbol={regime.symbol} />
                   <small>{regime.sessions_available} daily sessions</small>
                   <span className={`quality-badge ${regime.data_quality}`}>{regime.data_quality}</span>
                   <small className="factor-state">{regime.trend.regime.replaceAll("_", " ")}</small>
@@ -806,11 +811,11 @@ function DailyRegimePanel({ regimes }: { regimes: DailyRegime[] }) {
   );
 }
 
-function FeatureMatrix({ features }: { features: StockFeatures[] }) {
+function FeatureMatrix({ features, stockNames }: { features: StockFeatures[]; stockNames: StockNameLookup }) {
   const openingRange = (feature: StockFeatures, minutes: number) =>
     feature.opening_ranges.find((range) => range.minutes === minutes);
   const { sortedRows, sort, requestSort } = useSortableRows(features, {
-    symbol: (row) => row.symbol,
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     vwap: (row) => row.vwap.position_percent,
     gap: (row) => row.gap.gap_percent,
     opening_ranges: (row) => openingRange(row, 30)?.breakout_percent,
@@ -850,7 +855,7 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
               return (
                 <tr key={feature.instrument_key}>
                   <td>
-                    <strong>{feature.symbol}</strong>
+                    <CompanyName names={stockNames} instrumentKey={feature.instrument_key} symbol={feature.symbol} />
                     <small>{feature.sector ?? "Sector unavailable"}</small>
                     <span className={`quality-badge ${feature.data_quality}`}>{feature.data_quality}</span>
                   </td>
@@ -913,7 +918,7 @@ function FeatureMatrix({ features }: { features: StockFeatures[] }) {
               );
             })}
             {!features.length && (
-              <tr><td className="feature-empty" colSpan={10}>Waiting for a completed current-session candle. Prepare history, then start the live feed during market hours.</td></tr>
+              <tr><td className="feature-empty" colSpan={10}>Waiting for a completed current-session candle. Use Prepare stocks &amp; start live during market hours.</td></tr>
             )}
           </tbody>
         </table>
@@ -950,7 +955,7 @@ const escapeTooltip = (value: string) => value.replace(/[&<>"']/g, (character) =
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
 }[character] ?? character));
 
-function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void }) {
+function AlphaMatrix({ rows, onSelectStock, stockNames }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void; stockNames: StockNameLookup }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<echarts.EChartsType | null>(null);
 
@@ -981,7 +986,7 @@ function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSel
       const liquidityScore = componentByKey.liquidity_execution?.score ?? null;
       return {
         value: [row.score.final_score, Math.max(0, Math.min(100, confidenceProxy)), liquidityScore ?? 0],
-        name: row.symbol,
+        name: companyNameFor(stockNames, row.instrument_key, row.symbol),
         instrumentKey: row.instrument_key,
         sector: row.sector ?? "Sector unavailable",
         finalScore: row.score.final_score,
@@ -1068,7 +1073,7 @@ function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSel
         },
       }],
     }, { notMerge: true });
-  }, [rows]);
+  }, [rows, stockNames]);
 
   return (
     <div className="alpha-matrix-shell">
@@ -1085,15 +1090,15 @@ function AlphaMatrix({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSel
   );
 }
 
-function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void }) {
-  const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental", "catalyst"];
+function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void; stockNames: StockNameLookup }) {
+  const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental"];
   const componentScore = (row: RankedOpportunity, key: string) => row.score.components.find((item) => item.key === key)?.score;
   const traceReturn = (row: RankedOpportunity) => row.price_trace.length > 1 && row.price_trace[0] > 0
     ? ((row.price_trace.at(-1)! - row.price_trace[0]) / row.price_trace[0]) * 100
     : null;
   const { sortedRows, sort, requestSort } = useSortableRows(rows, {
     rank: (row) => row.rank,
-    symbol: (row) => row.symbol,
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     setup: traceReturn,
     cmp: (row) => row.session_return_percent,
     score: (row) => row.score.final_score,
@@ -1102,7 +1107,6 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
     market_sector: (row) => componentScore(row, "market_sector"),
     liquidity_execution: (row) => componentScore(row, "liquidity_execution"),
     fundamental: (row) => componentScore(row, "fundamental"),
-    catalyst: (row) => componentScore(row, "catalyst"),
     positives: (row) => row.score.top_positive_factors.length,
     risks: (row) => row.score.invalidation_reasons.length + row.score.top_cautions.length,
   }, "score");
@@ -1110,9 +1114,9 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
     <section className="table-card opportunity-card">
       <div className="table-heading">
         <div><h2>Explainable opportunity ranking</h2><p>Coverage-adjusted long-continuation candidates, recalculated every completed minute</p></div>
-        <span>Pilot v1 · provisional weights · not yet backtested</span>
+        <span>Pilot v2 · provisional weights · not yet backtested</span>
       </div>
-      <AlphaMatrix rows={rows} onSelectStock={onSelectStock} />
+      <AlphaMatrix rows={rows} onSelectStock={onSelectStock} stockNames={stockNames} />
       <div className="table-scroll">
         <table className="opportunity-table">
           <thead><tr>
@@ -1133,7 +1137,7 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
                   <td className="rank-cell">{row.rank ?? "—"}</td>
                   <td>
                     <button className="stock-detail-link" type="button" onClick={() => onSelectStock(row.instrument_key)}>
-                      <strong>{row.symbol}</strong><small>View details →</small>
+                      <CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} /><small>View details →</small>
                     </button>
                     <small>{row.sector ?? "Sector unavailable"}</small>
                     <span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span>
@@ -1167,7 +1171,7 @@ function OpportunityRankingBoard({ rows, onSelectStock }: { rows: RankedOpportun
   );
 }
 
-function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
+function EvidenceBoard({ rows, stockNames }: { rows: OpportunityEvidence[]; stockNames: StockNameLookup }) {
   const confluenceOrder: Record<OpportunityEvidence["confluence"], number> = {
     strong_support: 5, supportive: 4, mixed: 3, caution: 2, insufficient: 1,
   };
@@ -1176,7 +1180,7 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
     return pillar ? pillar.supportive_checks - pillar.caution_checks : null;
   };
   const { sortedRows, sort, requestSort } = useSortableRows(rows, {
-    symbol: (row) => row.symbol,
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     confluence: (row) => confluenceOrder[row.confluence],
     persistence: (row) => row.signal_persistence?.supportive_minutes,
     risk: (row) => row.risk_assessment?.eligible,
@@ -1184,7 +1188,6 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
     daily: (row) => pillarStrength(row, "daily"),
     relative_strength: (row) => pillarStrength(row, "relative_strength"),
     confirmation: (row) => row.flow_liquidity.relative_volume,
-    corporate: (row) => row.corporate_action_context?.effective_score,
     validation: (row) => row.validation_notes.length,
   }, "confluence");
   return (
@@ -1204,7 +1207,6 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
             <SortableHeader label="Daily regime" sortKey="daily" sort={sort} onSort={requestSort} />
             <SortableHeader label="NIFTY / sector" sortKey="relative_strength" sort={sort} onSort={requestSort} />
             <SortableHeader label="Volume / liquidity" sortKey="confirmation" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Corporate event" sortKey="corporate" sort={sort} onSort={requestSort} />
             <SortableHeader label="Validation" sortKey="validation" sort={sort} onSort={requestSort} defaultDirection="asc" />
           </tr></thead>
           <tbody>
@@ -1212,7 +1214,7 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
               const pillars = Object.fromEntries(row.pillars.map((pillar) => [pillar.key, pillar]));
               return (
                 <tr key={row.instrument_key}>
-                  <td><strong>{row.symbol}</strong><small>{row.sector ?? "Sector unavailable"}</small><span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span></td>
+                  <td><CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} /><small>{row.sector ?? "Sector unavailable"}</small><span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span></td>
                   <td><span className={`confluence-badge ${row.confluence}`}>{row.confluence.replaceAll("_", " ")}</span></td>
                   <td>{row.signal_persistence ? <><span className={`signal-badge ${row.signal_persistence.state}`}>{row.signal_persistence.state}</span><small>{row.signal_persistence.supportive_minutes}/{row.signal_persistence.observed_minutes} supportive minutes</small>{row.signal_persistence.transition && <span className="evidence-tag">{row.signal_persistence.transition.replaceAll("_", " ")}</span>}</> : "N/A"}</td>
                   <td>{row.risk_assessment ? <><span className={`filter-badge ${row.risk_assessment.status === "rejected" ? "reject" : row.risk_assessment.status}`}>{row.risk_assessment.status}</span><MetricLine label="Buy slip" value={row.risk_assessment.estimated_buy_slippage_bps == null ? "N/A" : `${number(row.risk_assessment.estimated_buy_slippage_bps)} bps`} /><MetricLine label="Upper circuit" value={percent(row.risk_assessment.distance_to_upper_circuit_percent)} />{row.risk_assessment.gates.filter((gate) => gate.status !== "pass").slice(0, 2).map((gate) => <span className="caution-tag" key={gate.key}>{gate.key.replaceAll("_", " ")}: {gate.status}</span>)}</> : "N/A"}</td>
@@ -1234,12 +1236,11 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
                     }
                     return <td key={key}>{pillar ? <><span className={`pillar-state ${pillar.state}`}>{pillar.state}</span><small>{pillar.supportive_checks} supportive · {pillar.caution_checks} cautions</small>{pillar.evidence.slice(0, 2).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{pillar.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</> : "N/A"}</td>;
                   })}
-                  <td>{row.corporate_action_context ? <><span className={`pillar-state ${row.corporate_action_context.state === "positive" ? "supportive" : row.corporate_action_context.state === "negative" ? "caution" : "mixed"}`}>{row.corporate_action_context.state}</span><MetricLine label="Active events" value={String(row.corporate_action_context.active_events)} /><MetricLine label="Effective score" value={row.corporate_action_context.effective_score == null ? "N/A" : number(row.corporate_action_context.effective_score, 0)} />{row.corporate_action_context.cautions.map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</> : "N/A"}</td>
                   <td>{row.validation_notes.length ? row.validation_notes.map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>) : <span className="evidence-tag">inputs current</span>}</td>
                 </tr>
               );
             })}
-            {!rows.length && <tr><td className="feature-empty" colSpan={10}>Waiting for current-session feature evidence.</td></tr>}
+            {!rows.length && <tr><td className="feature-empty" colSpan={9}>Waiting for current-session feature evidence.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1247,62 +1248,10 @@ function EvidenceBoard({ rows }: { rows: OpportunityEvidence[] }) {
   );
 }
 
-function CorporateActionPanel({ rows, analyses }: { rows: CorporateActionAssessment[]; analyses: CorporateActionAIAnalysis[] }) {
-  const aiByEvent = Object.fromEntries(analyses.map((item) => [item.event_id, item]));
-  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
-    symbol: (row) => row.symbol,
-    action: (row) => row.category,
-    direction: (row) => row.sentiment_score,
-    materiality: (row) => row.materiality_score,
-    sentiment: (row) => row.sentiment_score,
-    metrics: (row) => Object.keys(row.derived_metrics).length,
-    confidence: (row) => row.confidence,
-    ai: (row) => aiByEvent[row.event_id]?.impact_score,
-    review: (row) => row.cautions.length,
-  }, "materiality");
-  return (
-    <section className="table-card corporate-action-card">
-      <div className="table-heading">
-        <div><h2>Corporate-action materiality</h2><p>Deterministic event metrics based on facts and the pre-event close</p></div>
-        <span>Versioned rules · AI is optional and source-grounded</span>
-      </div>
-      <div className="table-scroll">
-        <table className="corporate-action-table">
-          <thead><tr>
-            <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
-            <SortableHeader label="Action" sortKey="action" sort={sort} onSort={requestSort} defaultDirection="asc" />
-            <SortableHeader label="Direction" sortKey="direction" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Materiality" sortKey="materiality" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Sentiment" sortKey="sentiment" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Derived metrics" sortKey="metrics" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Confidence" sortKey="confidence" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Grounded AI" sortKey="ai" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Review notes" sortKey="review" sort={sort} onSort={requestSort} defaultDirection="asc" />
-          </tr></thead>
-          <tbody>{sortedRows.map((row) => {
-            const ai = aiByEvent[row.event_id];
-            return <tr key={`${row.event_id}-${row.assessment_version}`}>
-              <td><strong>{row.symbol}</strong><small>{row.reference_price_date ? `Reference ${row.reference_price_date}` : "Reference price unavailable"}</small></td>
-              <td><span className="factor-state">{row.category}</span><small>{row.impact_horizon.replaceAll("_", " ")}</small></td>
-              <td><span className={`direction-badge ${row.direction}`}>{row.direction}</span></td>
-              <td className="numeric"><strong>{number(row.materiality_score, 0)}/100</strong></td>
-              <td className={`numeric ${tone(row.sentiment_score)}`}>{row.sentiment_score > 0 ? "+" : ""}{number(row.sentiment_score, 0)}</td>
-              <td>{Object.entries(row.derived_metrics).slice(0, 4).map(([key, value]) => <MetricLine key={key} label={key.replaceAll("_", " ")} value={typeof value === "number" ? number(value) : value ?? "N/A"} />)}</td>
-              <td><strong>{number(row.confidence * 100, 0)}%</strong><small>Rules v{row.assessment_version}</small></td>
-              <td>{ai?.grounded ? <><strong className={tone(ai.impact_score)}>{ai.impact_score != null && ai.impact_score > 0 ? "+" : ""}{number(ai.impact_score, 0)}</strong><small>{number((ai.confidence ?? 0) * 100, 0)}% confidence · {ai.citation_document_ids.length} citation(s)</small>{ai.rationale && <span className="evidence-tag">{ai.rationale}</span>}</> : <><span className="factor-state">Not active</span><small>{ai?.error?.replaceAll("_", " ") ?? "No eligible grounded analysis"}</small></>}</td>
-              <td>{row.cautions.slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.requires_ai_review && <span className="evidence-tag">rules sufficient</span>}</td>
-            </tr>;
-          })}</tbody>
-          {!rows.length && <tbody><tr><td className="feature-empty" colSpan={9}>No corporate-action materiality records are available for the pilot stocks.</td></tr></tbody>}
-        </table>
-      </div>
-    </section>
-  );
-}
-
 function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
+  const liquidityOrder = { active: 3, watch_only: 2, dormant: 1 };
   const { sortedRows, sort, requestSort } = useSortableRows(stocks, {
-    symbol: (row) => row.symbol,
+    symbol: (row) => row.display_name ?? row.company_name,
     sector: (row) => row.sector,
     ltp: (row) => row.ltp,
     change: (row) => row.change_percent,
@@ -1310,6 +1259,7 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
     volume: (row) => row.volume,
     rvol: (row) => row.relative_volume,
     spread: (row) => row.spread_bps,
+    liquidity: (row) => liquidityOrder[row.liquidity_tier],
     state: (row) => row.data_state,
   }, "change");
   return (
@@ -1329,12 +1279,13 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
             <SortableHeader label="Volume" sortKey="volume" sort={sort} onSort={requestSort} />
             <SortableHeader label="RVOL" sortKey="rvol" sort={sort} onSort={requestSort} />
             <SortableHeader label="Spread" sortKey="spread" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Tracking" sortKey="liquidity" sort={sort} onSort={requestSort} />
             <SortableHeader label="State" sortKey="state" sort={sort} onSort={requestSort} defaultDirection="asc" />
           </tr></thead>
           <tbody>
             {sortedRows.map((stock) => (
               <tr key={stock.instrument_key}>
-                <td><strong>{stock.symbol}</strong><small>{stock.company_name}</small></td>
+                <td><strong className="company-name" title={`${stock.company_name} · NSE symbol: ${stock.symbol}`}>{stock.display_name ?? stock.company_name}</strong></td>
                 <td>{stock.sector ?? "—"}</td>
                 <td className="numeric">{number(stock.ltp)}</td>
                 <td className={`numeric ${(stock.change_percent ?? 0) > 0 ? "positive" : (stock.change_percent ?? 0) < 0 ? "negative" : ""}`}>
@@ -1346,10 +1297,16 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
                   {stock.relative_volume == null ? "N/A" : `${number(stock.relative_volume)}x`}
                 </td>
                 <td className="numeric">{stock.spread_bps == null ? "—" : `${number(stock.spread_bps)} bps`}</td>
+                <td title={stock.liquidity_tier_reason}>
+                  <span className={`liquidity-tier ${stock.liquidity_tier}`}>{stock.liquidity_tier.replace("_", " ")}</span>
+                  <small>{tradedValue(stock.median_daily_traded_value_inr)} median/day</small>
+                  <small>{stock.liquidity_sessions_traded}/{stock.liquidity_sessions_expected} sessions traded</small>
+                  <small>{stock.median_spread_bps_20d == null ? "Spread history building" : `${number(stock.median_spread_bps_20d, 2)} bps median spread`}</small>
+                </td>
                 <td><span className={`data-badge ${stock.data_state}`}>{stock.data_state}</span></td>
               </tr>
             ))}
-            {!stocks.length && <tr><td className="feature-empty" colSpan={9}>Waiting for approved-stock market data.</td></tr>}
+            {!stocks.length && <tr><td className="feature-empty" colSpan={10}>Waiting for approved-stock market data.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1357,11 +1314,11 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
   );
 }
 
-function FinancialsPanel({ rows }: { rows: FinancialMetricSnapshot[] }) {
+function FinancialsPanel({ rows, stockNames }: { rows: FinancialMetricSnapshot[]; stockNames: StockNameLookup }) {
   const crore = (value: number | null) => value == null ? "N/A" : `Rs ${number(value)} cr`;
   const points = (value: number | null) => value == null ? "N/A" : `${value > 0 ? "+" : ""}${number(value)} pp`;
   const { sortedRows, sort, requestSort } = useSortableRows(rows, {
-    symbol: (row) => row.symbol,
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     revenue: (row) => row.growth.revenue_yoy_percent,
     operating_profit: (row) => row.growth.operating_profit_yoy_percent,
     net_profit: (row) => row.growth.net_profit_yoy_percent,
@@ -1397,7 +1354,7 @@ function FinancialsPanel({ rows }: { rows: FinancialMetricSnapshot[] }) {
             {sortedRows.map((row) => (
               <tr key={`${row.source_snapshot_id}-${row.calculation_version}`}>
                 <td>
-                  <strong>{row.symbol}</strong>
+                  <CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} />
                   <MetricLine label="Latest quarter" value={row.latest_quarter ?? "N/A"} />
                   <MetricLine label="Latest annual" value={row.latest_annual_period ?? "N/A"} />
                   <span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span>
@@ -1471,22 +1428,19 @@ type StockDetailPanelProps = {
   regimes: DailyRegime[];
   evidenceRows: OpportunityEvidence[];
   financialRows: FinancialMetricSnapshot[];
-  corporateRows: CorporateActionAssessment[];
-  corporateAI: CorporateActionAIAnalysis[];
   context: MarketContext | null;
   onBack: () => void;
 };
 
-function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regimes, evidenceRows, financialRows, corporateRows, corporateAI, context, onBack }: StockDetailPanelProps) {
+function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regimes, evidenceRows, financialRows, context, onBack }: StockDetailPanelProps) {
   const stock = stocks.find((item) => item.instrument_key === instrumentKey);
   const opportunity = opportunities.find((item) => item.instrument_key === instrumentKey);
   const feature = features.find((item) => item.instrument_key === instrumentKey);
   const regime = regimes.find((item) => item.instrument_key === instrumentKey);
   const evidence = evidenceRows.find((item) => item.instrument_key === instrumentKey);
   const financial = financialRows.find((item) => item.instrument_key === instrumentKey);
-  const actions = corporateRows.filter((item) => item.instrument_key === instrumentKey);
-  const aiByEvent = Object.fromEntries(corporateAI.map((item) => [item.event_id, item]));
   const symbol = opportunity?.symbol ?? stock?.symbol ?? feature?.symbol ?? regime?.symbol ?? "Selected stock";
+  const displayName = stock?.display_name ?? stock?.company_name ?? symbol;
   const sector = opportunity?.sector ?? stock?.sector ?? feature?.sector ?? regime?.sector;
 
   return (
@@ -1494,7 +1448,7 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
       <div className="stock-detail-header">
         <div>
           <p className="eyebrow">CONSOLIDATED STOCK VIEW</p>
-          <h2>{symbol}</h2>
+          <h2 className="company-name" title={symbol === "Selected stock" ? undefined : `${stock?.company_name ?? displayName} · NSE symbol: ${symbol}`}>{displayName}</h2>
           <p>{sector ?? "Sector unavailable"} · information combined from every Q-FAE evidence section</p>
         </div>
         <button className="secondary" type="button" onClick={onBack}>← Back to ranking</button>
@@ -1509,6 +1463,11 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
           <MetricLine label="Open" value={stock?.open == null ? "N/A" : number(stock.open)} />
           <MetricLine label="High / low" value={`${stock?.high == null ? "N/A" : number(stock.high)} / ${stock?.low == null ? "N/A" : number(stock.low)}`} />
           <MetricLine label="Latest minute volume" value={integer(stock?.volume ?? null)} />
+          <MetricLine label="Tracking tier" value={stock?.liquidity_tier?.replace("_", " ") ?? "N/A"} />
+          <MetricLine label="20-session median value" value={tradedValue(stock?.median_daily_traded_value_inr ?? null)} />
+          <MetricLine label="Trading continuity" value={stock ? `${stock.liquidity_sessions_traded}/${stock.liquidity_sessions_expected} sessions` : "—"} />
+          <MetricLine label="20-session median spread" value={stock?.median_spread_bps_20d == null ? "—" : `${number(stock.median_spread_bps_20d, 2)} bps`} />
+          <MetricLine label="Latest daily value" value={tradedValue(stock?.latest_daily_traded_value_inr ?? null)} />
           <MetricLine label="Updated" value={stock?.updated_at ? new Date(stock.updated_at).toLocaleTimeString("en-IN") : "N/A"} />
         </DetailCard>
 
@@ -1611,21 +1570,6 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
           </> : <p className="detail-empty">Use Check financial results to populate available provider data.</p>}
         </DetailCard>
 
-        <DetailCard title="Corporate actions and catalysts" subtitle={`${actions.length} stored assessment${actions.length === 1 ? "" : "s"}`} wide>
-          {actions.length ? <div className="detail-action-list">{actions.map((action) => {
-            const ai = aiByEvent[action.event_id];
-            return <div key={action.event_id}>
-              <span className={`direction-badge ${action.direction}`}>{action.direction}</span>
-              <strong>{action.category.replaceAll("_", " ")}</strong>
-              <MetricLine label="Materiality / sentiment" value={`${number(action.materiality_score, 0)} / ${action.sentiment_score > 0 ? "+" : ""}${number(action.sentiment_score, 0)}`} />
-              <MetricLine label="Horizon / confidence" value={`${action.impact_horizon.replaceAll("_", " ")} / ${number(action.confidence * 100, 0)}%`} />
-              {ai?.grounded && <MetricLine label="Grounded AI impact" value={ai.impact_score == null ? "N/A" : `${ai.impact_score > 0 ? "+" : ""}${number(ai.impact_score, 0)}`} valueClass={tone(ai.impact_score)} />}
-              {action.evidence.slice(0, 2).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
-              {action.cautions.slice(0, 2).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
-            </div>;
-          })}</div> : <p className="detail-empty">No active corporate-action assessment for this stock.</p>}
-        </DetailCard>
-
         {opportunity && <DetailCard title="Why it ranks" subtitle={opportunity.score.model_version} wide>
           <div className="detail-component-grid">{opportunity.score.components.map((component) => <div key={component.key}><strong>{component.label}</strong><span>{component.score == null ? "N/A" : number(component.score, 0)}</span><small>{number(component.weight_percent, 0)}% weight · {number(component.coverage_percent, 0)}% covered · {number(component.contribution_points, 1)} points</small></div>)}</div>
           <div className="detail-two-column detail-tag-groups"><div><h4>Top positives</h4>{opportunity.score.top_positive_factors.map((item, index) => <span className="evidence-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div><div><h4>Cautions / invalidations</h4>{[...opportunity.score.invalidation_reasons, ...opportunity.score.top_cautions].map((item, index) => <span className="caution-tag" key={`${item}-${index}`}>{item.replaceAll("_", " ")}</span>)}</div></div>
@@ -1635,7 +1579,7 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
   );
 }
 
-function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCheckReport; onClose: () => void }) {
+function FinancialResultsDialog({ report, onClose, stockNames }: { report: FinancialResultCheckReport; onClose: () => void; stockNames: StockNameLookup }) {
   return (
     <div className="dialog-backdrop" role="presentation" onMouseDown={onClose}>
       <section className="results-dialog" role="dialog" aria-modal="true" aria-labelledby="financial-results-title" onMouseDown={(event) => event.stopPropagation()}>
@@ -1650,7 +1594,7 @@ function FinancialResultsDialog({ report, onClose }: { report: FinancialResultCh
             <thead><tr><th>Stock</th><th>Status</th><th>Quarterly</th><th>Annual</th><th>Snapshot</th><th>Reason</th></tr></thead>
             <tbody>{report.items.map((item) => (
               <tr key={item.instrument_key}>
-                <td><strong>{item.symbol}</strong></td>
+                <td><CompanyName names={stockNames} instrumentKey={item.instrument_key} symbol={item.symbol} /></td>
                 <td><span className={`data-badge ${item.state}`}>{item.state}</span></td>
                 <td>{item.quarterly_available ? item.quarterly_period ?? "Available" : "Not available"}</td>
                 <td>{item.annual_available ? item.annual_period ?? "Available" : "Not available"}</td>
@@ -1674,7 +1618,7 @@ function localDate(offsetDays = 0) {
   return `${year}-${month}-${day}`;
 }
 
-function BacktestPanel({ databaseAvailable }: { databaseAvailable: boolean }) {
+function BacktestPanel({ databaseAvailable, stockNames }: { databaseAvailable: boolean; stockNames: StockNameLookup }) {
   const [fromDate, setFromDate] = useState(localDate(-30));
   const [toDate, setToDate] = useState(localDate());
   const [minScore, setMinScore] = useState(70);
@@ -1754,7 +1698,7 @@ function BacktestPanel({ databaseAvailable }: { databaseAvailable: boolean }) {
     result?.trades ?? [],
     {
       time: (row) => row.entry_timestamp,
-      symbol: (row) => row.symbol,
+      symbol: (row) => companyNameFor(stockNames, null, row.symbol),
       score: (row) => row.opportunity_score,
       return: (row) => row.net_return_percent,
       pnl: (row) => row.pnl_inr,
@@ -1798,7 +1742,7 @@ function BacktestPanel({ databaseAvailable }: { databaseAvailable: boolean }) {
         {result.summary.recorded_sessions != null && result.summary.recorded_sessions < 20 && <p className="notice error">Small sample: only {result.summary.recorded_sessions} recorded market sessions. Treat these results as diagnostics, not model validation.</p>}
         <div className="table-scroll backtest-trades">
           <table><thead><tr><SortableHeader label="Time" sortKey="time" sort={sort} onSort={requestSort} defaultDirection="asc" /><SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" /><SortableHeader label="Score" sortKey="score" sort={sort} onSort={requestSort} /><th>Entry / Exit</th><SortableHeader label="Net return" sortKey="return" sort={sort} onSort={requestSort} /><SortableHeader label="P&L" sortKey="pnl" sort={sort} onSort={requestSort} /><SortableHeader label="Holding" sortKey="holding" sort={sort} onSort={requestSort} /><th>Exit</th></tr></thead>
-            <tbody>{sortedTrades.map((trade) => <tr key={trade.trade_id}><td>{new Date(trade.entry_timestamp).toLocaleString("en-IN")}</td><td><strong>{trade.symbol}</strong><small>{trade.sector ?? "Sector unavailable"}</small></td><td>{number(trade.opportunity_score)}</td><td>₹{number(trade.entry_price)}<small>to ₹{number(trade.exit_price)}</small></td><td className={tone(trade.net_return_percent)}>{signedPercent(trade.net_return_percent)}</td><td className={tone(trade.pnl_inr)}>₹{integer(trade.pnl_inr)}</td><td>{trade.holding_minutes}m</td><td>{trade.exit_reason.replaceAll("_", " ")}<small>{trade.exit_signal_state ? `${trade.exit_signal_state} · score ${number(trade.exit_opportunity_score)}` : "Mechanical/risk exit"}</small></td></tr>)}</tbody>
+            <tbody>{sortedTrades.map((trade) => <tr key={trade.trade_id}><td>{new Date(trade.entry_timestamp).toLocaleString("en-IN")}</td><td><CompanyName names={stockNames} symbol={trade.symbol} /><small>{trade.sector ?? "Sector unavailable"}</small></td><td>{number(trade.opportunity_score)}</td><td>₹{number(trade.entry_price)}<small>to ₹{number(trade.exit_price)}</small></td><td className={tone(trade.net_return_percent)}>{signedPercent(trade.net_return_percent)}</td><td className={tone(trade.pnl_inr)}>₹{integer(trade.pnl_inr)}</td><td>{trade.holding_minutes}m</td><td>{trade.exit_reason.replaceAll("_", " ")}<small>{trade.exit_signal_state ? `${trade.exit_signal_state} · score ${number(trade.exit_opportunity_score)}` : "Mechanical/risk exit"}</small></td></tr>)}</tbody>
           </table>
           {!sortedTrades.length && <p className="feature-empty">No trades met these rules. This can also mean point-in-time evidence has not yet been recorded for the selected dates.</p>}
         </div>
@@ -1808,12 +1752,11 @@ function BacktestPanel({ databaseAvailable }: { databaseAvailable: boolean }) {
   );
 }
 
-type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "corporate" | "evidence" | "daily" | "financials" | "stocks" | "backtesting";
+type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "evidence" | "daily" | "financials" | "stocks" | "backtesting";
 
 const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "opportunities", label: "Opportunity Ranking" },
   { id: "intraday", label: "Intraday Features" },
-  { id: "corporate", label: "Corporate Actions" },
   { id: "evidence", label: "Evidence Confluence" },
   { id: "daily", label: "Daily Regime" },
   { id: "financials", label: "Financials (Qtrly/Yearly)" },
@@ -1830,8 +1773,6 @@ function Dashboard() {
   const [regimes, setRegimes] = useState<DailyRegime[]>([]);
   const [evidence, setEvidence] = useState<OpportunityEvidence[]>([]);
   const [opportunities, setOpportunities] = useState<RankedOpportunity[]>([]);
-  const [corporateActions, setCorporateActions] = useState<CorporateActionAssessment[]>([]);
-  const [corporateActionAI, setCorporateActionAI] = useState<CorporateActionAIAnalysis[]>([]);
   const [financialMetrics, setFinancialMetrics] = useState<FinancialMetricSnapshot[]>([]);
   const [financialResultReport, setFinancialResultReport] = useState<FinancialResultCheckReport | null>(null);
   const [selectedInstrumentKey, setSelectedInstrumentKey] = useState<string | null>(null);
@@ -1875,22 +1816,9 @@ function Dashboard() {
     }
   }, []);
 
-  const refreshReferenceData = useCallback(async () => {
-    try {
-      const [corporateActionsResponse, corporateActionAIResponse] = await Promise.all([
-        fetch(`${apiBaseUrl}/market/corporate-action-assessments?limit=100`),
-        fetch(`${apiBaseUrl}/market/corporate-action-ai`),
-      ]);
-      setCorporateActions(corporateActionsResponse.ok ? await corporateActionsResponse.json() as CorporateActionAssessment[] : []);
-      setCorporateActionAI(corporateActionAIResponse.ok ? await corporateActionAIResponse.json() as CorporateActionAIAnalysis[] : []);
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : "Could not load reference data");
-    }
-  }, []);
-
   const refresh = useCallback(async () => {
-    await Promise.all([refreshLive(), refreshAnalysis(), refreshReferenceData()]);
-  }, [refreshAnalysis, refreshLive, refreshReferenceData]);
+    await Promise.all([refreshLive(), refreshAnalysis()]);
+  }, [refreshAnalysis, refreshLive]);
 
   const loadFinancialMetrics = useCallback(async () => {
     try {
@@ -1905,19 +1833,17 @@ function Dashboard() {
     void refresh();
     const liveTimer = window.setInterval(() => void refreshLive(), 5_000);
     const analysisTimer = window.setInterval(() => void refreshAnalysis(), 15_000);
-    const referenceTimer = window.setInterval(() => void refreshReferenceData(), 300_000);
     return () => {
       window.clearInterval(liveTimer);
       window.clearInterval(analysisTimer);
-      window.clearInterval(referenceTimer);
     };
-  }, [refresh, refreshAnalysis, refreshLive, refreshReferenceData]);
+  }, [refresh, refreshAnalysis, refreshLive]);
 
   useEffect(() => {
     if (activeAnalysisTab === "financials" || activeAnalysisTab === "stock_detail") void loadFinancialMetrics();
   }, [activeAnalysisTab, loadFinancialMetrics]);
 
-  const runAction = async (action: "bootstrap" | "live/start" | "live/stop") => {
+  const runAction = async (action: "bootstrap" | "live/stop") => {
     setBusy(action);
     setError(null);
     try {
@@ -1938,7 +1864,7 @@ function Dashboard() {
     setBusy("financial-results");
     setError(null);
     try {
-      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 100}`, { method: "POST" });
+      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 139}`, { method: "POST" });
       if (!response.ok) {
         const payload = await response.json() as { detail?: string };
         throw new Error(payload.detail ?? "Financial results could not be checked");
@@ -1956,10 +1882,26 @@ function Dashboard() {
   const bootstrapping = runtime?.bootstrap.state === "running";
   const live = runtime?.live.connected === true;
   const liveStarting = ["connecting", "reconnecting"].includes(runtime?.live.state ?? "");
-  const pilotSize = runtime?.pilot_size ?? 100;
+  const pilotSize = runtime?.pilot_size ?? 139;
+  const stockNames = useMemo<StockNameLookup>(() => {
+    const byInstrumentKey: Record<string, string> = {};
+    const bySymbol: Record<string, string> = {};
+    const legalByInstrumentKey: Record<string, string> = {};
+    const legalBySymbol: Record<string, string> = {};
+    for (const stock of stocks) {
+      byInstrumentKey[stock.instrument_key] = stock.display_name ?? stock.company_name;
+      bySymbol[stock.symbol] = stock.display_name ?? stock.company_name;
+      legalByInstrumentKey[stock.instrument_key] = stock.company_name;
+      legalBySymbol[stock.symbol] = stock.company_name;
+    }
+    return { byInstrumentKey, bySymbol, legalByInstrumentKey, legalBySymbol };
+  }, [stocks]);
   const selectedOpportunity = opportunities.find((item) => item.instrument_key === selectedInstrumentKey);
+  const selectedSymbol = selectedOpportunity?.symbol
+    ?? stocks.find((item) => item.instrument_key === selectedInstrumentKey)?.symbol
+    ?? "Stock";
   const analysisTabs = selectedInstrumentKey
-    ? [ANALYSIS_TABS[0], { id: "stock_detail" as const, label: `${selectedOpportunity?.symbol ?? "Stock"} Detail` }, ...ANALYSIS_TABS.slice(1)]
+    ? [ANALYSIS_TABS[0], { id: "stock_detail" as const, label: `${companyNameFor(stockNames, selectedInstrumentKey, selectedSymbol)} Detail` }, ...ANALYSIS_TABS.slice(1)]
     : ANALYSIS_TABS;
 
   const openStockDetail = useCallback((instrumentKey: string) => {
@@ -1984,11 +1926,10 @@ function Dashboard() {
           <p>Daily regime evidence and live OHLCV are combined on a one-minute cadence.</p>
         </div>
         <div className="actions">
-          <button className="secondary" type="button" disabled={bootstrapping || busy !== null} onClick={() => void runAction("bootstrap")}>
-            {bootstrapping ? `Preparing ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? pilotSize}` : `Prepare ${pilotSize} stocks`}
-          </button>
           {!live && !liveStarting ? (
-            <button type="button" disabled={busy !== null || !runtime?.redis_available} onClick={() => void runAction("live/start")}>Start live feed</button>
+            <button type="button" disabled={bootstrapping || busy !== null || !runtime?.redis_available} onClick={() => void runAction("bootstrap")}>
+              {bootstrapping ? `Preparing ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? pilotSize} · live starts next` : `Prepare ${pilotSize} stocks & start live`}
+            </button>
           ) : (
             <button className="danger-button" type="button" disabled={busy !== null} onClick={() => void runAction("live/stop")}>Stop live feed</button>
           )}
@@ -1996,6 +1937,7 @@ function Dashboard() {
       </section>
 
       {error && <p className="notice error dashboard-notice">{error}</p>}
+      {runtime?.bootstrap.live_start_error && <p className="notice error dashboard-notice">Preparation completed, but live feed did not start: {runtime.bootstrap.live_start_error}</p>}
 
       <section className="summary-grid" aria-label="Market data status">
         <article><span>Redis</span><strong>{runtime?.redis_available ? "Ready" : "Offline"}</strong></article>
@@ -2006,16 +1948,16 @@ function Dashboard() {
         <article><span>Daily regimes</span><strong>{runtime?.bootstrap.daily_history_loaded ?? 0}/{pilotSize}</strong></article>
         <article><span>Daily stored</span><strong>{runtime?.bootstrap.daily_history_persisted ?? 0}/{pilotSize}</strong></article>
         <article><span>Sectors</span><strong>{runtime?.bootstrap.sectors_loaded ?? 0}/{pilotSize}</strong></article>
-        <article><span>Corporate actions</span><strong>{runtime?.bootstrap.corporate_actions_synced ?? 0}/{pilotSize}</strong></article>
-        <article><span>CA assessments</span><strong>{runtime?.bootstrap.corporate_actions_assessed ?? 0}</strong></article>
-        <article><span>CA outcomes</span><strong>{runtime?.bootstrap.corporate_outcomes_evaluated ?? 0}</strong></article>
-        <article><span>CA sources</span><strong>{runtime?.bootstrap.corporate_documents_stored ?? 0}</strong></article>
+        <article><span>Financial fetched</span><strong>{runtime?.bootstrap.financial_results_fetched ?? 0}</strong></article>
         <article><span>Financial reused</span><strong>{runtime?.bootstrap.financial_results_reused ?? 0}</strong></article>
+        <article><span>Active universe</span><strong>{runtime?.liquidity_universe.active ?? 0}</strong></article>
+        <article><span>Watch-only</span><strong>{runtime?.liquidity_universe.watch_only ?? 0}</strong></article>
+        <article><span>Dormant</span><strong>{runtime?.liquidity_universe.dormant ?? 0}</strong></article>
         <article><span>Subscribed</span><strong>{runtime?.live.subscribed ?? 0}</strong></article>
         <article><span>Reconciliation</span><strong>{runtime?.reconciliation.state ?? "Idle"}</strong></article>
       </section>
 
-      <MarketContextPanel context={context} regime={marketRegime} />
+      <MarketContextPanel context={context} regime={marketRegime} stockNames={stockNames} />
 
       <section className="analysis-workspace" aria-label="Market analysis workspace">
         <div className="analysis-tabs" role="tablist" aria-label="Analysis sections">
@@ -2036,7 +1978,7 @@ function Dashboard() {
           ))}
         </div>
         <div className="analysis-tab-panel" id={`analysis-panel-${activeAnalysisTab}`} role="tabpanel" aria-labelledby={`analysis-tab-${activeAnalysisTab}`}>
-          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} onSelectStock={openStockDetail} />}
+          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} onSelectStock={openStockDetail} stockNames={stockNames} />}
           {activeAnalysisTab === "stock_detail" && selectedInstrumentKey && (
             <StockDetailPanel
               instrumentKey={selectedInstrumentKey}
@@ -2046,19 +1988,16 @@ function Dashboard() {
               regimes={regimes}
               evidenceRows={evidence}
               financialRows={financialMetrics}
-              corporateRows={corporateActions}
-              corporateAI={corporateActionAI}
               context={context}
               onBack={() => setActiveAnalysisTab("opportunities")}
             />
           )}
-          {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} />}
-          {activeAnalysisTab === "corporate" && <CorporateActionPanel rows={corporateActions} analyses={corporateActionAI} />}
-          {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} />}
-          {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} />}
-          {activeAnalysisTab === "financials" && <FinancialsPanel rows={financialMetrics} />}
+          {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} stockNames={stockNames} />}
+          {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} stockNames={stockNames} />}
+          {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} stockNames={stockNames} />}
+          {activeAnalysisTab === "financials" && <FinancialsPanel rows={financialMetrics} stockNames={stockNames} />}
           {activeAnalysisTab === "stocks" && <ApprovedStocksPanel stocks={stocks} />}
-          {activeAnalysisTab === "backtesting" && <BacktestPanel databaseAvailable={runtime?.database_available === true} />}
+          {activeAnalysisTab === "backtesting" && <BacktestPanel databaseAvailable={runtime?.database_available === true} stockNames={stockNames} />}
         </div>
       </section>
 
@@ -2067,7 +2006,7 @@ function Dashboard() {
         <button className="secondary" type="button" disabled={busy !== null || !runtime?.database_available} onClick={() => void checkFinancialResults()}>{busy === "financial-results" ? "Checking results…" : "Check financial results"}</button>
       </section>
 
-      {financialResultReport && <FinancialResultsDialog report={financialResultReport} onClose={() => setFinancialResultReport(null)} />}
+      {financialResultReport && <FinancialResultsDialog report={financialResultReport} onClose={() => setFinancialResultReport(null)} stockNames={stockNames} />}
     </main>
   );
 }

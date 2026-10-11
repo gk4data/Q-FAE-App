@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import threading
 import time
-import hashlib
-import json
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -14,7 +12,7 @@ from urllib.parse import quote
 
 import httpx
 
-from app.models.market import Candle, CorporateAction, CorporateFinancialContext, FinancialResultSnapshot, LiveSnapshot, MarketDepthLevel
+from app.models.market import Candle, CorporateFinancialContext, FinancialResultSnapshot, LiveSnapshot, MarketDepthLevel
 from app.services.financial_results import build_financial_snapshot
 
 UPSTOX_API_ROOT = "https://api.upstox.com"
@@ -154,83 +152,6 @@ def _optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _corporate_action_date(value: Any) -> date | None:
-    if not value:
-        return None
-    text = str(value).strip()
-    for pattern in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, pattern).date()
-        except ValueError:
-            continue
-    return None
-
-
-def normalize_corporate_actions(
-    isin: str,
-    instrument_key: str,
-    symbol: str,
-    rows: Iterable[Any],
-    *,
-    ingested_at: datetime | None = None,
-) -> list[CorporateAction]:
-    """Normalize Upstox corporate-action rows while retaining their source payload."""
-    captured_at = ingested_at or datetime.now(UTC)
-    actions: list[CorporateAction] = []
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        action_type = str(row.get("name") or "Unknown").strip()
-        detail_rows = row.get("event_details")
-        details = {
-            str(item.get("name") or "").strip(): str(item.get("value") or "").strip()
-            for item in detail_rows
-            if isinstance(item, Mapping) and item.get("name")
-        } if isinstance(detail_rows, list) else {}
-        lower_details = {key.lower(): value for key, value in details.items()}
-
-        def detail_date(*names: str) -> date | None:
-            return next(
-                (parsed for name in names if (parsed := _corporate_action_date(lower_details.get(name))) is not None),
-                None,
-            )
-
-        ex_date = detail_date("ex date", "ex dividend date", "ex bonus date", "ex split date")
-        if ex_date is None:
-            ex_date = _corporate_action_date(row.get("expiry_date"))
-        canonical = json.dumps(
-            {
-                "isin": isin,
-                "action_type": action_type,
-                "ex_date": ex_date.isoformat() if ex_date else None,
-                "amount": row.get("amount"),
-                "ratio": row.get("ratio"),
-                "details": details,
-            },
-            sort_keys=True,
-            default=str,
-        )
-        event_id = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
-        actions.append(
-            CorporateAction(
-                event_id=event_id,
-                isin=isin,
-                instrument_key=instrument_key,
-                symbol=symbol,
-                action_type=action_type,
-                announcement_date=detail_date("announcement date"),
-                ex_date=ex_date,
-                record_date=detail_date("record date"),
-                amount=_optional_float(row.get("amount")),
-                ratio=str(row["ratio"]).strip() if row.get("ratio") else None,
-                details=details,
-                raw_payload=dict(row),
-                ingested_at=captured_at,
-            )
-        )
-    return actions
 
 
 def normalize_feed_message(
@@ -445,18 +366,6 @@ class UpstoxMarketDataClient:
         data = payload.get("data")
         sector = data.get("sector") if isinstance(data, Mapping) else None
         return str(sector).strip() if sector else None
-
-    def fetch_corporate_actions(
-        self,
-        isin: str,
-        instrument_key: str,
-        symbol: str,
-    ) -> list[CorporateAction]:
-        payload = self._get(f"/v2/fundamentals/{quote(isin, safe='')}/corporate-actions")
-        rows = payload.get("data")
-        if not isinstance(rows, list):
-            raise UpstoxMarketDataError("Upstox corporate-action response did not contain a list")
-        return normalize_corporate_actions(isin, instrument_key, symbol, rows)
 
     def fetch_corporate_financial_context(
         self,

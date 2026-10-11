@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 
 from app.models.market import (
     Candle,
-    CorporateActionContext,
     EvidencePillar,
     FinancialMetricSnapshot,
     FlowLiquidityConfirmation,
@@ -18,7 +17,7 @@ from app.models.market import (
     RiskAssessment,
 )
 
-MODEL_VERSION = "long-continuation-pilot-v1"
+MODEL_VERSION = "long-continuation-pilot-v2"
 STRATEGY = "long_continuation"
 CALIBRATION_STATUS = "provisional_not_backtested"
 DEFAULT_WEIGHTS = {
@@ -26,8 +25,7 @@ DEFAULT_WEIGHTS = {
     "participation": 20.0,
     "market_sector": 20.0,
     "liquidity_execution": 15.0,
-    "fundamental": 10.0,
-    "catalyst": 5.0,
+    "fundamental": 15.0,
 }
 FINANCIAL_SECTORS = {"bank", "banking", "nbfc", "finance", "financial services"}
 
@@ -281,34 +279,6 @@ def _fundamental_component(
     )
 
 
-def _catalyst_component(
-    context: CorporateActionContext | None, weight: float
-) -> OpportunityScoreComponent:
-    if context is None:
-        return _component(
-            "catalyst",
-            "Corporate catalyst",
-            weight,
-            [_Measure("corporate_action_context", None)],
-        )
-    if context.active_events == 0:
-        return _component(
-            "catalyst",
-            "Corporate catalyst",
-            weight,
-            [_Measure("active_catalyst", 50, positive="no_active_corporate_action")],
-        )
-    score = None if context.effective_score is None else _clamp(50 + context.effective_score / 2)
-    return _component(
-        "catalyst",
-        "Corporate catalyst",
-        weight,
-        [_Measure("active_catalyst", score, positive="positive_corporate_catalyst", caution="negative_corporate_catalyst")],
-        extra_positive=context.evidence,
-        extra_cautions=context.cautions,
-    )
-
-
 def _persistence_multiplier(evidence: OpportunityEvidenceSnapshot) -> tuple[float, str, bool]:
     signal = evidence.signal_persistence
     if signal is None:
@@ -358,7 +328,6 @@ def build_opportunity_score(
             normalized["fundamental"],
             unavailable_reason=financial_unavailable_reason,
         ),
-        _catalyst_component(evidence.corporate_action_context, normalized["catalyst"]),
     ]
     covered_weight = sum(item.weight_percent * item.coverage_percent / 100 for item in components)
     coverage = _clamp(covered_weight)

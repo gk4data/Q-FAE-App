@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from collections import deque
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
@@ -14,14 +15,7 @@ from app.core.config import Settings
 from app.db.repository import HistoricalMarketRepository
 from app.models.backtest import BacktestRun, BacktestRunListItem, BacktestRunRequest
 from app.models.market import (
-    AdjustedCandle,
     Candle,
-    CorporateAction,
-    CorporateActionAssessment,
-    CorporateActionAIAnalysis,
-    CorporateActionCalibrationReport,
-    CorporateActionDocument,
-    CorporateActionOutcome,
     CorporateFinancialContext,
     DailyReconciliationRecord,
     DailyRegimeSnapshot,
@@ -31,6 +25,7 @@ from app.models.market import (
     FinancialMetricSnapshot,
     FlowLiquidityConfirmation,
     LiveSnapshot,
+    MarketContext,
     MinuteOfDayProfile,
     OpportunityEvidenceSnapshot,
     RankedOpportunity,
@@ -47,16 +42,7 @@ from app.services.daily_regime import (
     merge_daily_history,
 )
 from app.services.backtesting import OpportunityBacktester
-from app.services.corporate_action_assessment import assess_corporate_action
-from app.services.corporate_action_ai import CorporateActionAIScorer, unavailable_ai_analysis
-from app.services.corporate_action_documents import NseAnnouncementClient
-from app.services.corporate_action_pipeline import (
-    build_adjustment,
-    build_calibration_report,
-    build_corporate_action_context,
-    evaluate_action_outcome,
-)
-from app.services.equity_universe import EquityUniverseService
+from app.services.equity_universe import EquityUniverseService, NSE_MAINBOARD_EQUITY_SERIES
 from app.services.evidence_integration import build_opportunity_evidence
 from app.services.flow_confirmation import build_flow_liquidity_confirmation
 from app.services.financial_results import (
@@ -67,6 +53,10 @@ from app.services.financial_metrics import calculate_financial_metrics
 from app.services.opportunity_scoring import build_opportunity_score, rank_opportunities
 from app.services.market_regime import build_market_regime
 from app.services.market_features import build_stock_features
+from app.services.liquidity_universe import (
+    LiquidityUniverseDecision,
+    classify_liquidity_tier,
+)
 from app.services.market_context import INDIA_TIMEZONE, build_market_context, calculate_relative_volume
 from app.services.market_state import MarketStateStore
 from app.services.risk_gates import build_risk_assessment
@@ -88,6 +78,76 @@ logger = logging.getLogger(__name__)
 NSE_MARKET_CLOSE = datetime_time(hour=15, minute=30)
 NSE_MARKET_OPEN = datetime_time(hour=9, minute=15)
 NSE_SESSION_CANDLE_LIMIT = 400
+
+STOCK_DISPLAY_NAME_ALIASES = {
+    "HEXT": "Hexaware",
+    "KAYNES": "Kaynes",
+    "NETWEB": "Netweb",
+}
+
+
+def readable_company_name(
+    symbol: str,
+    company_name: str,
+    short_name: str | None = None,
+) -> str:
+    """Return a compact, human-readable label without exposing cryptic tickers."""
+    alias = STOCK_DISPLAY_NAME_ALIASES.get(symbol.upper())
+    if alias:
+        return alias
+    candidate = (short_name or company_name).strip()
+    candidate = re.sub(r"\s+(?:LIMITED|LTD\.?)$", "", candidate, flags=re.IGNORECASE).strip()
+    if not candidate:
+        return symbol
+    if candidate.isupper():
+        words = [word if len(word) <= 4 else word.capitalize() for word in candidate.split()]
+        candidate = " ".join(words)
+    return candidate
+
+
+def opportunity_display_values(
+    feature: StockFeatureSnapshot,
+    snapshot: LiveSnapshot | None,
+) -> tuple[float | None, float | None, Candle | None, list[float]]:
+    """Return mutually consistent price fields for an opportunity row.
+
+    Feature snapshots intentionally use the latest completed minute. Thinly traded
+    stocks may not produce another minute candle even though LTPC subsequently
+    changes. In that case, using the feature's return beside the newer LTP makes
+    the CMP percentage and sparkline stale. Prefer the same-session LTP for all
+    display-only price fields while leaving the point-in-time evidence untouched.
+    """
+    trace = list(feature.session_price_trace)
+    feature_return = feature.relative_strength.session_return_percent
+    if snapshot is None or snapshot.ltp is None or snapshot.ltp <= 0:
+        return None, feature_return, None, trace
+
+    current_price = snapshot.ltp
+    feature_date = feature.candle_timestamp.astimezone(INDIA_TIMEZONE).date()
+    snapshot_date = snapshot.received_at.astimezone(INDIA_TIMEZONE).date()
+    if snapshot_date != feature_date:
+        return current_price, feature_return, snapshot.session_candle, trace
+
+    session_return = feature_return
+    if snapshot.previous_close is not None and snapshot.previous_close > 0:
+        session_return = round(
+            (current_price - snapshot.previous_close) / snapshot.previous_close * 100,
+            4,
+        )
+
+    session_candle = snapshot.session_candle
+    if session_candle is not None:
+        session_candle = session_candle.model_copy(
+            update={
+                "high": max(session_candle.high, current_price),
+                "low": min(session_candle.low, current_price),
+                "close": current_price,
+            }
+        )
+
+    if not trace or trace[-1] != current_price:
+        trace.append(current_price)
+    return current_price, session_return, session_candle, trace[-390:]
 
 
 def nse_market_close_at(now: datetime) -> datetime:
@@ -157,6 +217,8 @@ class MarketRuntime:
         self._last_context_bucket: int | None = None
         self._persisted_minute_watermarks: dict[str, datetime | None] = {}
         self._symbols: dict[str, str] = {}
+        self._spread_history_cache: dict[str, list[float]] = {}
+        self._spread_history_cache_at: datetime | None = None
         self._bootstrap: dict[str, Any] = {
             "state": "idle",
             "total": 0,
@@ -168,24 +230,22 @@ class MarketRuntime:
             "daily_history_persisted": 0,
             "benchmark_daily_loaded": 0,
             "sectors_loaded": 0,
-            "corporate_actions_synced": 0,
-            "corporate_actions_stored": 0,
-            "corporate_actions_assessed": 0,
-            "corporate_adjustments_built": 0,
-            "corporate_documents_stored": 0,
-            "corporate_financial_contexts": 0,
+            "financial_results_fetched": 0,
             "financial_results_reused": 0,
-            "corporate_ai_analyzed": 0,
-            "corporate_outcomes_evaluated": 0,
             "errors": 0,
             "started_at": None,
             "finished_at": None,
             "recent_errors": [],
+            "auto_start_live": False,
+            "live_start_error": None,
         }
         self._live: dict[str, Any] = {
             "state": "stopped",
             "connected": False,
             "subscribed": 0,
+            "liquidity_active": 0,
+            "liquidity_watch_only": 0,
+            "liquidity_dormant": 0,
             "last_message_at": None,
             "last_context_at": None,
             "last_evidence_at": None,
@@ -235,9 +295,11 @@ class MarketRuntime:
             bootstrap = dict(self._bootstrap)
             live = dict(self._live)
             reconciliation = dict(self._reconciliation)
+        liquidity_universe = {"active": 0, "watch_only": 0, "dormant": 0}
         if redis_available and bootstrap["state"] != "running":
             try:
                 instruments = self._resolved_instruments(None)
+                decisions = self._liquidity_decisions(instruments)
                 keys = [instrument["instrument_key"] for instrument in instruments]
                 sectors = self.state_store.get_sectors()
                 benchmark_keys = tuple(dict.fromkeys((NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())))
@@ -254,6 +316,8 @@ class MarketRuntime:
                         "sectors_loaded": sum(key in sectors for key in keys),
                     }
                 )
+                for decision in decisions.values():
+                    liquidity_universe[decision.tier] += 1
             except Exception:
                 pass
         if database_available and bootstrap["state"] != "running":
@@ -275,16 +339,6 @@ class MarketRuntime:
                     if self.historical_repository
                     else 0
                 )
-                bootstrap["corporate_actions_synced"] = (
-                    self.historical_repository.count_synced_instruments("corporate_actions", keys)
-                    if self.historical_repository
-                    else 0
-                )
-                bootstrap["corporate_actions_assessed"] = (
-                    self.historical_repository.count_corporate_action_assessments(keys)
-                    if self.historical_repository
-                    else 0
-                )
             except Exception:
                 pass
         return {
@@ -292,6 +346,7 @@ class MarketRuntime:
             "pilot_size": self.settings.qfae_market_pilot_size,
             "redis_available": redis_available,
             "database_available": database_available,
+            "liquidity_universe": liquidity_universe,
             "bootstrap": bootstrap,
             "live": live,
             "reconciliation": reconciliation,
@@ -301,6 +356,7 @@ class MarketRuntime:
         """Build a compact view of cached historical and live data for the pilot universe."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
+        liquidity_decisions = self._liquidity_decisions(instruments)
         snapshots = {
             snapshot.instrument_key: snapshot
             for snapshot in self.state_store.get_snapshots()
@@ -313,6 +369,7 @@ class MarketRuntime:
 
         for instrument in instruments:
             key = instrument["instrument_key"]
+            liquidity = liquidity_decisions[key]
             snapshot = snapshots.get(key)
             candle = snapshot.current_candle if snapshot and snapshot.current_candle else None
             if candle is None:
@@ -366,6 +423,7 @@ class MarketRuntime:
                     instrument_key=key,
                     symbol=instrument["symbol"],
                     company_name=instrument.get("company_name") or instrument["symbol"],
+                    display_name=instrument.get("display_name") or instrument["symbol"],
                     sector=sectors.get(key),
                     ltp=ltp,
                     previous_close=previous_close,
@@ -377,6 +435,18 @@ class MarketRuntime:
                     volume=candle.volume if candle else None,
                     relative_volume=relative_volume,
                     spread_bps=spread_bps,
+                    liquidity_tier=liquidity.tier,
+                    liquidity_sessions_expected=liquidity.sessions_expected,
+                    liquidity_sessions_traded=liquidity.sessions_available,
+                    median_daily_traded_value_inr=(
+                        liquidity.median_daily_traded_value_inr
+                    ),
+                    latest_daily_traded_value_inr=(
+                        liquidity.latest_daily_traded_value_inr
+                    ),
+                    spread_sessions_available=liquidity.spread_sessions_available,
+                    median_spread_bps_20d=liquidity.median_spread_bps,
+                    liquidity_tier_reason=liquidity.reason,
                     updated_at=(snapshot.received_at if snapshot else candle.timestamp if candle else None),
                     data_state=(
                         "live"
@@ -391,10 +461,55 @@ class MarketRuntime:
             )
         return rows
 
+    def get_market_context(self) -> MarketContext | None:
+        """Return cached context with provider-backed readable names on RVOL leaders."""
+        self._require_state_store()
+        context = self.state_store.get_context()
+        if context is None:
+            return None
+        try:
+            universe = self.universe_service.load()
+            identities: dict[str, tuple[str, str]] = {}
+            for row in universe.get("instruments", []):
+                if not isinstance(row, dict):
+                    continue
+                candidate = row.get("candidate")
+                if not isinstance(candidate, dict):
+                    continue
+                key = str(candidate.get("instrument_key") or "")
+                symbol = str(candidate.get("trading_symbol") or "")
+                if not key or not symbol:
+                    continue
+                company_name = str(row.get("requested_name") or candidate.get("name") or symbol)
+                identities[key] = (
+                    company_name,
+                    readable_company_name(
+                        symbol,
+                        company_name,
+                        str(candidate.get("short_name") or "") or None,
+                    ),
+                )
+            leaders = []
+            for leader in context.relative_volume_leaders:
+                company_name, display_name = identities.get(
+                    leader.instrument_key,
+                    (leader.company_name or leader.symbol, leader.display_name or leader.symbol),
+                )
+                leaders.append(
+                    leader.model_copy(
+                        update={"company_name": company_name, "display_name": display_name}
+                    )
+                )
+            return context.model_copy(update={"relative_volume_leaders": leaders})
+        except Exception:
+            logger.exception("Could not attach company names to market-context RVOL leaders")
+            return context
+
     def get_features(self, limit: int | None = None) -> list[StockFeatureSnapshot]:
         """Return current-session features in approved-universe order."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
+        active_keys = self._active_liquidity_keys(instruments)
         features = self.state_store.get_features()
         snapshots = {
             snapshot.instrument_key: snapshot
@@ -404,6 +519,8 @@ class MarketRuntime:
         rows = []
         for instrument in instruments:
             key = instrument["instrument_key"]
+            if key not in active_keys:
+                continue
             feature = features.get(key)
             snapshot = snapshots.get(key)
             if feature is None or snapshot is None or snapshot.current_candle is None:
@@ -433,6 +550,7 @@ class MarketRuntime:
         """Return validated feature families and their stored point-in-time score."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
+        active_keys = self._active_liquidity_keys(instruments)
         features = self.state_store.get_features()
         regimes = self.state_store.get_daily_regimes()
         context = self.state_store.get_context()
@@ -440,8 +558,9 @@ class MarketRuntime:
         rows = []
         signals = self.state_store.get_signals()
         risks = self.state_store.get_risk_assessments()
-        corporate_contexts = self.state_store.get_corporate_action_contexts()
         for instrument in instruments:
+            if instrument["instrument_key"] not in active_keys:
+                continue
             feature = features.get(instrument["instrument_key"])
             if feature is None:
                 continue
@@ -463,7 +582,6 @@ class MarketRuntime:
                     update={
                         "signal_persistence": signals.get(feature.instrument_key),
                         "risk_assessment": risks.get(feature.instrument_key),
-                        "corporate_action_context": corporate_contexts.get(feature.instrument_key),
                     }
                 )
             )
@@ -489,27 +607,31 @@ class MarketRuntime:
             item.model_copy(update={"market_regime": market_regime})
             for item in evidence
         ]
+        display_values = {
+            key: opportunity_display_values(feature, snapshots.get(key))
+            for key, feature in features.items()
+        }
         try:
             return rank_opportunities(
                 evidence,
                 self._latest_financial_metrics_by_instrument(),
                 {
-                    key: feature.relative_strength.session_return_percent
-                    for key, feature in features.items()
+                    key: values[1]
+                    for key, values in display_values.items()
                 },
                 {
-                    key: snapshot.ltp if snapshot.ltp is not None and snapshot.ltp > 0 else None
-                    for key, snapshot in snapshots.items()
+                    key: values[0]
+                    for key, values in display_values.items()
                 },
                 {
-                    key: snapshot.session_candle
-                    for key, snapshot in snapshots.items()
-                    if snapshot.session_candle is not None
+                    key: values[2]
+                    for key, values in display_values.items()
+                    if values[2] is not None
                 },
                 {
-                    key: feature.session_price_trace
-                    for key, feature in features.items()
-                    if feature.session_price_trace
+                    key: values[3]
+                    for key, values in display_values.items()
+                    if values[3]
                 },
                 weights=self._opportunity_scoring_weights(),
             )
@@ -518,8 +640,13 @@ class MarketRuntime:
 
     def get_risk_assessments(self, limit: int | None = None) -> list[RiskAssessment]:
         instruments = self._resolved_instruments(limit)
+        active_keys = self._active_liquidity_keys(instruments)
         values = self.state_store.get_risk_assessments()
-        return [values[item["instrument_key"]] for item in instruments if item["instrument_key"] in values]
+        return [
+            values[item["instrument_key"]]
+            for item in instruments
+            if item["instrument_key"] in active_keys and item["instrument_key"] in values
+        ]
 
     def get_market_regime(self) -> MarketRegimeSnapshot | None:
         self._require_state_store()
@@ -566,107 +693,6 @@ class MarketRuntime:
             return repository.list_backtest_runs(limit)
         except Exception as exc:
             raise MarketRuntimeError("Backtest runs are unavailable") from exc
-
-    def get_corporate_actions(
-        self,
-        *,
-        instrument_key: str | None = None,
-        isin: str | None = None,
-        from_date: date | None = None,
-        to_date: date | None = None,
-        limit: int = 500,
-    ) -> list[CorporateAction]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_corporate_actions(
-                instrument_key=instrument_key,
-                isin=isin,
-                from_date=from_date,
-                to_date=to_date,
-                limit=limit,
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action records are unavailable") from exc
-
-    def get_corporate_action_assessments(
-        self,
-        *,
-        instrument_key: str | None = None,
-        category: str | None = None,
-        direction: str | None = None,
-        minimum_materiality: float | None = None,
-        limit: int = 500,
-    ) -> list[CorporateActionAssessment]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_corporate_action_assessments(
-                instrument_key=instrument_key,
-                category=category,
-                direction=direction,
-                minimum_materiality=minimum_materiality,
-                limit=limit,
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action assessments are unavailable") from exc
-
-    def get_adjusted_candles(
-        self, instrument_key: str, *, interval: str = "day", limit: int = 300
-    ) -> list[AdjustedCandle]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_adjusted_candles(
-                instrument_key, interval=interval, limit=limit
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Adjusted candles are unavailable") from exc
-
-    def get_corporate_action_documents(
-        self, *, instrument_key: str | None = None, event_id: str | None = None, limit: int = 500
-    ) -> list[CorporateActionDocument]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_corporate_action_documents(
-                instrument_key=instrument_key, event_id=event_id, limit=limit
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action documents are unavailable") from exc
-
-    def get_corporate_action_ai_analyses(
-        self, *, instrument_key: str | None = None, event_id: str | None = None
-    ) -> list[CorporateActionAIAnalysis]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_corporate_action_ai_analyses(
-                instrument_key=instrument_key, event_id=event_id
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action AI analyses are unavailable") from exc
-
-    def get_corporate_action_outcomes(
-        self, instrument_key: str | None = None
-    ) -> list[CorporateActionOutcome]:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return self.historical_repository.get_corporate_action_outcomes(instrument_key)
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action outcomes are unavailable") from exc
-
-    def get_corporate_action_calibration(self) -> CorporateActionCalibrationReport:
-        if self.historical_repository is None:
-            raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        try:
-            return build_calibration_report(
-                self.historical_repository.get_corporate_action_assessments(limit=10000),
-                self.historical_repository.get_corporate_action_outcomes(),
-            )
-        except Exception as exc:
-            raise MarketRuntimeError("Corporate-action calibration is unavailable") from exc
 
     def check_financial_results(
         self,
@@ -732,11 +758,13 @@ class MarketRuntime:
         """Return current-session volume and executable-liquidity confirmation."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
+        active_keys = self._active_liquidity_keys(instruments)
         features = self.state_store.get_features()
         return [
             self._build_flow_confirmation(features[instrument["instrument_key"]])
             for instrument in instruments
-            if instrument["instrument_key"] in features
+            if instrument["instrument_key"] in active_keys
+            and instrument["instrument_key"] in features
         ]
 
     def _build_flow_confirmation(
@@ -777,9 +805,29 @@ class MarketRuntime:
         except Exception as exc:
             raise MarketRuntimeError("Daily reconciliation records are unavailable") from exc
 
-    def start_bootstrap(self, limit: int | None = None) -> dict[str, Any]:
+    def start_bootstrap(
+        self,
+        limit: int | None = None,
+        *,
+        auto_start_live: bool = False,
+    ) -> dict[str, Any]:
         self._require_access_token()
         self._require_state_store()
+        universe_warning: str | None = None
+        refresh_universe = getattr(self.universe_service, "refresh", None)
+        if callable(refresh_universe):
+            try:
+                refresh_universe()
+            except Exception as exc:
+                try:
+                    self.universe_service.load()
+                except Exception:
+                    raise MarketRuntimeError(
+                        "Daily instrument-universe refresh failed and no previous snapshot is available"
+                    ) from exc
+                universe_warning = (
+                    "Daily instrument-universe refresh failed; using the previous validated snapshot"
+                )
         instruments = self._resolved_instruments(limit)
         with self._lock:
             if self._bootstrap_thread and self._bootstrap_thread.is_alive():
@@ -797,23 +845,19 @@ class MarketRuntime:
                 "daily_history_persisted": 0,
                 "benchmark_daily_loaded": 0,
                 "sectors_loaded": 0,
-                "corporate_actions_synced": 0,
-                "corporate_actions_stored": 0,
-                "corporate_actions_assessed": 0,
-                "corporate_adjustments_built": 0,
-                "corporate_documents_stored": 0,
-                "corporate_financial_contexts": 0,
+                "financial_results_fetched": 0,
                 "financial_results_reused": 0,
-                "corporate_ai_analyzed": 0,
-                "corporate_outcomes_evaluated": 0,
                 "errors": 0,
                 "started_at": datetime.now(UTC).isoformat(),
                 "finished_at": None,
                 "recent_errors": [],
+                "universe_warning": universe_warning,
+                "auto_start_live": auto_start_live,
+                "live_start_error": None,
             }
             self._bootstrap_thread = threading.Thread(
                 target=self._run_bootstrap,
-                args=(instruments,),
+                args=(instruments, auto_start_live),
                 name="qfae-pre-market-bootstrap",
                 daemon=True,
             )
@@ -974,6 +1018,10 @@ class MarketRuntime:
                 tzinfo=INDIA_TIMEZONE,
             ).astimezone(UTC)
             self._calculate_daily_regimes(reconciliation_time, include_provisional=False)
+            repository.refresh_daily_execution_quality(
+                list(equity_keys), session_date, session_date
+            )
+            self._spread_history_cache_at = None
             with self._lock:
                 self._reconciliation["state"] = "completed"
         except Exception as exc:
@@ -988,7 +1036,11 @@ class MarketRuntime:
             with self._lock:
                 self._reconciliation["finished_at"] = datetime.now(UTC).isoformat()
 
-    def _run_bootstrap(self, instruments: list[dict[str, str]]) -> None:
+    def _run_bootstrap(
+        self,
+        instruments: list[dict[str, str]],
+        auto_start_live: bool = False,
+    ) -> None:
         limiter = RequestRateLimiter(
             self.settings.qfae_market_request_rate_per_second,
             self.settings.qfae_market_request_rate_per_minute,
@@ -999,9 +1051,6 @@ class MarketRuntime:
                     errors: list[str] = []
                     daily_history_loaded = False
                     sector_loaded = False
-                    corporate_actions_synced = False
-                    corporate_actions_stored = 0
-                    corporate_actions_assessed = 0
                     history_loaded, minute_persisted, profile_built, minute_errors = (
                         self._prepare_minute_history(client, instrument["instrument_key"])
                     )
@@ -1021,40 +1070,6 @@ class MarketRuntime:
                                 sector_loaded = True
                         except Exception as exc:
                             errors.append(f"{instrument['symbol']}: sector: {exc}")
-                        if repository := self.historical_repository:
-                            try:
-                                actions = client.fetch_corporate_actions(
-                                    isin,
-                                    instrument["instrument_key"],
-                                    instrument["symbol"],
-                                )
-                                corporate_actions_stored = repository.upsert_corporate_actions(
-                                    isin,
-                                    instrument["instrument_key"],
-                                    actions,
-                                )
-                                assessments: list[CorporateActionAssessment] = []
-                                for action in actions:
-                                    reference_date = (
-                                        action.announcement_date or action.ex_date or action.record_date
-                                    )
-                                    reference = repository.get_reference_daily_close(
-                                        action.instrument_key,
-                                        reference_date,
-                                    )
-                                    assessments.append(
-                                        assess_corporate_action(
-                                            action,
-                                            reference_price=reference[0] if reference else None,
-                                            reference_price_date=reference[1] if reference else None,
-                                        )
-                                    )
-                                corporate_actions_assessed = (
-                                    repository.upsert_corporate_action_assessments(assessments)
-                                )
-                                corporate_actions_synced = True
-                            except Exception as exc:
-                                errors.append(f"{instrument['symbol']}: corporate actions: {exc}")
 
                     with self._lock:
                         self._bootstrap["processed"] += 1
@@ -1064,9 +1079,6 @@ class MarketRuntime:
                         self._bootstrap["daily_history_loaded"] += int(daily_history_loaded)
                         self._bootstrap["daily_history_persisted"] += int(daily_history_persisted)
                         self._bootstrap["sectors_loaded"] += int(sector_loaded)
-                        self._bootstrap["corporate_actions_synced"] += int(corporate_actions_synced)
-                        self._bootstrap["corporate_actions_stored"] += corporate_actions_stored
-                        self._bootstrap["corporate_actions_assessed"] += corporate_actions_assessed
                         self._bootstrap["errors"] += len(errors)
                         if errors:
                             self._bootstrap["recent_errors"] = (
@@ -1086,18 +1098,44 @@ class MarketRuntime:
                                 self._bootstrap["recent_errors"]
                                 + [f"{label}: {error}" for error in errors]
                             )[-25:]
-                enrichment, enrichment_errors = self._enrich_corporate_actions(client, instruments)
+                financial_counts, financial_errors = self._sync_bootstrap_financial_results(
+                    client, instruments
+                )
                 with self._lock:
-                    for key, value in enrichment.items():
+                    for key, value in financial_counts.items():
                         self._bootstrap[key] += value
-                    self._bootstrap["errors"] += len(enrichment_errors)
-                    if enrichment_errors:
+                    self._bootstrap["errors"] += len(financial_errors)
+                    if financial_errors:
                         self._bootstrap["recent_errors"] = (
-                            self._bootstrap["recent_errors"] + enrichment_errors
+                            self._bootstrap["recent_errors"] + financial_errors
                         )[-25:]
+                repository = self.historical_repository
+                if repository is not None:
+                    try:
+                        today = datetime.now(INDIA_TIMEZONE).date()
+                        repository.refresh_daily_execution_quality(
+                            [item["instrument_key"] for item in instruments],
+                            today - timedelta(days=45),
+                            today - timedelta(days=1),
+                        )
+                        self._spread_history_cache_at = None
+                    except Exception as exc:
+                        with self._lock:
+                            self._bootstrap["errors"] += 1
+                            self._bootstrap["recent_errors"] = (
+                                self._bootstrap["recent_errors"]
+                                + [f"execution quality profiles: {exc}"]
+                            )[-25:]
             self._calculate_daily_regimes(datetime.now(UTC))
             with self._lock:
                 self._bootstrap["state"] = "completed"
+            if auto_start_live:
+                try:
+                    self.start_live(len(instruments))
+                except Exception as exc:
+                    logger.exception("Live feed did not start after market preparation")
+                    with self._lock:
+                        self._bootstrap["live_start_error"] = str(exc)
         except Exception as exc:
             logger.exception("Pre-market bootstrap stopped unexpectedly")
             with self._lock:
@@ -1110,188 +1148,28 @@ class MarketRuntime:
             with self._lock:
                 self._bootstrap["finished_at"] = datetime.now(UTC).isoformat()
 
-    def _enrich_corporate_actions(
+    def _sync_bootstrap_financial_results(
         self,
         client: UpstoxMarketDataClient,
         instruments: list[dict[str, str]],
     ) -> tuple[dict[str, int], list[str]]:
-        """Build optional event enrichment after stock and benchmark history are durable."""
+        """Refresh reusable quarterly/annual snapshots after price history is durable."""
         counters = {
-            "corporate_adjustments_built": 0,
-            "corporate_documents_stored": 0,
-            "corporate_financial_contexts": 0,
+            "financial_results_fetched": 0,
             "financial_results_reused": 0,
-            "corporate_ai_analyzed": 0,
-            "corporate_outcomes_evaluated": 0,
         }
-        repository = self.historical_repository
-        if repository is None:
+        if self.historical_repository is None:
             return counters, []
         errors: list[str] = []
-        today = datetime.now(INDIA_TIMEZONE).date()
-        cutoff = today - timedelta(days=self.settings.qfae_corporate_action_lookback_days)
-        benchmark = repository.get_candles(NIFTY_50_KEY, "day", 1000)
-        nse_client: NseAnnouncementClient | None = None
-        ai_scorer: CorporateActionAIScorer | None = None
-        if self.settings.qfae_corporate_documents_enabled:
+        for instrument in instruments:
             try:
-                nse_client = NseAnnouncementClient()
+                status, _ = self._sync_financial_result(client, instrument)
+                counters["financial_results_fetched"] += int(status.state == "fetched")
+                counters["financial_results_reused"] += int(status.state == "reused")
             except Exception as exc:
-                errors.append(f"NSE documents unavailable: {type(exc).__name__}")
-        if (
-            self.settings.qfae_corporate_action_ai_enabled
-            and self.settings.openai_api_key
-            and self.settings.qfae_ai_model
-        ):
-            ai_scorer = CorporateActionAIScorer(
-                self.settings.openai_api_key,
-                self.settings.qfae_ai_model,
-            )
-        try:
-            for instrument in instruments:
-                key = instrument["instrument_key"]
-                symbol = instrument["symbol"]
-                isin = instrument.get("isin")
-                try:
-                    actions = repository.get_corporate_actions(instrument_key=key, limit=5000)
-                    assessments = repository.get_corporate_action_assessments(
-                        instrument_key=key, limit=5000
-                    )
-                    assessment_by_id = {item.event_id: item for item in assessments}
-                    adjustments = []
-                    for action in actions:
-                        effective_date = action.ex_date or action.record_date
-                        reference = repository.get_reference_daily_close(key, effective_date)
-                        adjustments.append(
-                            build_adjustment(
-                                action,
-                                reference_close=reference[0] if reference else None,
-                            )
-                        )
-                    counters["corporate_adjustments_built"] += (
-                        repository.upsert_corporate_action_adjustments(adjustments)
-                    )
-
-                    financial_context = None
-                    if isin:
-                        try:
-                            financial_status, financial_context = self._sync_financial_result(
-                                client, instrument
-                            )
-                            counters["corporate_financial_contexts"] += int(
-                                financial_status.state == "fetched"
-                            )
-                            counters["financial_results_reused"] += int(
-                                financial_status.state == "reused"
-                            )
-                        except Exception as exc:
-                            errors.append(f"{symbol}: financial context: {type(exc).__name__}")
-
-                    if nse_client is not None and actions:
-                        try:
-                            documents = nse_client.fetch(
-                                key,
-                                symbol,
-                                actions,
-                                from_date=cutoff,
-                                to_date=today,
-                            )
-                            counters["corporate_documents_stored"] += (
-                                repository.upsert_corporate_action_documents(documents)
-                            )
-                        except Exception as exc:
-                            errors.append(f"{symbol}: NSE documents: {type(exc).__name__}")
-                            nse_client.close()
-                            nse_client = None
-
-                    adjusted_rows = repository.get_adjusted_candles(
-                        key, interval="day", limit=1000
-                    )
-                    stock = [
-                        Candle(
-                            instrument_key=row.instrument_key,
-                            timestamp=row.timestamp,
-                            interval=row.interval,
-                            open=row.adjusted_open,
-                            high=row.adjusted_high,
-                            low=row.adjusted_low,
-                            close=row.adjusted_close,
-                            volume=row.adjusted_volume,
-                            source="qfae_adjusted",
-                        )
-                        for row in adjusted_rows
-                    ]
-                    adjustment_by_id = {item.event_id: item for item in adjustments}
-                    outcomes: list[CorporateActionOutcome] = []
-                    for action in actions:
-                        adjustment = adjustment_by_id.get(action.event_id)
-                        event_date = action.ex_date or action.announcement_date or action.record_date
-                        if adjustment and adjustment.status == "unavailable" and event_date:
-                            outcomes.append(
-                                CorporateActionOutcome(
-                                    event_id=action.event_id,
-                                    instrument_key=key,
-                                    event_date=event_date,
-                                    outcome_status="unavailable_adjustment",
-                                    evaluated_at=datetime.now(UTC),
-                                )
-                            )
-                            continue
-                        outcome = evaluate_action_outcome(action, stock, benchmark)
-                        if outcome is not None:
-                            outcomes.append(outcome)
-                    counters["corporate_outcomes_evaluated"] += (
-                        repository.upsert_corporate_action_outcomes(outcomes)
-                    )
-
-                    analyses: list[CorporateActionAIAnalysis] = []
-                    for action in actions:
-                        event_date = action.announcement_date or action.ex_date or action.record_date
-                        assessment = assessment_by_id.get(action.event_id)
-                        if assessment is None or event_date is None or event_date < cutoff:
-                            continue
-                        documents = repository.get_corporate_action_documents(
-                            instrument_key=key, event_id=action.event_id
-                        )
-                        if ai_scorer is not None:
-                            analysis = ai_scorer.analyze(
-                                action, assessment, documents, financial_context
-                            )
-                        else:
-                            reason = (
-                                "ai_scoring_disabled"
-                                if not self.settings.qfae_corporate_action_ai_enabled
-                                else "openai_key_or_model_unavailable"
-                            )
-                            analysis = unavailable_ai_analysis(
-                                action.event_id,
-                                model=self.settings.qfae_ai_model,
-                                reason=reason,
-                            )
-                        analyses.append(analysis)
-                    repository.upsert_corporate_action_ai_analyses(analyses)
-                    counters["corporate_ai_analyzed"] += sum(
-                        item.status == "complete" for item in analyses
-                    )
-                    all_analyses = repository.get_corporate_action_ai_analyses(
-                        instrument_key=key
-                    )
-                    self.state_store.save_corporate_action_context(
-                        build_corporate_action_context(
-                            key,
-                            actions,
-                            assessments,
-                            all_analyses,
-                            as_of=datetime.now(UTC),
-                        )
-                    )
-                except Exception as exc:
-                    errors.append(f"{symbol}: corporate enrichment: {type(exc).__name__}")
-        finally:
-            if nse_client is not None:
-                nse_client.close()
-            if ai_scorer is not None:
-                ai_scorer.close()
+                errors.append(
+                    f"{instrument['symbol']}: financial results: {type(exc).__name__}"
+                )
         return counters, errors
 
     def _sync_financial_result(
@@ -1487,6 +1365,12 @@ class MarketRuntime:
         token = self._require_access_token()
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
+        liquidity_decisions = self._liquidity_decisions(instruments)
+        instruments = [
+            item
+            for item in instruments
+            if liquidity_decisions[item["instrument_key"]].tier != "dormant"
+        ]
         symbols = {item["instrument_key"]: item["symbol"] for item in instruments}
         symbols.update(MARKET_CONTEXT_SYMBOLS)
         instrument_keys = list(dict.fromkeys([*symbols.keys()]))
@@ -1500,6 +1384,15 @@ class MarketRuntime:
                 "state": "connecting",
                 "connected": False,
                 "subscribed": len(instrument_keys),
+                "liquidity_active": sum(
+                    decision.tier == "active" for decision in liquidity_decisions.values()
+                ),
+                "liquidity_watch_only": sum(
+                    decision.tier == "watch_only" for decision in liquidity_decisions.values()
+                ),
+                "liquidity_dormant": sum(
+                    decision.tier == "dormant" for decision in liquidity_decisions.values()
+                ),
                 "last_message_at": None,
                 "last_context_at": None,
                 "last_evidence_at": None,
@@ -2051,13 +1944,16 @@ class MarketRuntime:
     ) -> None:
         regimes = self.state_store.get_daily_regimes()
         previous_signals = self.state_store.get_signals()
-        corporate_contexts = self.state_store.get_corporate_action_contexts()
         repository = self.historical_repository
         financial_metrics = self._latest_financial_metrics_by_instrument()
+        liquidity_decisions = self._liquidity_decisions(self._resolved_instruments(None))
+        observed_keys = {
+            key for key, decision in liquidity_decisions.items() if decision.tier != "dormant"
+        }
         observations: list[EvidenceOutcomeObservation] = []
         for feature in features:
             try:
-                if feature.as_of != as_of:
+                if feature.as_of != as_of or feature.instrument_key not in observed_keys:
                     continue
                 flow = self._build_flow_confirmation(feature)
                 evidence = build_opportunity_evidence(
@@ -2106,7 +2002,6 @@ class MarketRuntime:
                         "signal_persistence": signal,
                         "risk_assessment": risk,
                         "market_regime": market_regime,
-                        "corporate_action_context": corporate_contexts.get(feature.instrument_key),
                     }
                 )
                 evidence = evidence.model_copy(
@@ -2160,7 +2055,6 @@ class MarketRuntime:
             "market_sector": self.settings.qfae_score_weight_market_sector,
             "liquidity_execution": self.settings.qfae_score_weight_liquidity_execution,
             "fundamental": self.settings.qfae_score_weight_fundamental,
-            "catalyst": self.settings.qfae_score_weight_catalyst,
         }
 
     def _latest_financial_metrics_by_instrument(self) -> dict[str, FinancialMetricSnapshot]:
@@ -2367,19 +2261,32 @@ class MarketRuntime:
         except (FileNotFoundError, ValueError) as exc:
             raise MarketRuntimeError(str(exc)) from exc
         instruments: list[dict[str, str]] = []
-        for row in universe.get("instruments", []):
-            candidate = row.get("candidate") if isinstance(row, dict) else None
+        seen_keys: set[str] = set()
+        universe_rows = universe.get("instruments", [])
+        for row in universe_rows:
+            if not isinstance(row, dict):
+                continue
+            candidate = row.get("candidate")
             if row.get("status") != "resolved" or not isinstance(candidate, dict):
+                continue
+            if candidate.get("instrument_type") not in NSE_MAINBOARD_EQUITY_SERIES:
                 continue
             key = candidate.get("instrument_key")
             symbol = candidate.get("trading_symbol")
-            if key and symbol:
+            if key and symbol and str(key) not in seen_keys:
+                seen_keys.add(str(key))
+                company_name = str(row.get("requested_name") or candidate.get("name") or symbol)
                 instruments.append(
                     {
                         "instrument_key": str(key),
                         "symbol": str(symbol),
                         "isin": str(candidate.get("isin") or ""),
-                        "company_name": str(row.get("requested_name") or candidate.get("name") or symbol),
+                        "company_name": company_name,
+                        "display_name": readable_company_name(
+                            str(symbol),
+                            company_name,
+                            str(candidate.get("short_name") or "") or None,
+                        ),
                     }
                 )
         effective_limit = limit if limit is not None else self.settings.qfae_market_pilot_size
@@ -2387,6 +2294,96 @@ class MarketRuntime:
         if not instruments:
             raise MarketRuntimeError("The approved universe has no resolved instruments")
         return instruments
+
+    def _liquidity_decisions(
+        self,
+        instruments: list[dict[str, str]],
+    ) -> dict[str, LiquidityUniverseDecision]:
+        as_of_date = datetime.now(INDIA_TIMEZONE).date()
+        lookback = int(getattr(self.settings, "qfae_liquidity_lookback_sessions", 20))
+        minimum_traded_sessions = int(
+            getattr(self.settings, "qfae_liquidity_min_traded_sessions", 18)
+        )
+        active_threshold = float(
+            getattr(
+                self.settings,
+                "qfae_liquidity_active_median_traded_value_inr",
+                50_000_000.0,
+            )
+        )
+        max_median_spread = float(
+            getattr(
+                self.settings,
+                "qfae_liquidity_max_median_spread_bps",
+                25.0,
+            )
+        )
+        reference_session_dates = [
+            candle.timestamp.astimezone(INDIA_TIMEZONE).date()
+            for candle in self.state_store.get_daily_candles(
+                NIFTY_50_KEY, limit=lookback + 5
+            )
+            if candle.timestamp.astimezone(INDIA_TIMEZONE).date() < as_of_date
+        ][-lookback:]
+        spread_histories = self._daily_spread_histories(
+            [item["instrument_key"] for item in instruments],
+            as_of_date=as_of_date,
+            lookback_sessions=lookback,
+        )
+        return {
+            instrument["instrument_key"]: classify_liquidity_tier(
+                self.state_store.get_daily_candles(
+                    instrument["instrument_key"],
+                    limit=lookback + 5,
+                ),
+                as_of_date=as_of_date,
+                lookback_sessions=lookback,
+                minimum_traded_sessions=minimum_traded_sessions,
+                active_median_traded_value_inr=active_threshold,
+                reference_session_dates=reference_session_dates,
+                daily_median_spreads_bps=spread_histories.get(
+                    instrument["instrument_key"], []
+                ),
+                max_median_spread_bps=max_median_spread,
+            )
+            for instrument in instruments
+        }
+
+    def _daily_spread_histories(
+        self,
+        instrument_keys: list[str],
+        *,
+        as_of_date: date,
+        lookback_sessions: int,
+    ) -> dict[str, list[float]]:
+        repository = self.historical_repository
+        if repository is None:
+            return {}
+        now = datetime.now(UTC)
+        if (
+            self._spread_history_cache_at is None
+            or now - self._spread_history_cache_at > timedelta(minutes=5)
+        ):
+            self._spread_history_cache = repository.get_daily_median_spreads(
+                instrument_keys,
+                before_date=as_of_date,
+                limit_sessions=lookback_sessions,
+            )
+            self._spread_history_cache_at = now
+        return {
+            key: self._spread_history_cache.get(key, [])
+            for key in instrument_keys
+        }
+
+    def _active_liquidity_keys(
+        self,
+        instruments: list[dict[str, str]],
+    ) -> set[str]:
+        return {
+            key
+            for key, decision in self._liquidity_decisions(instruments).items()
+            if decision.tier == "active"
+        }
 
     def _access_token(self) -> str | None:
         cached = TokenCache(self.settings.upstox_token_cache_path).load()

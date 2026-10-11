@@ -72,10 +72,6 @@ def _evidence(symbol: str, *, supportive: bool = True, rejected: bool = False) -
                 "as_of": NOW, "state": "risk_on", "observations": 3,
                 "evidence": ["market_participation_supportive"],
             },
-            "corporate_action_context": {
-                "instrument_key": f"NSE_EQ|{symbol}", "as_of": NOW,
-                "state": "unavailable", "active_events": 0,
-            },
         }
     )
 
@@ -116,7 +112,7 @@ def test_supportive_complete_evidence_produces_explainable_high_priority_score()
     assert sum(result.weights.values()) == 100
     assert {item.key for item in result.components} == {
         "price_trend", "participation", "market_sector",
-        "liquidity_execution", "fundamental", "catalyst",
+        "liquidity_execution", "fundamental",
     }
     assert "intraday_support" in result.top_positive_factors
 
@@ -131,7 +127,7 @@ def test_rejected_risk_gate_makes_candidate_ineligible_even_with_positive_eviden
 
 def test_missing_inputs_reduce_coverage_instead_of_becoming_neutral_values() -> None:
     evidence = _evidence("SPARSE").model_copy(
-        update={"risk_assessment": None, "corporate_action_context": None}
+        update={"risk_assessment": None}
     )
     result = build_opportunity_score(evidence, None)
 

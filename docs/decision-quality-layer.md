@@ -11,15 +11,8 @@ Q-FAE records what the system knew at each completed minute before any strategy 
 - **Tradability gates:** circuit distance and opening-gap/ATR are enforced. Missing ASM/GSM/trade-to-trade and portfolio-capital inputs remain visibly `unavailable`; they never silently pass.
 - **Persistent market regime:** NIFTY direction, current and rolling breadth, sector participation, India VIX direction and acceleration produce `risk_on`, `mixed`, `risk_off`, or `insufficient` once per completed minute.
 - **F&O contract:** evidence responses expose a provider-neutral derivatives-confirmation object. It remains unavailable until cash-to-derivative mapping and expiry selection are implemented.
-- **Corporate-action facts:** the preparation flow now fetches Upstox events by ISIN and idempotently stores dividend, split, bonus, rights and other provider facts with announcement/ex/record dates and the untouched source payload.
-- **Deterministic corporate-action assessment:** versioned rules classify each event, select the last daily close before the announcement/event date, and calculate available dividend yield, offer premium, rights dilution/discount, and split/bonus magnitude. Materiality and conservative sentiment remain separate fields.
-- **Safe adjusted-series overlay:** raw provider candles remain untouched. Versioned dividend, bonus and verified face-value split factors produce a separate adjusted-candle response; ambiguous mechanical terms are marked `unavailable` instead of guessed.
-- **Official filing evidence:** preparation best-effort synchronizes matching NSE corporate announcements, their attachment URLs, exchange text and untouched response metadata. A filing outage is reported but cannot stop market history preparation.
 - **Financial context:** Upstox quarterly consolidated income-statement and cash-flow facts are stored separately from event facts and interpretations.
 - **Financial-result cache:** quarterly income statements and annual income, cash-flow and balance-sheet responses are content-versioned. Latest-quarter snapshots younger than 30 days are reused per stock by both preparation and the dashboard utility.
-- **Grounded AI adapter:** AI interpretation is opt-in. It runs only with an explicitly configured model and supporting documents, uses strict structured output, stores no API response at OpenAI, and rejects scores that do not cite a supplied document ID.
-- **Event outcomes and calibration:** 1/5/20-session raw and NIFTY-relative returns are recorded. Category/direction buckets require at least 30 observations before being labelled ready; the report never changes live weights automatically.
-- **Live evidence context:** active events and their deterministic or grounded-AI impact appear beside the minute evidence. They remain outside the raw confluence; the separate pilot ranking uses them only in its bounded 5% catalyst component.
 - **Explainable pilot ranking:** every completed-minute evidence record now includes a versioned long-continuation score. Component weights, contributions, coverage, persistence adjustment and invalidating risk gates remain inspectable; the model is explicitly labelled provisional until backtested.
 
 ## API
@@ -28,16 +21,9 @@ Q-FAE records what the system knew at each completed minute before any strategy 
 - `GET /api/v1/market/risk`
 - `GET /api/v1/market/outcomes?session_date=YYYY-MM-DD`
 - `GET /api/v1/market/outcomes?session_date=YYYY-MM-DD&instrument_key=NSE_EQ%7C...`
-- `GET /api/v1/market/corporate-actions`
-- `GET /api/v1/market/corporate-action-assessments`
-- `GET /api/v1/market/adjusted-candles?instrument_key=NSE_EQ%7C...&interval=day`
-- `GET /api/v1/market/corporate-action-documents`
-- `GET /api/v1/market/corporate-action-ai`
-- `GET /api/v1/market/corporate-action-outcomes`
-- `GET /api/v1/market/corporate-action-calibration`
 - `GET /api/v1/market/opportunities`
 
-The existing `GET /api/v1/market/evidence` response now includes `signal_persistence`, `risk_assessment`, `corporate_action_context`, and an explicit `derivatives_confirmation` availability state.
+The existing `GET /api/v1/market/evidence` response includes `signal_persistence`, `risk_assessment`, and an explicit `derivatives_confirmation` availability state.
 
 ## Configuration
 
@@ -47,9 +33,6 @@ The existing `GET /api/v1/market/evidence` response now includes `signal_persist
 - `QFAE_RISK_MAX_GAP_ATR` rejects unusually large opening gaps relative to daily ATR.
 - `QFAE_RISK_MAX_SPREAD_RANGE_BPS` rejects unstable spreads across the latest three observations.
 - `QFAE_RISK_CAPITAL_INR` is intentionally optional. Position, loss, and sector-exposure limits must not be presented as active without an explicit capital budget and portfolio state.
-- `QFAE_CORPORATE_DOCUMENTS_ENABLED` enables best-effort official NSE filing metadata ingestion.
-- `QFAE_CORPORATE_ACTION_LOOKBACK_DAYS` bounds filing and AI enrichment; raw Upstox event history remains durable.
-- `QFAE_CORPORATE_ACTION_AI_ENABLED`, `OPENAI_API_KEY`, and `QFAE_AI_MODEL` must all be deliberately configured to activate AI analysis. AI is disabled by default.
 
 ## Inputs staged next
 
@@ -58,16 +41,9 @@ The existing `GET /api/v1/market/evidence` response now includes `signal_persist
 3. Add global instruments such as GIFT NIFTY and major overnight indices to the pre-market context. The current regime explicitly reports `global_market_context` as unavailable.
 4. Add account/virtual-portfolio state before activating per-trade loss, position-size, daily-loss and sector-exposure limits.
 
-Deterministic corporate-action scores are not model weights. Splits and bonuses are marked economically neutral; rights, merger and other context-dependent actions retain explicit cautions for later filing/document and AI review.
-
-Corporate actions and surveillance lists are time-varying facts. Store every version with effective dates; never overwrite history with today's classification.
-
 ## Provider contracts
 
 - [Upstox full market feed](https://upstox.com/developer/api-documentation/get-market-data-feed/) supplies D5 depth and extended feed details including circuit limits.
-- [Upstox corporate actions](https://upstox.com/developer/api-documentation/get-corporate-actions/) supplies split, bonus, dividend and rights events by ISIN.
 - [Upstox income statement](https://upstox.com/developer/api-documentation/get-income-statement/) and cash-flow endpoints supply company-reported financial context.
-- [NSE corporate filings](https://www.nseindia.com/companies-listing/corporate-filings-announcements) supplies official announcement metadata and attachment links.
-- [OpenAI Responses API](https://developers.openai.com/api/reference/cli/resources/responses/methods/create) supplies the optional strict-schema, non-stored AI interpretation contract.
 - [Upstox OI API](https://upstox.com/developer/api-documentation/get-oi/) and the related analytics endpoints are candidates for derivatives confirmation.
 - [NSE market surveillance](https://www.nseindia.com/static/regulations/exchange-market-surveillance-actions) is the authoritative source family for ASM/GSM/trade-to-trade restrictions.

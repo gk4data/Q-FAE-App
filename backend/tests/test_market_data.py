@@ -10,6 +10,8 @@ from app.services.market_runtime import (
     MarketRuntime,
     completed_regular_session_candles,
     nse_market_close_at,
+    opportunity_display_values,
+    readable_company_name,
 )
 from app.services.market_state import InMemoryMarketStateStore
 from app.services.upstox_market import (
@@ -20,7 +22,6 @@ from app.services.upstox_market import (
     UpstoxMarketDataError,
     keep_latest_sessions,
     normalize_feed_message,
-    normalize_corporate_actions,
     parse_candle_rows,
 )
 
@@ -56,6 +57,47 @@ def test_parse_candles_and_keep_latest_sessions() -> None:
 def test_invalid_candle_contract_is_rejected() -> None:
     with pytest.raises(UpstoxMarketDataError):
         parse_candle_rows("NSE_EQ|TEST", [["2026-09-01", 100]])
+
+
+def test_readable_company_names_prefer_familiar_names_over_cryptic_symbols() -> None:
+    assert readable_company_name("HEXT", "HEXAWARE TECHNOLOGIES LTD") == "Hexaware"
+    assert readable_company_name("NETWEB", "NETWEB TECH INDIA LTD", "Netweb Tech India") == "Netweb"
+    assert readable_company_name("KAYNES", "KAYNES TECHNOLOGY IND LTD", "Kaynes Technology") == "Kaynes"
+    assert readable_company_name("INFY", "INFOSYS LIMITED", "Infosys") == "Infosys"
+
+
+def test_opportunity_display_uses_latest_ltp_for_cmp_return_and_trace() -> None:
+    feature = SimpleNamespace(
+        candle_timestamp=datetime(2026, 10, 9, 15, 22, tzinfo=IST),
+        session_price_trace=[18.99, 19.29, 19.98],
+        relative_strength=SimpleNamespace(session_return_percent=6.7878),
+    )
+    snapshot = LiveSnapshot(
+        instrument_key="NSE_EQ|TEST",
+        symbol="TEST",
+        received_at=datetime(2026, 10, 9, 15, 29, tzinfo=IST),
+        ltp=19.02,
+        previous_close=18.71,
+        session_candle=Candle(
+            instrument_key="NSE_EQ|TEST",
+            timestamp=datetime(2026, 10, 9, 0, 0, tzinfo=IST),
+            interval="day",
+            open=19.0,
+            high=20.5,
+            low=18.52,
+            close=19.98,
+            volume=25_675,
+        ),
+    )
+
+    price, session_return, session_candle, trace = opportunity_display_values(feature, snapshot)
+
+    assert price == 19.02
+    assert session_return == 1.6569
+    assert session_candle is not None
+    assert session_candle.close == 19.02
+    assert (session_candle.open, session_candle.high, session_candle.low) == (19.0, 20.5, 18.52)
+    assert trace == [18.99, 19.29, 19.98, 19.02]
 
 
 def test_current_session_daily_candle_uses_intraday_v3_endpoint() -> None:
@@ -265,37 +307,6 @@ def test_full_feed_message_is_normalized() -> None:
     assert snapshots[0].session_candle.close == 101.5
 
 
-def test_corporate_actions_preserve_facts_and_normalize_dates() -> None:
-    actions = normalize_corporate_actions(
-        "INE000000001",
-        "NSE_EQ|INE000000001",
-        "TEST",
-        [
-            {
-                "name": "Dividend",
-                "expiry_date": "14 Aug 2025",
-                "amount": 5.5,
-                "ratio": None,
-                "event_details": [
-                    {"name": "Announcement date", "value": "25 Apr 2025"},
-                    {"name": "Ex dividend date", "value": "14 Aug 2025"},
-                    {"name": "Record date", "value": "14 Aug 2025"},
-                    {"name": "Details", "value": "Final dividend"},
-                ],
-            }
-        ],
-        ingested_at=datetime(2026, 9, 12, tzinfo=UTC),
-    )
-
-    assert len(actions) == 1
-    assert actions[0].action_type == "Dividend"
-    assert actions[0].announcement_date.isoformat() == "2025-04-25"
-    assert actions[0].ex_date.isoformat() == "2025-08-14"
-    assert actions[0].amount == 5.5
-    assert actions[0].details["Details"] == "Final dividend"
-    assert len(actions[0].event_id) == 32
-
-
 def test_relative_volume_uses_same_minute_from_prior_sessions() -> None:
     key = "NSE_EQ|TEST"
     current = candle(key, datetime(2026, 9, 4, 9, 30, tzinfo=IST), 3000)
@@ -351,6 +362,47 @@ def test_market_context_calculates_breadth_benchmarks_sectors_and_spread() -> No
     assert context.median_spread_bps is not None
 
 
+def test_market_context_rvol_leaders_are_enriched_with_readable_company_names() -> None:
+    now = datetime(2026, 9, 4, 4, 5, tzinfo=UTC)
+    key = "NSE_EQ|INE093A01041"
+    snapshot = LiveSnapshot(
+        instrument_key=key,
+        symbol="HEXT",
+        received_at=now,
+        ltp=500,
+        previous_close=490,
+        completed_candle_relative_volume=3.5,
+        completed_candle_timestamp=now,
+    )
+    store = InMemoryMarketStateStore()
+    store.save_context(build_market_context([snapshot], {}, as_of=now))
+    universe = {
+        "instruments": [
+            {
+                "status": "excluded_share_price",
+                "requested_name": "HEXAWARE TECHNOLOGIES LTD",
+                "candidate": {
+                    "instrument_key": key,
+                    "trading_symbol": "HEXT",
+                    "name": "HEXAWARE TECHNOLOGIES LTD",
+                    "short_name": None,
+                },
+            }
+        ]
+    }
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(),
+        state_store=store,
+        universe_service=SimpleNamespace(load=lambda: universe),
+    )
+
+    context = runtime.get_market_context()
+
+    assert context is not None
+    assert context.relative_volume_leaders[0].company_name == "HEXAWARE TECHNOLOGIES LTD"
+    assert context.relative_volume_leaders[0].display_name == "Hexaware"
+
+
 def test_in_memory_store_replaces_an_updating_minute_candle() -> None:
     store = InMemoryMarketStateStore()
     timestamp = datetime(2026, 9, 4, 9, 30, tzinfo=IST)
@@ -371,6 +423,7 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
                 "instrument_key": f"NSE_EQ|{index}",
                 "trading_symbol": f"STOCK{index}",
                 "isin": f"ISIN{index}",
+                "instrument_type": "EQ",
             },
         }
         for index in range(12)
@@ -526,3 +579,41 @@ def test_live_persistence_collects_all_completed_minutes_after_watermark() -> No
     runtime._collect_unpersisted_minutes(snapshot, [first, second, forming], second, pending)
 
     assert list(pending.values()) == [first, second]
+
+
+def test_provider_ranked_order_is_preserved_and_instrument_keys_are_unique() -> None:
+    def row(
+        symbol: str,
+        key: str,
+        *,
+        instrument_type: str = "EQ",
+    ) -> dict[str, object]:
+        return {
+            "requested_name": symbol,
+            "status": "resolved",
+            "candidate": {
+                "instrument_key": key,
+                "trading_symbol": symbol,
+                "isin": f"ISIN-{symbol}",
+                "instrument_type": instrument_type,
+            },
+        }
+
+    universe = {
+        "instruments": [
+            row("ORDINARY_A", "NSE_EQ|A"),
+            row("SECOND", "NSE_EQ|P"),
+            row("SME", "NSE_EQ|SME", instrument_type="SM"),
+            row("PRIORITY_DUPLICATE", "NSE_EQ|P"),
+            row("ORDINARY_B", "NSE_EQ|B"),
+        ]
+    }
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(qfae_market_pilot_size=3),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(load=lambda: universe),
+    )
+
+    selected = runtime._resolved_instruments(None)
+
+    assert [item["symbol"] for item in selected] == ["ORDINARY_A", "SECOND", "ORDINARY_B"]

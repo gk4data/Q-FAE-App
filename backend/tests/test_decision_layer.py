@@ -86,6 +86,29 @@ def test_d5_slippage_and_circuit_gate_are_calculated() -> None:
     assert result.status == "partial"  # surveillance and portfolio budget are explicitly unavailable
 
 
+def test_missing_visible_depth_makes_slippage_gate_ineligible() -> None:
+    snapshot = LiveSnapshot(
+        instrument_key="NSE_EQ|TEST",
+        symbol="TEST",
+        received_at=NOW.astimezone(UTC),
+        ltp=100,
+    )
+    feature = StockFeatureSnapshot.model_validate(
+        {
+            "instrument_key": "NSE_EQ|TEST", "symbol": "TEST", "as_of": NOW.astimezone(UTC),
+            "candle_timestamp": NOW - timedelta(minutes=1), "data_quality": "complete",
+            "vwap": {}, "gap": {}, "opening_ranges": [], "relative_strength": {},
+            "momentum": {}, "volume": {}, "pullback": {}, "volatility": {},
+            "liquidity": {"spread_bps": 10, "total_traded_value_inr": 20_000_000, "passes_spread_filter": True, "passes_traded_value_filter": True},
+        }
+    )
+
+    result = build_risk_assessment(feature, snapshot, as_of=NOW.astimezone(UTC))
+
+    assert result.eligible is False
+    assert next(gate for gate in result.gates if gate.key == "d5_slippage").status == "reject"
+
+
 def test_forward_outcomes_do_not_use_prices_before_each_horizon() -> None:
     observation = EvidenceOutcomeObservation(
         instrument_key="NSE_EQ|TEST", symbol="TEST", candle_timestamp=NOW,

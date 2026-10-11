@@ -14,14 +14,7 @@ from app.db.engine import get_engine
 from app.db.repository import HistoricalMarketRepository
 from app.models.backtest import BacktestRun, BacktestRunListItem, BacktestRunRequest
 from app.models.market import (
-    AdjustedCandle,
     Candle,
-    CorporateAction,
-    CorporateActionAssessment,
-    CorporateActionAIAnalysis,
-    CorporateActionCalibrationReport,
-    CorporateActionDocument,
-    CorporateActionOutcome,
     DailyReconciliationRecord,
     DailyRegimeSnapshot,
     EvidenceOutcomeObservation,
@@ -55,8 +48,9 @@ def get_market_runtime() -> MarketRuntime:
             retention_days=settings.qfae_market_history_retention_days,
         ),
         universe_service=EquityUniverseService(
-            stock_list_path=settings.qfae_stock_list_path,
             output_path=settings.qfae_equity_universe_path,
+            minimum_market_cap_crore=settings.qfae_min_market_cap_crore,
+            minimum_share_price_inr=settings.qfae_min_share_price_inr,
         ),
         historical_repository=HistoricalMarketRepository(get_engine()),
     )
@@ -73,8 +67,10 @@ def _runtime_action(action: Any) -> dict[str, Any]:
 def start_pre_market_bootstrap(
     limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
 ) -> dict[str, Any]:
-    """Start rate-limited 1-minute history and sector loading in the background."""
-    return _runtime_action(lambda: get_market_runtime().start_bootstrap(limit))
+    """Prepare the universe and automatically start live data when preparation finishes."""
+    return _runtime_action(
+        lambda: get_market_runtime().start_bootstrap(limit, auto_start_live=True)
+    )
 
 
 @router.post("/live/start", status_code=status.HTTP_202_ACCEPTED)
@@ -243,112 +239,6 @@ def get_opportunity_backtest(run_id: str) -> BacktestRun:
     return result
 
 
-@router.get("/corporate-actions", response_model=list[CorporateAction])
-def get_corporate_actions(
-    instrument_key: str | None = None,
-    isin: str | None = None,
-    from_date: date | None = None,
-    to_date: date | None = None,
-    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
-) -> list[CorporateAction]:
-    """Return factual Upstox corporate actions; no sentiment is inferred here."""
-    try:
-        return get_market_runtime().get_corporate_actions(
-            instrument_key=instrument_key,
-            isin=isin,
-            from_date=from_date,
-            to_date=to_date,
-            limit=limit,
-        )
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/corporate-action-assessments", response_model=list[CorporateActionAssessment])
-def get_corporate_action_assessments(
-    instrument_key: str | None = None,
-    category: str | None = None,
-    direction: str | None = None,
-    minimum_materiality: Annotated[float | None, Query(ge=0, le=100)] = None,
-    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
-) -> list[CorporateActionAssessment]:
-    """Return versioned deterministic corporate-action classifications and metrics."""
-    try:
-        return get_market_runtime().get_corporate_action_assessments(
-            instrument_key=instrument_key,
-            category=category,
-            direction=direction,
-            minimum_materiality=minimum_materiality,
-            limit=limit,
-        )
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/adjusted-candles", response_model=list[AdjustedCandle])
-def get_adjusted_candles(
-    instrument_key: str,
-    interval: str = "day",
-    limit: Annotated[int, Query(ge=1, le=5000)] = 300,
-) -> list[AdjustedCandle]:
-    """Return a corporate-action-adjusted overlay while preserving raw candles."""
-    try:
-        return get_market_runtime().get_adjusted_candles(
-            instrument_key, interval=interval, limit=limit
-        )
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/corporate-action-documents", response_model=list[CorporateActionDocument])
-def get_corporate_action_documents(
-    instrument_key: str | None = None,
-    event_id: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=5000)] = 500,
-) -> list[CorporateActionDocument]:
-    """Return official supporting announcement metadata and source links."""
-    try:
-        return get_market_runtime().get_corporate_action_documents(
-            instrument_key=instrument_key, event_id=event_id, limit=limit
-        )
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/corporate-action-ai", response_model=list[CorporateActionAIAnalysis])
-def get_corporate_action_ai(
-    instrument_key: str | None = None,
-    event_id: str | None = None,
-) -> list[CorporateActionAIAnalysis]:
-    """Return optional, document-grounded AI interpretations and citation IDs."""
-    try:
-        return get_market_runtime().get_corporate_action_ai_analyses(
-            instrument_key=instrument_key, event_id=event_id
-        )
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/corporate-action-outcomes", response_model=list[CorporateActionOutcome])
-def get_corporate_action_outcomes(
-    instrument_key: str | None = None,
-) -> list[CorporateActionOutcome]:
-    """Return 1/5/20-session raw and NIFTY-relative event outcomes."""
-    try:
-        return get_market_runtime().get_corporate_action_outcomes(instrument_key)
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
-@router.get("/corporate-action-calibration", response_model=CorporateActionCalibrationReport)
-def get_corporate_action_calibration() -> CorporateActionCalibrationReport:
-    """Report outcome buckets; samples under 30 remain explicitly uncalibrated."""
-    try:
-        return get_market_runtime().get_corporate_action_calibration()
-    except MarketRuntimeError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-
 @router.post("/financial-results/check", response_model=FinancialResultCheckReport)
 def check_financial_results(
     limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
@@ -396,7 +286,7 @@ def get_after_market_reconciliations(session_date: date) -> list[DailyReconcilia
 def get_latest_market_context() -> MarketContext:
     """Return the most recent minute-level breadth, benchmark, liquidity, and sector context."""
     try:
-        context = get_market_runtime().state_store.get_context()
+        context = get_market_runtime().get_market_context()
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -414,7 +304,7 @@ async def stream_minute_market_context(websocket: WebSocket) -> None:
     last_timestamp: str | None = None
     try:
         while True:
-            context = await asyncio.to_thread(get_market_runtime().state_store.get_context)
+            context = await asyncio.to_thread(get_market_runtime().get_market_context)
             if context is not None:
                 timestamp = context.as_of.isoformat()
                 if timestamp != last_timestamp:

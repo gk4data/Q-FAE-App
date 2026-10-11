@@ -50,7 +50,9 @@ The API health endpoint is `http://localhost:8000/api/v1/health`; PostgreSQL hea
 
 ## Equity universe refresh
 
-`Stock List.xlsx` is the source list for the Q-FAE equity universe. Refreshing the universe downloads the current public Upstox NSE instrument master, maps the requested company names to instrument keys, and writes `data/instruments/upstox_nse_equity_universe.json`.
+The current Upstox NSE BOD master is the source of the Q-FAE equity universe. Each refresh cross-checks it against Upstox's suspended-instrument file and official NSE security/bhavdata reports, then writes `data/instruments/upstox_nse_equity_universe.json`. No manually maintained stock-list workbook is required.
+
+Eligibility requires a normal NSE `EQ` company share, an official completed-session close of at least Rs 20, an issued-capital record, no current suspension, and market capitalization of at least Rs 500 crore. Market cap is calculated as NSE issued capital multiplied by the latest completed NSE close. ETFs and other non-company EQ instruments are rejected using NSE's security-type flag. The thresholds are configurable with `QFAE_MIN_SHARE_PRICE_INR` and `QFAE_MIN_MARKET_CAP_CRORE`.
 
 Start the API, then call:
 
@@ -58,7 +60,7 @@ Start the API, then call:
 Invoke-RestMethod -Method Post http://localhost:8000/api/v1/instruments/refresh
 ```
 
-The frontend's future **Get instrument list** action will call this same endpoint. The mapping records `resolved`, `needs_review`, and `unmatched` rows. Only `resolved` rows are safe to subscribe to automatically.
+The preparation action refreshes this snapshot before selecting stocks, and the instrument endpoint can refresh it independently. Only `resolved` rows are eligible for automatic subscription. Excluded rows retain a transparent reason so missing market-cap data is never treated as a pass.
 
 ## Upstox sign-in
 
@@ -84,9 +86,9 @@ cd backend
 .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-After signing in through the frontend, use the Market Workspace buttons to **Prepare 100 stocks** and **Start live feed**. The dashboard displays LTP, change, one-minute OHLCV, relative volume, spread, sector, and whether each value is live, cached, historical, or waiting.
+After signing in through the frontend, use the single **Prepare 139 stocks & start live** button. Preparation runs in the backend and automatically starts the live feed when it finishes, so there is no second action to remember. If the market is already closed, preparation still completes and the dashboard explains why streaming was not started. The dashboard displays LTP, change, one-minute OHLCV, relative volume, spread, sector, and whether each value is live, cached, historical, or waiting.
 
-One hundred stocks is the application default during the expanded evidence-collection phase (`QFAE_MARKET_PILOT_SIZE=100`). This is intentionally below the provider's Full-feed capacity while the local one-minute calculation and persistence latency is measured. Historical loading runs in the background and is throttled below Upstox's published standard-API limits. The dashboard shows its progress; the API endpoints remain available for diagnostics and future automation. The live session also subscribes to NIFTY 50, India VIX, and thirteen NIFTY sector indices so sector direction is measured from provider benchmarks rather than inferred from the equity universe.
+One hundred thirty-nine stocks is the application default during the expanded evidence-collection phase (`QFAE_MARKET_PILOT_SIZE=139`). The pilot is selected from the fresh eligible universe by latest completed-session traded value and then market cap. This remains below the provider's Full-feed capacity while local one-minute calculation and persistence latency is measured. Historical loading runs in the background and is throttled below Upstox's published standard-API limits. The dashboard shows its progress; the API endpoints remain available for diagnostics and future automation. The live session also subscribes to NIFTY 50, India VIX, and thirteen NIFTY sector indices so sector direction is measured from provider benchmarks rather than inferred from the equity universe.
 
 Each manually started live session schedules a backend safety stop for the normal NSE cash-market close at 3:30 PM IST. The API refuses to start a new normal live session after that time. Exchange holidays and announced special sessions will be handled by the future market-calendar controller.
 
@@ -106,13 +108,6 @@ Read the normalized state through:
 - `GET /api/v1/market/risk`
 - `GET /api/v1/market/regime`
 - `GET /api/v1/market/outcomes?session_date=YYYY-MM-DD`
-- `GET /api/v1/market/corporate-actions`
-- `GET /api/v1/market/corporate-action-assessments`
-- `GET /api/v1/market/adjusted-candles?instrument_key=NSE_EQ%7C...&interval=day`
-- `GET /api/v1/market/corporate-action-documents`
-- `GET /api/v1/market/corporate-action-ai`
-- `GET /api/v1/market/corporate-action-outcomes`
-- `GET /api/v1/market/corporate-action-calibration`
 - `POST /api/v1/market/financial-results/check?limit=100`
 - `GET /api/v1/market/financial-metrics`
 - `POST /api/v1/market/reconcile?session_date=YYYY-MM-DD`
@@ -129,15 +124,15 @@ The [validated evidence-confluence layer](docs/evidence-confluence.md) integrate
 
 The [volume and liquidity confirmation contract](docs/volume-liquidity-confirmation.md) combines RVOL and acceleration with spread and traded-value gates. High activity cannot be labelled confirmed when execution quality is rejected.
 
-The [decision-quality layer](docs/decision-quality-layer.md) adds two-of-three-minute signal persistence, D5 slippage/circuit/tradability checks, persistent market regime, point-in-time forward-outcome tracking, safe corporate-action adjustments, official filing evidence, optional citation-grounded AI interpretation, and event calibration. NSE surveillance synchronization, global context and mapped F&O confirmation remain explicit staged inputs rather than silently assumed data.
+The [decision-quality layer](docs/decision-quality-layer.md) adds two-of-three-minute signal persistence, D5 slippage/circuit/tradability checks, persistent market regime, and point-in-time forward-outcome tracking. NSE surveillance synchronization, global context and mapped F&O confirmation remain explicit staged inputs rather than silently assumed data.
 
-The [financial-result caching policy](docs/financial-result-caching.md) stores content-versioned quarterly and annual Upstox statements. **Prepare 100 stocks** and the dashboard utility reuse a latest-quarter snapshot for 30 days, while older-quarter, stale or missing data triggers a provider refresh.
+The [financial-result caching policy](docs/financial-result-caching.md) stores content-versioned quarterly and annual Upstox statements. **Prepare 139 stocks** and the dashboard utility reuse a latest-quarter snapshot for 30 days, while older-quarter, stale or missing data triggers a provider refresh.
 
 The [financial-metric layer](docs/financial-metrics.md) calculates versioned QoQ/YoY growth, margins, cash conversion, explicit debt measures, ROE/ROCE and EPS history. Available metrics now feed the bounded fundamental component of the provisional pilot score; missing fields reduce coverage instead of becoming favourable values.
 
 The dashboard exposes the latest stored values for every pilot stock in a dedicated **Financials (Qtrly/Yearly)** tab. It reads PostgreSQL when opened, stays outside the five-second live refresh, and does not trigger a provider refresh.
 
-Selecting a stock name in **Opportunity Ranking** opens a dynamic stock-detail tab. It combines the quote, rank explanation, market context, intraday technicals, relative strength, volume/liquidity, daily regime, validated evidence, financial metrics and corporate-action context in responsive cards rather than another wide table.
+Selecting a stock name in **Opportunity Ranking** opens a dynamic stock-detail tab. It combines the quote, rank explanation, market context, intraday technicals, relative strength, volume/liquidity, daily regime, validated evidence and financial metrics in responsive cards rather than another wide table.
 
 The top of **Opportunity Ranking** contains an interactive Apache ECharts Alpha Matrix for the complete active universe. It plots Opportunity Score against a provisional coverage-and-persistence confidence proxy, sizes bubbles by liquidity/execution quality, colours them by status, and links every bubble to the same stock-detail view.
 
@@ -145,6 +140,10 @@ The first preparation backfills configured daily and one-minute history into Pos
 
 Order placement, scoring, ML predictions, and automated trading are intentionally outside this phase.
 
-The approved candidate inputs are maintained in [the model factor register](docs/model-factor-register.md). Pilot-v1 implements only the available long-continuation inputs. Its direction, weights, thresholds and interactions remain provisional until point-in-time Indian-market backtesting supports calibration.
+The approved candidate inputs are maintained in [the model factor register](docs/model-factor-register.md). Pilot-v2 implements only the available long-continuation inputs. Its direction, weights, thresholds and interactions remain provisional until point-in-time Indian-market backtesting supports calibration.
 
-The approved [intraday focus-universe policy](docs/intraday-focus-universe.md) uses the first 30 minutes to form a provisional Focus list without discarding the rest of the 100-stock evidence universe. Background stocks remain monitored and recorded so late movers and early-leader failures remain measurable.
+The approved [intraday focus-universe policy](docs/intraday-focus-universe.md) uses the first 30 minutes to form a provisional Focus list without discarding the rest of the 139-stock evidence universe. Background stocks remain monitored and recorded so late movers and early-leader failures remain measurable.
+
+The same policy applies rolling tradability admission before intraday ranking. A stock must trade in at least 18 of the latest 20 NIFTY sessions; otherwise it is Dormant. A qualifying stock remains Watch-only unless its 20-session median traded value is at least Rs 5 crore and its rolling median spread is at most 25 bps. Daily execution-quality profiles are built from recorded minute evidence. Ranking additionally requires the live D5 depth to support a Rs 1 lakh order within 20 bps estimated worst-side slippage.
+
+Q-FAE accepts only normal NSE `EQ` company shares with market cap of at least Rs 500 crore and a completed close of at least Rs 20. SME series (`SM`, `ST`, and `SZ`), trade-for-trade series (`BE` and `BZ`), ETFs, other non-company instruments, suspended stocks, penny stocks, and stocks without sufficient official inputs are excluded before preparation. They cannot enter live subscriptions, evidence, ranking, or dashboard views.

@@ -13,8 +13,9 @@ router = APIRouter(prefix="/instruments", tags=["instruments"])
 def get_universe_service() -> EquityUniverseService:
     settings = get_settings()
     return EquityUniverseService(
-        stock_list_path=settings.qfae_stock_list_path,
         output_path=settings.qfae_equity_universe_path,
+        minimum_market_cap_crore=settings.qfae_min_market_cap_crore,
+        minimum_share_price_inr=settings.qfae_min_share_price_inr,
     )
 
 

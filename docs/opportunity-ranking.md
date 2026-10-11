@@ -1,6 +1,6 @@
 # Explainable opportunity ranking
 
-Q-FAE pilot-v1 ranks the 20 pilot stocks for **long-continuation research** after each completed market minute. It is an explainable deterministic baseline, not a trained prediction model or trading recommendation.
+Q-FAE pilot-v2 ranks the active pilot stocks for **long-continuation research** after each completed market minute. It is an explainable deterministic baseline, not a trained prediction model or trading recommendation.
 
 ## Provisional weights
 
@@ -10,8 +10,7 @@ Q-FAE pilot-v1 ranks the 20 pilot stocks for **long-continuation research** afte
 | Volume participation | 20% |
 | NIFTY and sector alignment | 20% |
 | Liquidity and execution | 15% |
-| Fundamental quality and growth | 10% |
-| Corporate catalyst | 5% |
+| Fundamental quality and growth | 15% |
 
 The values are configurable with the `QFAE_SCORE_WEIGHT_*` environment variables and normalized to 100. Every response records the effective weights and model version.
 

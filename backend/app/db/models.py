@@ -147,6 +147,25 @@ class EvidenceObservationRecord(Base):
     )
 
 
+class DailyExecutionQualityRecord(Base):
+    """One session's medians from recorded quote spread and visible D5 depth."""
+
+    __tablename__ = "daily_execution_quality"
+
+    instrument_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    session_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    median_spread_bps: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    median_buy_slippage_bps: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    median_sell_slippage_bps: Mapped[Decimal | None] = mapped_column(Numeric(18, 6))
+    observations: Mapped[int] = mapped_column(Integer, nullable=False)
+    calculated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("ix_daily_execution_quality_date", "session_date"),)
+
+
 class BacktestRunRecord(Base):
     """Saved assumptions and aggregate output for a reproducible research run."""
 

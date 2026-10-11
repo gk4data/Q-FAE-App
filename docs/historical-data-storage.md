@@ -14,7 +14,6 @@ The implemented foundation includes an Alembic-managed schema, idempotent candle
 - Use daily data for multi-horizon returns, moving-average regimes, ATR, breakouts, bases, relative strength, and other medium/long-term context.
 - Perform a one-time backfill, followed by a small overlapping incremental refresh of approximately 2–5 sessions.
 - Use an idempotent database upsert keyed by instrument key, interval, and timestamp.
-- Preserve raw and corporate-action-adjusted values, with adjustment/version metadata, when that layer is implemented.
 
 ### Raw one-minute OHLCV
 
@@ -67,16 +66,16 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 - Missing values must remain missing; they must not be silently converted to zero.
 - Calculations must record data-through time, source, adjustment status, and feature version.
 - Backtests must use only information available at that historical time and avoid survivorship/look-ahead bias.
-- Provider corrections, symbol changes, instrument-key changes, splits, bonuses, and other corporate actions must be handled without destroying the original observations.
+- Provider corrections, symbol changes, and instrument-key changes must be handled without destroying the original observations.
 - Daily history is broad and permanent; approved-universe raw minute history remains durable for reproducible backtesting.
 
 ## Capacity and operational limits
 
 PostgreSQL does not impose a small fixed database quota; practical capacity is governed by the host/Docker disk, write throughput, indexes, vacuuming and backup time. The local Docker database was approximately 48 MB at the start of the 100-stock phase, and its container filesystem reported approximately 950 GB available. These figures are observations, not reserved capacity or a storage guarantee.
 
-At 100 stocks and 375 normal NSE minutes, Q-FAE can create up to 37,500 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Both candles and evidence observations intended for backtesting now remain durable by default; retention and archival limits must be introduced deliberately as measured storage grows.
+At 139 stocks and 375 normal NSE minutes, Q-FAE can create up to 52,125 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Both candles and evidence observations intended for backtesting now remain durable by default; retention and archival limits must be introduced deliberately as measured storage grows.
 
-Before moving from 100 to 200 stocks:
+Before moving from 139 to 200 stocks:
 
 - record per-minute calculation and persistence latency;
 - add database-size, table-size, latest-evidence and disk-usage health reporting;
