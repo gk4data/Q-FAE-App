@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import re
 import threading
+import time
 from collections import deque
 from datetime import UTC, date, datetime, time as datetime_time, timedelta
 from typing import Any
 
 import upstox_client
+import psutil
 
 from app.core.config import Settings
 from app.db.repository import HistoricalMarketRepository
 from app.models.backtest import BacktestRun, BacktestRunListItem, BacktestRunRequest
 from app.models.market import (
     Candle,
+    CompactEvidenceObservation,
     CorporateFinancialContext,
     DailyReconciliationRecord,
     DailyRegimeSnapshot,
@@ -23,7 +27,9 @@ from app.models.market import (
     FinancialResultAvailability,
     FinancialResultCheckReport,
     FinancialMetricSnapshot,
+    FocusTransition,
     FlowLiquidityConfirmation,
+    IntradayFocusState,
     LiveSnapshot,
     MarketContext,
     MinuteOfDayProfile,
@@ -44,12 +50,19 @@ from app.services.daily_regime import (
 from app.services.backtesting import OpportunityBacktester
 from app.services.equity_universe import EquityUniverseService, NSE_MAINBOARD_EQUITY_SERIES
 from app.services.evidence_integration import build_opportunity_evidence
+from app.services.evidence_retention import (
+    build_compact_evidence_observation,
+    compact_checkpoint_due,
+    compact_state_key,
+    opportunity_priority,
+)
 from app.services.flow_confirmation import build_flow_liquidity_confirmation
 from app.services.financial_results import (
     context_from_financial_snapshot,
     snapshot_is_reusable,
 )
 from app.services.financial_metrics import calculate_financial_metrics
+from app.services.focus_universe import evaluate_focus_state
 from app.services.opportunity_scoring import build_opportunity_score, rank_opportunities
 from app.services.market_regime import build_market_regime
 from app.services.market_features import build_stock_features
@@ -62,7 +75,7 @@ from app.services.market_state import MarketStateStore
 from app.services.risk_gates import build_risk_assessment
 from app.services.signal_persistence import build_signal_persistence
 from app.services.session_reconciliation import reconcile_session
-from app.services.upstox_auth import TokenCache
+from app.services.upstox_auth import TokenCache, analytics_access_token
 from app.services.upstox_market import (
     MARKET_CONTEXT_KEYS,
     MARKET_CONTEXT_SYMBOLS,
@@ -199,6 +212,8 @@ class MarketRuntime:
         self.historical_repository = historical_repository
         self._lock = threading.RLock()
         self._bootstrap_thread: threading.Thread | None = None
+        self._enrichment_thread: threading.Thread | None = None
+        self._enrichment_cancel = threading.Event()
         self._stream_thread: threading.Thread | None = None
         self._session_backfill_thread: threading.Thread | None = None
         self._session_backfill_cancel: threading.Event | None = None
@@ -210,7 +225,10 @@ class MarketRuntime:
         self._context_calculation_lock = threading.Lock()
         self._evidence_thread: threading.Thread | None = None
         self._evidence_queue: deque[tuple[Any, ...]] = deque()
+        self._compact_evidence_states: dict[str, tuple[date, tuple[object, ...]]] = {}
+        self._focus_states: dict[str, IntradayFocusState] = {}
         self._market_close_timer: threading.Timer | None = None
+        self._market_open_timer: threading.Timer | None = None
         self._reconciliation_schedule_timer: threading.Timer | None = None
         self._reconciliation_monitor_timer: threading.Timer | None = None
         self._automatic_reconciliation_attempts = 0
@@ -219,8 +237,12 @@ class MarketRuntime:
         self._symbols: dict[str, str] = {}
         self._spread_history_cache: dict[str, list[float]] = {}
         self._spread_history_cache_at: datetime | None = None
+        self._liquidity_decision_cache: dict[str, LiquidityUniverseDecision] = {}
+        self._liquidity_decision_cache_at: datetime | None = None
+        self._liquidity_decision_cache_keys: tuple[str, ...] = ()
         self._bootstrap: dict[str, Any] = {
             "state": "idle",
+            "phase": "idle",
             "total": 0,
             "processed": 0,
             "history_loaded": 0,
@@ -239,6 +261,20 @@ class MarketRuntime:
             "auto_start_live": False,
             "live_start_error": None,
         }
+        self._enrichment: dict[str, Any] = {
+            "state": "idle",
+            "total": 0,
+            "processed": 0,
+            "daily_refreshed": 0,
+            "minute_profiles_built": 0,
+            "sectors_loaded": 0,
+            "financial_processed": 0,
+            "errors": 0,
+            "started_at": None,
+            "finished_at": None,
+            "recent_errors": [],
+            "pause_reason": None,
+        }
         self._live: dict[str, Any] = {
             "state": "stopped",
             "connected": False,
@@ -249,6 +285,12 @@ class MarketRuntime:
             "last_message_at": None,
             "last_context_at": None,
             "last_evidence_at": None,
+            "last_full_evidence_saved": 0,
+            "last_compact_evidence_saved": 0,
+            "last_focus_transitions_saved": 0,
+            "focus_count": 0,
+            "cooling_count": 0,
+            "background_count": 0,
             "evidence_queue_depth": 0,
             "backfill_state": "idle",
             "backfill_total": 0,
@@ -260,6 +302,7 @@ class MarketRuntime:
             "backfill_finished_at": None,
             "backfill_recent_errors": [],
             "scheduled_stop_at": None,
+            "scheduled_start_at": None,
             "error": None,
         }
         self._reconciliation: dict[str, Any] = {
@@ -293,25 +336,32 @@ class MarketRuntime:
             database_available = False
         with self._lock:
             bootstrap = dict(self._bootstrap)
+            enrichment = dict(self._enrichment)
             live = dict(self._live)
             reconciliation = dict(self._reconciliation)
         liquidity_universe = {"active": 0, "watch_only": 0, "dormant": 0}
+        approved_universe_size = 0
         if redis_available and bootstrap["state"] != "running":
             try:
                 instruments = self._resolved_instruments(None)
                 decisions = self._liquidity_decisions(instruments)
                 keys = [instrument["instrument_key"] for instrument in instruments]
+                approved_universe_size = len(keys)
                 sectors = self.state_store.get_sectors()
+                minute_histories = self.state_store.get_candles_many(keys, limit=1)
+                daily_histories = self.state_store.get_daily_candles_many(keys, limit=1)
                 benchmark_keys = tuple(dict.fromkeys((NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())))
+                benchmark_histories = self.state_store.get_daily_candles_many(
+                    benchmark_keys,
+                    limit=1,
+                )
                 bootstrap.update(
                     {
                         "total": len(keys),
-                        "history_loaded": sum(self.state_store.has_candles(key) for key in keys),
-                        "daily_history_loaded": sum(
-                            self.state_store.has_daily_candles(key) for key in keys
-                        ),
+                        "history_loaded": sum(bool(minute_histories.get(key)) for key in keys),
+                        "daily_history_loaded": sum(bool(daily_histories.get(key)) for key in keys),
                         "benchmark_daily_loaded": sum(
-                            self.state_store.has_daily_candles(key) for key in benchmark_keys
+                            bool(benchmark_histories.get(key)) for key in benchmark_keys
                         ),
                         "sectors_loaded": sum(key in sectors for key in keys),
                     }
@@ -343,17 +393,18 @@ class MarketRuntime:
                 pass
         return {
             "cadence_seconds": self.settings.qfae_market_snapshot_interval_seconds,
-            "pilot_size": self.settings.qfae_market_pilot_size,
+            "approved_universe_size": approved_universe_size or bootstrap["total"],
             "redis_available": redis_available,
             "database_available": database_available,
             "liquidity_universe": liquidity_universe,
             "bootstrap": bootstrap,
+            "enrichment": enrichment,
             "live": live,
             "reconciliation": reconciliation,
         }
 
     def get_watchlist(self, limit: int | None = None) -> list[WatchlistItem]:
-        """Build a compact view of cached historical and live data for the pilot universe."""
+        """Build a compact view of cached historical and live data for the approved universe."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
         liquidity_decisions = self._liquidity_decisions(instruments)
@@ -363,6 +414,9 @@ class MarketRuntime:
         }
         sectors = self.state_store.get_sectors()
         relative_volumes = self.state_store.get_relative_volumes()
+        instrument_keys = [instrument["instrument_key"] for instrument in instruments]
+        latest_minutes = self.state_store.get_candles_many(instrument_keys, limit=1)
+        recent_daily = self.state_store.get_daily_candles_many(instrument_keys, limit=2)
         with self._lock:
             live_connected = bool(self._live["connected"])
         rows: list[WatchlistItem] = []
@@ -373,14 +427,14 @@ class MarketRuntime:
             snapshot = snapshots.get(key)
             candle = snapshot.current_candle if snapshot and snapshot.current_candle else None
             if candle is None:
-                latest = self.state_store.get_candles(key, limit=1)
+                latest = latest_minutes.get(key, [])
                 candle = latest[-1] if latest else None
             ltp = snapshot.ltp if snapshot and snapshot.ltp is not None else (
                 candle.close if candle else None
             )
             previous_close = snapshot.previous_close if snapshot else None
             if previous_close is None:
-                daily_history = self.state_store.get_daily_candles(key, limit=2)
+                daily_history = recent_daily.get(key, [])
                 reference_date = (
                     candle.timestamp.astimezone(INDIA_TIMEZONE).date()
                     if candle is not None
@@ -550,7 +604,10 @@ class MarketRuntime:
         """Return validated feature families and their stored point-in-time score."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
-        active_keys = self._active_liquidity_keys(instruments)
+        liquidity_decisions = self._liquidity_decisions(instruments)
+        observed_keys = {
+            key for key, decision in liquidity_decisions.items() if decision.tier != "dormant"
+        }
         features = self.state_store.get_features()
         regimes = self.state_store.get_daily_regimes()
         context = self.state_store.get_context()
@@ -559,14 +616,23 @@ class MarketRuntime:
         signals = self.state_store.get_signals()
         risks = self.state_store.get_risk_assessments()
         for instrument in instruments:
-            if instrument["instrument_key"] not in active_keys:
+            instrument_key = instrument["instrument_key"]
+            if instrument_key not in observed_keys:
                 continue
-            feature = features.get(instrument["instrument_key"])
+            feature = features.get(instrument_key)
             if feature is None:
                 continue
+            liquidity = liquidity_decisions[instrument_key]
             cached = self.state_store.get_evidence_history(feature.instrument_key, 1)
             if cached and cached[-1].as_of == feature.as_of:
-                rows.append(cached[-1])
+                rows.append(
+                    cached[-1].model_copy(
+                        update={
+                            "liquidity_tier": liquidity.tier,
+                            "liquidity_tier_reason": liquidity.reason,
+                        }
+                    )
+                )
                 continue
             flow_liquidity = self._build_flow_confirmation(feature)
             evidence = build_opportunity_evidence(
@@ -582,6 +648,8 @@ class MarketRuntime:
                     update={
                         "signal_persistence": signals.get(feature.instrument_key),
                         "risk_assessment": risks.get(feature.instrument_key),
+                        "liquidity_tier": liquidity.tier,
+                        "liquidity_tier_reason": liquidity.reason,
                     }
                 )
             )
@@ -612,7 +680,7 @@ class MarketRuntime:
             for key, feature in features.items()
         }
         try:
-            return rank_opportunities(
+            ranked = rank_opportunities(
                 evidence,
                 self._latest_financial_metrics_by_instrument(),
                 {
@@ -635,6 +703,48 @@ class MarketRuntime:
                 },
                 weights=self._opportunity_scoring_weights(),
             )
+            with self._lock:
+                focus_states = dict(self._focus_states)
+            classified: list[RankedOpportunity] = []
+            for item in ranked:
+                focus = focus_states.get(item.instrument_key)
+                fallback_state = (
+                    item.liquidity_tier
+                    if item.liquidity_tier in {"watch_only", "dormant"}
+                    else "background"
+                )
+                classified.append(
+                    item.model_copy(
+                        update={
+                            "rank": None,
+                            "focus_state": focus.state if focus else fallback_state,
+                            "focus_reasons": (
+                                focus.reasons
+                                if focus
+                                else ["awaiting_focus_confirmation"]
+                            ),
+                            "focus_since": focus.state_since if focus else None,
+                        }
+                    )
+                )
+            classified.sort(
+                key=lambda item: (
+                    {"focus": 0, "cooling": 1}.get(item.focus_state, 2),
+                    not item.score.eligible,
+                    -item.score.final_score,
+                    -item.score.coverage_percent,
+                    item.symbol,
+                )
+            )
+            focus_rank = 0
+            result: list[RankedOpportunity] = []
+            for item in classified:
+                rank = None
+                if item.focus_state in {"focus", "cooling"} and item.score.eligible:
+                    focus_rank += 1
+                    rank = focus_rank
+                result.append(item.model_copy(update={"rank": rank}))
+            return result
         except ValueError as exc:
             raise MarketRuntimeError(f"Opportunity scoring configuration is invalid: {exc}") from exc
 
@@ -698,10 +808,13 @@ class MarketRuntime:
         self,
         limit: int | None = None,
     ) -> FinancialResultCheckReport:
-        """Check the pilot universe, reusing latest-quarter snapshots younger than the cache window."""
+        """Check a bounded batch, reusing recent latest-quarter snapshots."""
         if self.historical_repository is None:
             raise MarketRuntimeError("PostgreSQL historical storage is not configured")
-        instruments = self._resolved_instruments(limit)
+        instruments = self._financial_refresh_batch(
+            self._resolved_instruments(None),
+            limit or self.settings.qfae_enrichment_financial_limit_per_run,
+        )
         limiter = RequestRateLimiter(
             self.settings.qfae_market_request_rate_per_second,
             self.settings.qfae_market_request_rate_per_minute,
@@ -813,6 +926,17 @@ class MarketRuntime:
     ) -> dict[str, Any]:
         self._require_access_token()
         self._require_state_store()
+        if self.historical_repository is not None:
+            try:
+                database_available = self.historical_repository.ping()
+            except Exception as exc:
+                raise MarketRuntimeError(
+                    "PostgreSQL is unavailable; start it before preparing the market session"
+                ) from exc
+            if not database_available:
+                raise MarketRuntimeError(
+                    "PostgreSQL is unavailable; start it before preparing the market session"
+                )
         universe_warning: str | None = None
         refresh_universe = getattr(self.universe_service, "refresh", None)
         if callable(refresh_universe):
@@ -832,10 +956,14 @@ class MarketRuntime:
         with self._lock:
             if self._bootstrap_thread and self._bootstrap_thread.is_alive():
                 raise MarketRuntimeError("Pre-market bootstrap is already running")
+            if self._enrichment_thread and self._enrichment_thread.is_alive():
+                raise MarketRuntimeError("Background market-data enrichment is already running")
             if self._reconciliation_thread and self._reconciliation_thread.is_alive():
                 raise MarketRuntimeError("After-market reconciliation is running")
+            self._enrichment_cancel = threading.Event()
             self._bootstrap = {
                 "state": "running",
+                "phase": "admission_cache",
                 "total": len(instruments),
                 "processed": 0,
                 "history_loaded": 0,
@@ -854,6 +982,20 @@ class MarketRuntime:
                 "universe_warning": universe_warning,
                 "auto_start_live": auto_start_live,
                 "live_start_error": None,
+            }
+            self._enrichment = {
+                "state": "waiting",
+                "total": len(instruments),
+                "processed": 0,
+                "daily_refreshed": 0,
+                "minute_profiles_built": 0,
+                "sectors_loaded": 0,
+                "financial_processed": 0,
+                "errors": 0,
+                "started_at": None,
+                "finished_at": None,
+                "recent_errors": [],
+                "pause_reason": None,
             }
             self._bootstrap_thread = threading.Thread(
                 target=self._run_bootstrap,
@@ -1022,6 +1164,7 @@ class MarketRuntime:
                 list(equity_keys), session_date, session_date
             )
             self._spread_history_cache_at = None
+            self._liquidity_decision_cache_at = None
             with self._lock:
                 self._reconciliation["state"] = "completed"
         except Exception as exc:
@@ -1041,49 +1184,20 @@ class MarketRuntime:
         instruments: list[dict[str, str]],
         auto_start_live: bool = False,
     ) -> None:
+        """Build only the admission cache before handing control to the live feed.
+
+        Full history, sectors and financial statements are deliberately excluded
+        from this blocking path. They are refreshed later by the bounded
+        enrichment worker so a large universe cannot delay the market stream for
+        hours or retain millions of candle objects in the API process.
+        """
         limiter = RequestRateLimiter(
             self.settings.qfae_market_request_rate_per_second,
             self.settings.qfae_market_request_rate_per_minute,
         )
         try:
+            self._hydrate_daily_admission_cache(instruments)
             with UpstoxMarketDataClient(self._require_access_token(), limiter) as client:
-                for instrument in instruments:
-                    errors: list[str] = []
-                    daily_history_loaded = False
-                    sector_loaded = False
-                    history_loaded, minute_persisted, profile_built, minute_errors = (
-                        self._prepare_minute_history(client, instrument["instrument_key"])
-                    )
-                    errors.extend(f"{instrument['symbol']}: {error}" for error in minute_errors)
-
-                    daily_history_loaded, daily_history_persisted, daily_errors = (
-                        self._prepare_daily_history(client, instrument["instrument_key"])
-                    )
-                    errors.extend(f"{instrument['symbol']}: {error}" for error in daily_errors)
-
-                    isin = instrument.get("isin")
-                    if isin:
-                        try:
-                            sector = client.fetch_sector(isin)
-                            if sector:
-                                self.state_store.save_sector(instrument["instrument_key"], sector)
-                                sector_loaded = True
-                        except Exception as exc:
-                            errors.append(f"{instrument['symbol']}: sector: {exc}")
-
-                    with self._lock:
-                        self._bootstrap["processed"] += 1
-                        self._bootstrap["history_loaded"] += int(history_loaded)
-                        self._bootstrap["minute_history_persisted"] += int(minute_persisted)
-                        self._bootstrap["minute_profiles_built"] += int(profile_built)
-                        self._bootstrap["daily_history_loaded"] += int(daily_history_loaded)
-                        self._bootstrap["daily_history_persisted"] += int(daily_history_persisted)
-                        self._bootstrap["sectors_loaded"] += int(sector_loaded)
-                        self._bootstrap["errors"] += len(errors)
-                        if errors:
-                            self._bootstrap["recent_errors"] = (
-                                self._bootstrap["recent_errors"] + errors
-                            )[-25:]
                 benchmark_keys = (NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())
                 for instrument_key in dict.fromkeys(benchmark_keys):
                     loaded, _, errors = self._prepare_daily_history(client, instrument_key)
@@ -1098,79 +1212,296 @@ class MarketRuntime:
                                 self._bootstrap["recent_errors"]
                                 + [f"{label}: {error}" for error in errors]
                             )[-25:]
-                financial_counts, financial_errors = self._sync_bootstrap_financial_results(
-                    client, instruments
-                )
+
+            decisions = self._liquidity_decisions(instruments)
+            live_instruments = [
+                item
+                for item in instruments
+                if decisions[item["instrument_key"]].tier != "dormant"
+            ]
+            if not live_instruments:
+                # A new database has no 20-session admission history yet. Keep
+                # collecting the provider universe, while the risk layer still
+                # marks these unclassified stocks ineligible for ranking.
+                live_instruments = list(instruments)
                 with self._lock:
-                    for key, value in financial_counts.items():
-                        self._bootstrap[key] += value
-                    self._bootstrap["errors"] += len(financial_errors)
-                    if financial_errors:
-                        self._bootstrap["recent_errors"] = (
-                            self._bootstrap["recent_errors"] + financial_errors
-                        )[-25:]
-                repository = self.historical_repository
-                if repository is not None:
-                    try:
-                        today = datetime.now(INDIA_TIMEZONE).date()
-                        repository.refresh_daily_execution_quality(
-                            [item["instrument_key"] for item in instruments],
-                            today - timedelta(days=45),
-                            today - timedelta(days=1),
-                        )
-                        self._spread_history_cache_at = None
-                    except Exception as exc:
-                        with self._lock:
-                            self._bootstrap["errors"] += 1
-                            self._bootstrap["recent_errors"] = (
-                                self._bootstrap["recent_errors"]
-                                + [f"execution quality profiles: {exc}"]
-                            )[-25:]
-            self._calculate_daily_regimes(datetime.now(UTC))
+                    self._bootstrap["universe_warning"] = (
+                        "Rolling liquidity history is unavailable; collecting the approved "
+                        "universe as watch-only while background enrichment builds admission data"
+                    )
+
             with self._lock:
-                self._bootstrap["state"] = "completed"
+                self._bootstrap["phase"] = "starting_live"
+                self._bootstrap["processed"] = len(instruments)
             if auto_start_live:
                 try:
-                    self.start_live(len(instruments))
+                    self.arm_or_start_live(prepared_instruments=live_instruments)
                 except Exception as exc:
-                    logger.exception("Live feed did not start after market preparation")
+                    logger.exception("Live feed did not start after fast market preparation")
                     with self._lock:
                         self._bootstrap["live_start_error"] = str(exc)
+            with self._lock:
+                self._bootstrap["state"] = "completed"
+                if self._live["connected"]:
+                    self._bootstrap["phase"] = "live_started"
+                elif self._live["state"] == "scheduled":
+                    self._bootstrap["phase"] = "live_scheduled"
+                elif self._live["state"] == "not_trading_day":
+                    self._bootstrap["phase"] = "not_trading_day"
+                elif self._live["state"] == "market_closed":
+                    self._bootstrap["phase"] = "market_closed"
+                else:
+                    self._bootstrap["phase"] = "ready"
+                self._bootstrap["finished_at"] = datetime.now(UTC).isoformat()
+            self._start_background_enrichment(instruments, decisions)
         except Exception as exc:
             logger.exception("Pre-market bootstrap stopped unexpectedly")
             with self._lock:
                 self._bootstrap["state"] = "failed"
+                self._bootstrap["phase"] = "failed"
                 self._bootstrap["recent_errors"] = (
                     self._bootstrap["recent_errors"] + [f"bootstrap: {exc}"]
                 )[-25:]
                 self._bootstrap["errors"] += 1
         finally:
             with self._lock:
-                self._bootstrap["finished_at"] = datetime.now(UTC).isoformat()
+                if self._bootstrap["finished_at"] is None:
+                    self._bootstrap["finished_at"] = datetime.now(UTC).isoformat()
 
-    def _sync_bootstrap_financial_results(
+    def _hydrate_daily_admission_cache(
         self,
-        client: UpstoxMarketDataClient,
         instruments: list[dict[str, str]],
-    ) -> tuple[dict[str, int], list[str]]:
-        """Refresh reusable quarterly/annual snapshots after price history is durable."""
-        counters = {
-            "financial_results_fetched": 0,
-            "financial_results_reused": 0,
+    ) -> None:
+        """Hydrate only the rolling admission window from PostgreSQL in small batches."""
+        repository = self.historical_repository
+        if repository is None:
+            return
+        batch_size = self.settings.qfae_bootstrap_batch_size
+        history_limit = self.settings.qfae_bootstrap_admission_history_sessions
+        keys = [item["instrument_key"] for item in instruments]
+        profile_keys = repository.get_profile_instrument_keys(keys)
+        sectors = self.state_store.get_sectors()
+        with self._lock:
+            self._bootstrap["minute_profiles_built"] = len(profile_keys)
+            self._bootstrap["sectors_loaded"] = sum(key in sectors for key in keys)
+        for offset in range(0, len(keys), batch_size):
+            batch_keys = keys[offset : offset + batch_size]
+            histories = repository.get_candles_many(batch_keys, "day", history_limit)
+            loaded = 0
+            for candles in histories.values():
+                if candles:
+                    self.state_store.save_daily_candles(candles)
+                    loaded += 1
+            with self._lock:
+                self._bootstrap["daily_history_loaded"] += loaded
+                self._bootstrap["daily_history_persisted"] += loaded
+            del histories
+            gc.collect()
+
+    def _start_background_enrichment(
+        self,
+        instruments: list[dict[str, str]],
+        decisions: dict[str, LiquidityUniverseDecision],
+    ) -> None:
+        with self._lock:
+            self._enrichment["state"] = "waiting_for_live_backfill"
+            self._enrichment_thread = threading.Thread(
+                target=self._run_background_enrichment,
+                args=(instruments, decisions, self._enrichment_cancel),
+                name="qfae-background-enrichment",
+                daemon=True,
+            )
+            self._enrichment_thread.start()
+
+    def _run_background_enrichment(
+        self,
+        instruments: list[dict[str, str]],
+        decisions: dict[str, LiquidityUniverseDecision],
+        cancel_event: threading.Event,
+    ) -> None:
+        """Incrementally enrich the universe without blocking live collection."""
+        while not cancel_event.is_set():
+            with self._lock:
+                backfill_state = self._live.get("backfill_state")
+            if backfill_state not in {"waiting_for_stream", "running"}:
+                break
+            time.sleep(2)
+        if cancel_event.is_set():
+            self._finish_enrichment("cancelled")
+            return
+
+        repository = self.historical_repository
+        keys = [item["instrument_key"] for item in instruments]
+        profile_keys = repository.get_profile_instrument_keys(keys) if repository else set()
+        sectors = self.state_store.get_sectors()
+        financial_candidates = {
+            item["instrument_key"]
+            for item in self._financial_refresh_batch(
+                [
+                    item
+                    for item in instruments
+                    if decisions[item["instrument_key"]].tier != "dormant"
+                ],
+                self.settings.qfae_enrichment_financial_limit_per_run,
+            )
         }
-        if self.historical_repository is None:
-            return counters, []
-        errors: list[str] = []
-        for instrument in instruments:
-            try:
-                status, _ = self._sync_financial_result(client, instrument)
-                counters["financial_results_fetched"] += int(status.state == "fetched")
-                counters["financial_results_reused"] += int(status.state == "reused")
-            except Exception as exc:
-                errors.append(
-                    f"{instrument['symbol']}: financial results: {type(exc).__name__}"
+        limiter = RequestRateLimiter(
+            self.settings.qfae_market_request_rate_per_second,
+            self.settings.qfae_market_request_rate_per_minute,
+        )
+        with self._lock:
+            self._enrichment["state"] = "running"
+            self._enrichment["started_at"] = datetime.now(UTC).isoformat()
+
+        try:
+            with UpstoxMarketDataClient(self._require_access_token(), limiter) as client:
+                batch_size = self.settings.qfae_bootstrap_batch_size
+                for offset in range(0, len(instruments), batch_size):
+                    if cancel_event.is_set():
+                        self._finish_enrichment("cancelled")
+                        return
+                    pressure = self._memory_pressure_reason()
+                    if pressure:
+                        with self._lock:
+                            self._enrichment["pause_reason"] = pressure
+                        self._finish_enrichment("paused_memory")
+                        return
+
+                    batch = instruments[offset : offset + batch_size]
+                    for instrument in batch:
+                        if cancel_event.is_set():
+                            self._finish_enrichment("cancelled")
+                            return
+                        key = instrument["instrument_key"]
+                        errors: list[str] = []
+                        daily_loaded, _, daily_errors = self._prepare_daily_history(client, key)
+                        errors.extend(f"{instrument['symbol']}: {error}" for error in daily_errors)
+                        profile_built = False
+                        if decisions[key].tier != "dormant" and key not in profile_keys:
+                            _, _, profile_built, minute_errors = self._prepare_minute_history(
+                                client,
+                                key,
+                                hydrate_cache=False,
+                            )
+                            errors.extend(
+                                f"{instrument['symbol']}: {error}" for error in minute_errors
+                            )
+                            if profile_built:
+                                profile_keys.add(key)
+
+                        sector_loaded = False
+                        if key not in sectors and instrument.get("isin"):
+                            try:
+                                sector = client.fetch_sector(instrument["isin"])
+                                if sector:
+                                    self.state_store.save_sector(key, sector)
+                                    sectors[key] = sector
+                                    sector_loaded = True
+                            except Exception as exc:
+                                errors.append(f"{instrument['symbol']}: sector: {type(exc).__name__}")
+
+                        financial_processed = False
+                        if key in financial_candidates:
+                            try:
+                                status, _ = self._sync_financial_result(client, instrument)
+                                financial_processed = True
+                                with self._lock:
+                                    self._bootstrap["financial_results_fetched"] += int(
+                                        status.state == "fetched"
+                                    )
+                                    self._bootstrap["financial_results_reused"] += int(
+                                        status.state == "reused"
+                                    )
+                            except Exception as exc:
+                                errors.append(
+                                    f"{instrument['symbol']}: financial results: {type(exc).__name__}"
+                                )
+
+                        with self._lock:
+                            self._enrichment["processed"] += 1
+                            self._enrichment["daily_refreshed"] += int(daily_loaded)
+                            self._enrichment["minute_profiles_built"] += int(profile_built)
+                            self._enrichment["sectors_loaded"] += int(sector_loaded)
+                            self._enrichment["financial_processed"] += int(financial_processed)
+                            self._enrichment["errors"] += len(errors)
+                            if errors:
+                                self._enrichment["recent_errors"] = (
+                                    self._enrichment["recent_errors"] + errors
+                                )[-25:]
+                    if repository is not None:
+                        today = datetime.now(INDIA_TIMEZONE).date()
+                        try:
+                            repository.refresh_daily_execution_quality(
+                                [item["instrument_key"] for item in batch],
+                                today - timedelta(days=45),
+                                today - timedelta(days=1),
+                            )
+                        except Exception as exc:
+                            with self._lock:
+                                self._enrichment["errors"] += 1
+                                self._enrichment["recent_errors"] = (
+                                    self._enrichment["recent_errors"]
+                                    + [f"execution quality batch: {type(exc).__name__}"]
+                                )[-25:]
+                    self._spread_history_cache_at = None
+                    self._liquidity_decision_cache_at = None
+                    gc.collect()
+            if not cancel_event.is_set():
+                active_instruments = [
+                    item for item in instruments if decisions[item["instrument_key"]].tier != "dormant"
+                ]
+                self._calculate_daily_regimes(
+                    datetime.now(UTC),
+                    instruments=active_instruments,
                 )
-        return counters, errors
+                self._finish_enrichment("completed")
+        except Exception as exc:
+            logger.exception("Background market-data enrichment stopped unexpectedly")
+            with self._lock:
+                self._enrichment["errors"] += 1
+                self._enrichment["recent_errors"] = (
+                    self._enrichment["recent_errors"]
+                    + [f"enrichment: {type(exc).__name__}"]
+                )[-25:]
+            self._finish_enrichment("failed")
+
+    def _memory_pressure_reason(self) -> str | None:
+        available_mb = psutil.virtual_memory().available / (1024 * 1024)
+        minimum_mb = self.settings.qfae_memory_min_available_mb
+        if available_mb < minimum_mb:
+            return (
+                f"Available system memory is {available_mb:.0f} MB; "
+                f"enrichment requires at least {minimum_mb} MB"
+            )
+        return None
+
+    def _finish_enrichment(self, state: str) -> None:
+        with self._lock:
+            self._enrichment["state"] = state
+            self._enrichment["finished_at"] = datetime.now(UTC).isoformat()
+
+    def _financial_refresh_batch(
+        self,
+        instruments: list[dict[str, str]],
+        limit: int,
+    ) -> list[dict[str, str]]:
+        """Prioritise never-checked and oldest financial snapshots."""
+        if limit <= 0 or not instruments:
+            return []
+        repository = self.historical_repository
+        if repository is None:
+            return instruments[:limit]
+        recency = repository.get_financial_result_recency(
+            [item["instrument_key"] for item in instruments]
+        )
+        never_checked = datetime.min.replace(tzinfo=UTC)
+        return sorted(
+            instruments,
+            key=lambda item: (
+                recency.get(item["instrument_key"], never_checked),
+                item["symbol"],
+            ),
+        )[:limit]
 
     def _sync_financial_result(
         self,
@@ -1258,6 +1589,8 @@ class MarketRuntime:
         self,
         client: UpstoxMarketDataClient,
         instrument_key: str,
+        *,
+        hydrate_cache: bool = True,
     ) -> tuple[bool, bool, bool, list[str]]:
         """Hydrate Redis and refresh bounded minute history and its rolling profile."""
         errors: list[str] = []
@@ -1270,7 +1603,7 @@ class MarketRuntime:
                     "1minute",
                     self._history_limit(),
                 )
-                if stored:
+                if stored and hydrate_cache:
                     self.state_store.save_candles(stored)
             except Exception as exc:
                 errors.append(f"minute database read: {exc}")
@@ -1287,7 +1620,8 @@ class MarketRuntime:
                 self.settings.qfae_market_history_days,
                 from_date=from_date,
             )
-            self.state_store.save_candles(downloaded)
+            if hydrate_cache:
+                self.state_store.save_candles(downloaded)
         except Exception as exc:
             errors.append(f"minute history: {exc}")
 
@@ -1357,20 +1691,142 @@ class MarketRuntime:
                 errors.append(f"database write: {exc}")
         return bool(stored or downloaded), persisted, errors
 
-    def start_live(self, limit: int | None = None) -> dict[str, Any]:
-        now = datetime.now(INDIA_TIMEZONE)
-        market_close = nse_market_close_at(now)
-        if now >= market_close:
-            raise MarketRuntimeError("The NSE cash market is closed after 3:30 PM IST")
+    def arm_or_start_live(
+        self,
+        *,
+        prepared_instruments: list[dict[str, str]],
+        now: datetime | None = None,
+        session_window: tuple[datetime, datetime] | None = None,
+    ) -> dict[str, Any]:
+        """Start now during an NSE session or arm the prepared feed for its open."""
+        now = (now or datetime.now(INDIA_TIMEZONE)).astimezone(INDIA_TIMEZONE)
         token = self._require_access_token()
         self._require_state_store()
-        instruments = self._resolved_instruments(limit)
+        if session_window is None:
+            with UpstoxMarketDataClient(token) as client:
+                session_window = client.fetch_nse_market_session(now.date())
+        if session_window is None:
+            with self._lock:
+                self._live.update(
+                    {
+                        "state": "not_trading_day",
+                        "connected": False,
+                        "subscribed": 0,
+                        "scheduled_start_at": None,
+                        "scheduled_stop_at": None,
+                        "error": None,
+                    }
+                )
+                return dict(self._live)
+
+        market_open, market_close = session_window
+        if now >= market_close:
+            with self._lock:
+                self._live.update(
+                    {
+                        "state": "market_closed",
+                        "connected": False,
+                        "subscribed": 0,
+                        "scheduled_start_at": None,
+                        "scheduled_stop_at": None,
+                        "error": None,
+                    }
+                )
+                return dict(self._live)
+        if now >= market_open:
+            return self.start_live(
+                prepared_instruments=prepared_instruments,
+                now=now,
+                session_window=session_window,
+            )
+
+        with self._lock:
+            if self._market_open_timer is not None:
+                self._market_open_timer.cancel()
+            delay_seconds = max(0.0, (market_open - now).total_seconds())
+            timer = threading.Timer(
+                delay_seconds,
+                self._start_scheduled_live,
+                args=(list(prepared_instruments), session_window),
+            )
+            timer.name = "qfae-market-open"
+            timer.daemon = True
+            self._market_open_timer = timer
+            self._live.update(
+                {
+                    "state": "scheduled",
+                    "connected": False,
+                    "subscribed": 0,
+                    "scheduled_start_at": market_open.isoformat(),
+                    "scheduled_stop_at": market_close.isoformat(),
+                    "error": None,
+                }
+            )
+            timer.start()
+            return dict(self._live)
+
+    def _start_scheduled_live(
+        self,
+        prepared_instruments: list[dict[str, str]],
+        session_window: tuple[datetime, datetime],
+    ) -> None:
+        with self._lock:
+            self._market_open_timer = None
+        try:
+            self.start_live(
+                prepared_instruments=prepared_instruments,
+                session_window=session_window,
+            )
+            logger.info("Upstox live feed started automatically at the NSE market open")
+        except Exception as exc:
+            logger.exception("Could not start the prepared live feed at market open")
+            with self._lock:
+                self._live["state"] = "start_failed"
+                self._live["connected"] = False
+                self._live["scheduled_start_at"] = None
+                self._live["error"] = str(exc)
+                self._bootstrap["phase"] = "ready"
+                self._bootstrap["live_start_error"] = str(exc)
+
+    def start_live(
+        self,
+        limit: int | None = None,
+        *,
+        prepared_instruments: list[dict[str, str]] | None = None,
+        now: datetime | None = None,
+        session_window: tuple[datetime, datetime] | None = None,
+    ) -> dict[str, Any]:
+        now = (now or datetime.now(INDIA_TIMEZONE)).astimezone(INDIA_TIMEZONE)
+        token = self._require_access_token()
+        self._require_state_store()
+        if session_window is None:
+            with UpstoxMarketDataClient(token) as client:
+                session_window = client.fetch_nse_market_session(now.date())
+        if session_window is None:
+            raise MarketRuntimeError("NSE has no trading session scheduled today")
+        market_open, market_close = session_window
+        if now < market_open:
+            market_open_label = market_open.strftime("%I:%M %p").lstrip("0")
+            raise MarketRuntimeError(
+                f"The NSE cash market opens at {market_open_label} IST"
+            )
+        if now >= market_close:
+            market_close_label = market_close.strftime("%I:%M %p").lstrip("0")
+            raise MarketRuntimeError(
+                f"The NSE cash market closed at {market_close_label} IST"
+            )
+        instruments = (
+            list(prepared_instruments)
+            if prepared_instruments is not None
+            else self._resolved_instruments(limit)
+        )
         liquidity_decisions = self._liquidity_decisions(instruments)
-        instruments = [
-            item
-            for item in instruments
-            if liquidity_decisions[item["instrument_key"]].tier != "dormant"
-        ]
+        if prepared_instruments is None:
+            instruments = [
+                item
+                for item in instruments
+                if liquidity_decisions[item["instrument_key"]].tier != "dormant"
+            ]
         symbols = {item["instrument_key"]: item["symbol"] for item in instruments}
         symbols.update(MARKET_CONTEXT_SYMBOLS)
         instrument_keys = list(dict.fromkeys([*symbols.keys()]))
@@ -1396,6 +1852,12 @@ class MarketRuntime:
                 "last_message_at": None,
                 "last_context_at": None,
                 "last_evidence_at": None,
+                "last_full_evidence_saved": 0,
+                "last_compact_evidence_saved": 0,
+                "last_focus_transitions_saved": 0,
+                "focus_count": 0,
+                "cooling_count": 0,
+                "background_count": 0,
                 "evidence_queue_depth": 0,
                 "backfill_state": "waiting_for_stream",
                 "backfill_total": len(instrument_keys),
@@ -1407,10 +1869,13 @@ class MarketRuntime:
                 "backfill_finished_at": None,
                 "backfill_recent_errors": [],
                 "scheduled_stop_at": market_close.isoformat(),
+                "scheduled_start_at": None,
                 "error": None,
             }
             self._last_context_bucket = None
             self._evidence_queue.clear()
+            self._compact_evidence_states.clear()
+            self._focus_states.clear()
             self._session_backfill_keys = instrument_keys
             self._session_backfill_date = now.date()
             self._session_backfill_cancel = threading.Event()
@@ -1440,12 +1905,17 @@ class MarketRuntime:
         with self._lock:
             streamer = self._streamer
             market_close_timer = self._market_close_timer
+            market_open_timer = self._market_open_timer
             backfill_cancel = self._session_backfill_cancel
             self._market_close_timer = None
+            self._market_open_timer = None
         if market_close_timer is not None:
             market_close_timer.cancel()
+        if market_open_timer is not None:
+            market_open_timer.cancel()
         if backfill_cancel is not None:
             backfill_cancel.set()
+        self._enrichment_cancel.set()
         if streamer is not None:
             try:
                 streamer.disconnect()
@@ -1456,6 +1926,7 @@ class MarketRuntime:
             self._live["connected"] = False
             self._live["subscribed"] = 0
             self._live["scheduled_stop_at"] = None
+            self._live["scheduled_start_at"] = None
             if self._live.get("backfill_state") in {"waiting_for_stream", "running"}:
                 self._live["backfill_state"] = "cancelled"
                 self._live["backfill_finished_at"] = datetime.now(UTC).isoformat()
@@ -1584,8 +2055,10 @@ class MarketRuntime:
 
     def shutdown(self) -> None:
         """Stop live activity and cancel timers when the API process exits."""
+        self._enrichment_cancel.set()
         with self._lock:
             timers = (
+                self._market_open_timer,
                 self._market_close_timer,
                 self._context_timer,
                 self._reconciliation_schedule_timer,
@@ -1593,6 +2066,7 @@ class MarketRuntime:
             )
             self._reconciliation_schedule_timer = None
             self._reconciliation_monitor_timer = None
+            self._market_open_timer = None
         for timer in timers:
             if timer is not None:
                 timer.cancel()
@@ -1610,6 +2084,8 @@ class MarketRuntime:
             self._live["state"] = "connected"
             self._live["connected"] = True
             self._live["error"] = None
+            if self._bootstrap.get("state") == "completed":
+                self._bootstrap["phase"] = "live_started"
             if (
                 self._live.get("backfill_state") == "waiting_for_stream"
                 and self._session_backfill_date is not None
@@ -1950,7 +2426,16 @@ class MarketRuntime:
         observed_keys = {
             key for key, decision in liquidity_decisions.items() if decision.tier != "dormant"
         }
-        observations: list[EvidenceOutcomeObservation] = []
+        full_candidate_inputs: list[
+            tuple[
+                StockFeatureSnapshot,
+                OpportunityEvidenceSnapshot,
+                RiskAssessment,
+                float,
+            ]
+        ] = []
+        compact_observations: list[CompactEvidenceObservation] = []
+        focus_transitions: list[FocusTransition] = []
         for feature in features:
             try:
                 if feature.as_of != as_of or feature.instrument_key not in observed_keys:
@@ -1996,11 +2481,23 @@ class MarketRuntime:
                         if (value := item.flow_liquidity.depth_imbalance) is not None
                     ],
                     max_spread_range_bps=self.settings.qfae_risk_max_spread_range_bps,
+                    rolling_liquidity_tier=liquidity_decisions[
+                        feature.instrument_key
+                    ].tier,
+                    rolling_liquidity_reason=liquidity_decisions[
+                        feature.instrument_key
+                    ].reason,
                 )
                 evidence = evidence.model_copy(
                     update={
                         "signal_persistence": signal,
                         "risk_assessment": risk,
+                        "liquidity_tier": liquidity_decisions[
+                            feature.instrument_key
+                        ].tier,
+                        "liquidity_tier_reason": liquidity_decisions[
+                            feature.instrument_key
+                        ].reason,
                         "market_regime": market_regime,
                     }
                 )
@@ -2013,6 +2510,46 @@ class MarketRuntime:
                         )
                     }
                 )
+                with self._lock:
+                    previous_focus = self._focus_states.get(feature.instrument_key)
+                focus = evaluate_focus_state(
+                    feature,
+                    evidence,
+                    previous_focus,
+                    start_minutes_after_open=self.settings.qfae_focus_start_minutes_after_open,
+                    promote_confirmation_minutes=(
+                        self.settings.qfae_focus_promote_confirmation_minutes
+                    ),
+                    cooling_confirmation_minutes=(
+                        self.settings.qfae_focus_cooling_confirmation_minutes
+                    ),
+                    demote_confirmation_minutes=(
+                        self.settings.qfae_focus_demote_confirmation_minutes
+                    ),
+                    minimum_score=self.settings.qfae_focus_min_score,
+                )
+                with self._lock:
+                    self._focus_states[feature.instrument_key] = focus
+                if previous_focus is None or previous_focus.state != focus.state:
+                    score = evidence.opportunity_score
+                    focus_transitions.append(
+                        FocusTransition(
+                            instrument_key=feature.instrument_key,
+                            symbol=feature.symbol,
+                            sector=feature.sector,
+                            session_date=feature.candle_timestamp.astimezone(
+                                INDIA_TIMEZONE
+                            ).date(),
+                            candle_timestamp=feature.candle_timestamp,
+                            observed_at=as_of,
+                            from_state=previous_focus.state if previous_focus else None,
+                            to_state=focus.state,
+                            reasons=focus.reasons,
+                            opportunity_score=score.final_score if score else None,
+                            coverage_percent=score.coverage_percent if score else None,
+                            market_regime_state=market_regime.state,
+                        )
+                    )
                 self.state_store.save_signal(signal)
                 self.state_store.save_risk_assessment(risk)
                 self.state_store.save_evidence(evidence)
@@ -2025,28 +2562,116 @@ class MarketRuntime:
                 )
                 if reference is None or reference <= 0:
                     continue
-                observation = EvidenceOutcomeObservation(
-                    instrument_key=feature.instrument_key,
-                    symbol=feature.symbol,
-                    sector=feature.sector,
-                    candle_timestamp=feature.candle_timestamp,
-                    observed_at=as_of,
-                    reference_price=reference,
-                    confluence=evidence.confluence,
-                    signal_state=signal.state,
-                    data_quality=evidence.data_quality,
-                    evidence_payload=evidence.model_dump(mode="json"),
-                    risk_payload=risk.model_dump(mode="json"),
-                    market_regime_payload=market_regime.model_dump(mode="json"),
+                full_candidate_inputs.append((feature, evidence, risk, reference))
+
+                local_session_date = feature.candle_timestamp.astimezone(
+                    INDIA_TIMEZONE
+                ).date()
+                state_key = compact_state_key(
+                    evidence,
+                    score_bucket=self.settings.qfae_compact_evidence_score_bucket,
                 )
-                observations.append(observation)
+                previous_state = self._compact_evidence_states.get(
+                    feature.instrument_key
+                )
+                is_first_session_observation = (
+                    previous_state is None
+                    or previous_state[0] != local_session_date
+                )
+                state_changed = (
+                    previous_state is not None
+                    and previous_state[0] == local_session_date
+                    and previous_state[1] != state_key
+                )
+                is_checkpoint = compact_checkpoint_due(
+                    feature.candle_timestamp,
+                    self.settings.qfae_compact_evidence_interval_minutes,
+                )
+                capture_reason = (
+                    "session_start"
+                    if is_first_session_observation
+                    else "interval"
+                    if is_checkpoint
+                    else "state_change"
+                    if state_changed
+                    else None
+                )
+                if capture_reason is not None:
+                    compact = build_compact_evidence_observation(
+                        evidence,
+                        candle_timestamp=feature.candle_timestamp,
+                        reference_price=reference,
+                        capture_reason=capture_reason,
+                    )
+                    if compact is not None:
+                        compact_observations.append(compact)
+                self._compact_evidence_states[feature.instrument_key] = (
+                    local_session_date,
+                    state_key,
+                )
             except Exception:
                 logger.exception("Could not record minute evidence for %s", feature.symbol)
-        if repository is not None and observations:
+        selected_inputs = sorted(
+            full_candidate_inputs,
+            key=lambda item: opportunity_priority(item[1]),
+            reverse=True,
+        )[: self.settings.qfae_full_evidence_max_per_minute]
+        full_candidates = [
+            EvidenceOutcomeObservation(
+                instrument_key=feature.instrument_key,
+                symbol=feature.symbol,
+                sector=feature.sector,
+                candle_timestamp=feature.candle_timestamp,
+                observed_at=as_of,
+                reference_price=reference,
+                confluence=evidence.confluence,
+                signal_state=(
+                    evidence.signal_persistence.state
+                    if evidence.signal_persistence is not None
+                    else "unavailable"
+                ),
+                data_quality=evidence.data_quality,
+                evidence_payload=evidence.model_dump(mode="json"),
+                risk_payload=risk.model_dump(mode="json"),
+                market_regime_payload=market_regime.model_dump(mode="json"),
+            )
+            for feature, evidence, risk, reference in selected_inputs
+        ]
+        full_saved = 0
+        compact_saved = 0
+        if repository is not None and full_candidates:
             try:
-                repository.save_evidence_observations(observations)
+                full_saved = repository.save_evidence_observations(full_candidates)
             except Exception:
                 logger.exception("Could not persist minute evidence batch")
+        if repository is not None and compact_observations:
+            try:
+                compact_saved = repository.save_compact_evidence_observations(
+                    compact_observations
+                )
+            except Exception:
+                logger.exception("Could not persist compact minute evidence batch")
+        focus_transitions_saved = 0
+        if repository is not None and focus_transitions:
+            try:
+                focus_transitions_saved = repository.save_focus_transitions(
+                    focus_transitions
+                )
+            except Exception:
+                logger.exception("Could not persist focus transition batch")
+        with self._lock:
+            self._live["last_full_evidence_saved"] = full_saved
+            self._live["last_compact_evidence_saved"] = compact_saved
+            self._live["last_focus_transitions_saved"] = focus_transitions_saved
+            self._live["focus_count"] = sum(
+                item.state == "focus" for item in self._focus_states.values()
+            )
+            self._live["cooling_count"] = sum(
+                item.state == "cooling" for item in self._focus_states.values()
+            )
+            self._live["background_count"] = sum(
+                item.state == "background" for item in self._focus_states.values()
+            )
 
     def _opportunity_scoring_weights(self) -> dict[str, float]:
         return {
@@ -2124,8 +2749,9 @@ class MarketRuntime:
         *,
         include_provisional: bool = True,
         session_histories: dict[str, list[Candle]] | None = None,
+        instruments: list[dict[str, str]] | None = None,
     ) -> None:
-        instruments = self._resolved_instruments(None)
+        instruments = instruments if instruments is not None else self._resolved_instruments(None)
         sectors = self.state_store.get_sectors()
         snapshots = {
             snapshot.instrument_key: snapshot
@@ -2289,8 +2915,8 @@ class MarketRuntime:
                         ),
                     }
                 )
-        effective_limit = limit if limit is not None else self.settings.qfae_market_pilot_size
-        instruments = instruments[:effective_limit]
+        if limit is not None:
+            instruments = instruments[:limit]
         if not instruments:
             raise MarketRuntimeError("The approved universe has no resolved instruments")
         return instruments
@@ -2299,6 +2925,14 @@ class MarketRuntime:
         self,
         instruments: list[dict[str, str]],
     ) -> dict[str, LiquidityUniverseDecision]:
+        instrument_keys = tuple(item["instrument_key"] for item in instruments)
+        cache_now = datetime.now(UTC)
+        if (
+            self._liquidity_decision_cache_at is not None
+            and cache_now - self._liquidity_decision_cache_at <= timedelta(minutes=5)
+            and instrument_keys == self._liquidity_decision_cache_keys
+        ):
+            return dict(self._liquidity_decision_cache)
         as_of_date = datetime.now(INDIA_TIMEZONE).date()
         lookback = int(getattr(self.settings, "qfae_liquidity_lookback_sessions", 20))
         minimum_traded_sessions = int(
@@ -2326,16 +2960,17 @@ class MarketRuntime:
             if candle.timestamp.astimezone(INDIA_TIMEZONE).date() < as_of_date
         ][-lookback:]
         spread_histories = self._daily_spread_histories(
-            [item["instrument_key"] for item in instruments],
+            list(instrument_keys),
             as_of_date=as_of_date,
             lookback_sessions=lookback,
         )
-        return {
+        daily_histories = self.state_store.get_daily_candles_many(
+            instrument_keys,
+            limit=lookback + 5,
+        )
+        decisions = {
             instrument["instrument_key"]: classify_liquidity_tier(
-                self.state_store.get_daily_candles(
-                    instrument["instrument_key"],
-                    limit=lookback + 5,
-                ),
+                daily_histories.get(instrument["instrument_key"], []),
                 as_of_date=as_of_date,
                 lookback_sessions=lookback,
                 minimum_traded_sessions=minimum_traded_sessions,
@@ -2348,6 +2983,10 @@ class MarketRuntime:
             )
             for instrument in instruments
         }
+        self._liquidity_decision_cache = decisions
+        self._liquidity_decision_cache_at = cache_now
+        self._liquidity_decision_cache_keys = instrument_keys
+        return dict(decisions)
 
     def _daily_spread_histories(
         self,
@@ -2386,6 +3025,9 @@ class MarketRuntime:
         }
 
     def _access_token(self) -> str | None:
+        analytics_token = analytics_access_token(self.settings)
+        if analytics_token:
+            return analytics_token
         cached = TokenCache(self.settings.upstox_token_cache_path).load()
         return cached["access_token"] if cached else None
 

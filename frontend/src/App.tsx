@@ -12,12 +12,13 @@ type AuthStatus = { configured: boolean; authenticated: boolean; expires_at: str
 
 type RuntimeStatus = {
   cadence_seconds: number;
-  pilot_size: number;
+  approved_universe_size: number;
   redis_available: boolean;
   database_available: boolean;
   liquidity_universe: { active: number; watch_only: number; dormant: number };
-  bootstrap: { state: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; financial_results_fetched: number; financial_results_reused: number; errors: number; auto_start_live: boolean; live_start_error: string | null };
-  live: { state: string; connected: boolean; subscribed: number; liquidity_active: number; liquidity_watch_only: number; liquidity_dormant: number; last_message_at: string | null; scheduled_stop_at: string | null; error: string | null };
+  bootstrap: { state: string; phase: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; financial_results_fetched: number; financial_results_reused: number; errors: number; auto_start_live: boolean; live_start_error: string | null };
+  enrichment: { state: string; total: number; processed: number; daily_refreshed: number; minute_profiles_built: number; sectors_loaded: number; financial_processed: number; errors: number; pause_reason: string | null };
+  live: { state: string; connected: boolean; subscribed: number; liquidity_active: number; liquidity_watch_only: number; liquidity_dormant: number; last_message_at: string | null; scheduled_start_at: string | null; scheduled_stop_at: string | null; error: string | null };
   reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
 
@@ -300,6 +301,8 @@ type OpportunityEvidence = {
   as_of: string;
   data_quality: string;
   confluence: "strong_support" | "supportive" | "mixed" | "caution" | "insufficient";
+  liquidity_tier: "active" | "watch_only" | "dormant";
+  liquidity_tier_reason: string | null;
   pillars: EvidencePillar[];
   flow_liquidity: {
     data_quality: string;
@@ -362,6 +365,11 @@ type RankedOpportunity = {
   day_low: number | null;
   day_close: number | null;
   price_trace: number[];
+  liquidity_tier: "active" | "watch_only" | "dormant";
+  liquidity_tier_reason: string | null;
+  focus_state: "focus" | "cooling" | "background" | "watch_only" | "dormant";
+  focus_reasons: string[];
+  focus_since: string | null;
   score: {
     model_version: string;
     strategy: string;
@@ -682,7 +690,7 @@ function MarketContextPanel({ context, regime, stockNames }: { context: MarketCo
         <article className="breadth-card">
           <span>Median spread</span>
           <strong>{context.median_spread_bps == null ? "N/A" : `${number(context.median_spread_bps)} bps`}</strong>
-          <small>Across fresh pilot stocks</small>
+          <small>Across fresh approved stocks</small>
         </article>
       </div>
 
@@ -802,7 +810,7 @@ function DailyRegimePanel({ regimes, stockNames }: { regimes: DailyRegime[]; sto
               </tr>
             ))}
             {!regimes.length && (
-              <tr><td className="feature-empty" colSpan={7}>Prepare the pilot stocks to load daily history and calculate regime evidence.</td></tr>
+              <tr><td className="feature-empty" colSpan={7}>Prepare the approved universe to load daily history and calculate regime evidence.</td></tr>
             )}
           </tbody>
         </table>
@@ -1096,7 +1104,16 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
   const traceReturn = (row: RankedOpportunity) => row.price_trace.length > 1 && row.price_trace[0] > 0
     ? ((row.price_trace.at(-1)! - row.price_trace[0]) / row.price_trace[0]) * 100
     : null;
-  const { sortedRows, sort, requestSort } = useSortableRows(rows, {
+  const executableRows = rows.filter((row) => row.score.eligible && ["focus", "cooling"].includes(row.focus_state));
+  const activeFocusRows = executableRows.filter((row) => row.focus_state === "focus");
+  const coolingRows = executableRows.filter((row) => row.focus_state === "cooling");
+  const backgroundRows = rows.filter((row) => row.focus_state === "background");
+  const watchOnlyRows = rows.filter((row) => row.focus_state === "watch_only");
+  const highSignalIneligibleRows = rows
+    .filter((row) => !row.score.eligible && row.score.final_score >= 55)
+    .sort((left, right) => right.score.final_score - left.score.final_score || right.score.coverage_percent - left.score.coverage_percent);
+  const matrixRows = [...executableRows, ...highSignalIneligibleRows];
+  const { sortedRows, sort, requestSort } = useSortableRows(executableRows, {
     rank: (row) => row.rank,
     symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     setup: traceReturn,
@@ -1113,10 +1130,17 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
   return (
     <section className="table-card opportunity-card">
       <div className="table-heading">
-        <div><h2>Explainable opportunity ranking</h2><p>Coverage-adjusted long-continuation candidates, recalculated every completed minute</p></div>
-        <span>Pilot v2 · provisional weights · not yet backtested</span>
+        <div><h2>Explainable opportunity ranking</h2><p>Focus and Cooling stocks stay visible; Background stocks remain silently evaluated every completed minute</p></div>
+        <span>Model v3 · reversible focus funnel · provisional thresholds</span>
       </div>
-      <AlphaMatrix rows={rows} onSelectStock={onSelectStock} stockNames={stockNames} />
+      <div className="focus-funnel-summary" aria-label="Intraday focus funnel status">
+        <span className="focus-count"><b>{activeFocusRows.length}</b> Focus</span>
+        <span className="cooling-count"><b>{coolingRows.length}</b> Focus — Cooling</span>
+        <span><b>{backgroundRows.length}</b> Background monitored</span>
+        <span><b>{watchOnlyRows.length}</b> Watch-only</span>
+        <small>Constructive green pullbacks stay visible and return to active Focus as soon as strength resumes.</small>
+      </div>
+      <AlphaMatrix rows={matrixRows} onSelectStock={onSelectStock} stockNames={stockNames} />
       <div className="table-scroll">
         <table className="opportunity-table">
           <thead><tr>
@@ -1141,6 +1165,7 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
                     </button>
                     <small>{row.sector ?? "Sector unavailable"}</small>
                     <span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span>
+                    {row.focus_state === "cooling" && <span className="focus-state cooling">Focus — Cooling</span>}
                   </td>
                   <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
                   <td className="numeric cmp-cell">
@@ -1158,14 +1183,38 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
                     const component = components[key];
                     return <td key={key}>{component ? <><strong>{component.score == null ? "N/A" : number(component.score, 0)}</strong><small>{number(component.weight_percent, 0)}% weight · {number(component.coverage_percent, 0)}% covered</small><small>{number(component.contribution_points, 1)} points</small></> : "N/A"}</td>;
                   })}
-                  <td className="tag-cell">{row.score.top_positive_factors.slice(0, 4).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.score.top_positive_factors.length && <span className="factor-state">No strong positive evidence</span>}</td>
+                  <td className="tag-cell">{[...new Set([...row.focus_reasons, ...row.score.top_positive_factors])].slice(0, 5).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</td>
                   <td className="tag-cell">{[...row.score.invalidation_reasons, ...row.score.top_cautions].slice(0, 5).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.score.invalidation_reasons.length && !row.score.top_cautions.length && <span className="evidence-tag">No active caution</span>}</td>
                 </tr>
               );
             })}
-            {!rows.length && <tr><td className="feature-empty" colSpan={13}>Waiting for completed-minute evidence and risk checks before ranking opportunities.</td></tr>}
+            {!executableRows.length && <tr><td className="feature-empty" colSpan={13}>No stock currently has confirmed Focus or Cooling status. Background stocks are still monitored every completed minute.</td></tr>}
           </tbody>
         </table>
+      </div>
+      <div className="non-executable-board">
+        <div className="table-heading">
+          <div><h3>High signal, not executable</h3><p>Opportunity score at least 55, but blocked by liquidity, spread, slippage, freshness or another risk gate</p></div>
+          <span>{highSignalIneligibleRows.length} observed</span>
+        </div>
+        <div className="table-scroll">
+          <table>
+            <thead><tr><th>Stock</th><th>Current setup</th><th>CMP</th><th>Opportunity score</th><th>Tracking tier</th><th>Why blocked</th></tr></thead>
+            <tbody>
+              {highSignalIneligibleRows.map((row) => (
+                <tr key={`ineligible-${row.instrument_key}`}>
+                  <td><button className="stock-detail-link" type="button" onClick={() => onSelectStock(row.instrument_key)}><CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} /><small>View details →</small></button><small>{row.sector ?? "Sector unavailable"}</small></td>
+                  <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
+                  <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong><span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span></td>
+                  <td><strong className="opportunity-score">{number(row.score.final_score, 1)}</strong><small>Coverage {number(row.score.coverage_percent, 0)}%</small></td>
+                  <td><span className={`liquidity-tier ${row.liquidity_tier}`}>{row.liquidity_tier.replace("_", " ")}</span><small>{row.liquidity_tier_reason?.replaceAll("_", " ") ?? "Live execution gate"}</small></td>
+                  <td className="tag-cell">{row.score.invalidation_reasons.slice(0, 4).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</td>
+                </tr>
+              ))}
+              {!highSignalIneligibleRows.length && <tr><td className="feature-empty" colSpan={6}>No strong but non-executable signals at this minute.</td></tr>}
+            </tbody>
+          </table>
+        </div>
       </div>
     </section>
   );
@@ -1478,6 +1527,8 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
             <MetricLine label="Coverage" value={`${number(opportunity.score.coverage_percent, 0)}%`} />
             <MetricLine label="Persistence" value={`${number(opportunity.score.persistence_multiplier, 2)}x`} />
             <MetricLine label="Eligible" value={opportunity.score.eligible ? "Yes" : "No"} />
+            <MetricLine label="Focus state" value={opportunity.focus_state.replaceAll("_", " ")} />
+            <MetricLine label="Focus reasons" value={opportunity.focus_reasons.map((item) => item.replaceAll("_", " ")).join(", ") || "Awaiting confirmation"} />
           </> : <p className="detail-empty">No current opportunity score.</p>}
         </DetailCard>
 
@@ -1864,7 +1915,7 @@ function Dashboard() {
     setBusy("financial-results");
     setError(null);
     try {
-      const response = await fetch(`${apiBaseUrl}/market/financial-results/check?limit=${runtime?.pilot_size ?? 139}`, { method: "POST" });
+      const response = await fetch(`${apiBaseUrl}/market/financial-results/check`, { method: "POST" });
       if (!response.ok) {
         const payload = await response.json() as { detail?: string };
         throw new Error(payload.detail ?? "Financial results could not be checked");
@@ -1881,8 +1932,9 @@ function Dashboard() {
 
   const bootstrapping = runtime?.bootstrap.state === "running";
   const live = runtime?.live.connected === true;
-  const liveStarting = ["connecting", "reconnecting"].includes(runtime?.live.state ?? "");
-  const pilotSize = runtime?.pilot_size ?? 139;
+  const liveScheduled = runtime?.live.state === "scheduled";
+  const liveStarting = ["scheduled", "connecting", "reconnecting"].includes(runtime?.live.state ?? "");
+  const universeSize = runtime?.approved_universe_size ?? runtime?.bootstrap.total ?? 0;
   const stockNames = useMemo<StockNameLookup>(() => {
     const byInstrumentKey: Record<string, string> = {};
     const bySymbol: Record<string, string> = {};
@@ -1921,33 +1973,35 @@ function Dashboard() {
 
       <section className="dashboard-intro">
         <div>
-          <p className="eyebrow">{pilotSize}-STOCK PILOT</p>
+          <p className="eyebrow">{universeSize ? `${universeSize}-STOCK APPROVED UNIVERSE` : "FULL APPROVED UNIVERSE"}</p>
           <h1>Market workspace</h1>
           <p>Daily regime evidence and live OHLCV are combined on a one-minute cadence.</p>
         </div>
         <div className="actions">
           {!live && !liveStarting ? (
             <button type="button" disabled={bootstrapping || busy !== null || !runtime?.redis_available} onClick={() => void runAction("bootstrap")}>
-              {bootstrapping ? `Preparing ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? pilotSize} · live starts next` : `Prepare ${pilotSize} stocks & start live`}
+              {bootstrapping ? `Starting market session ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? universeSize}` : `Prepare universe${universeSize ? ` (${universeSize})` : ""} & start live`}
             </button>
           ) : (
-            <button className="danger-button" type="button" disabled={busy !== null} onClick={() => void runAction("live/stop")}>Stop live feed</button>
+            <button className="danger-button" type="button" disabled={busy !== null} onClick={() => void runAction("live/stop")}>{liveScheduled ? "Cancel scheduled live start" : "Stop live feed"}</button>
           )}
         </div>
       </section>
 
       {error && <p className="notice error dashboard-notice">{error}</p>}
+      {liveScheduled && runtime?.live.scheduled_start_at && <p className="notice dashboard-notice">Universe prepared. Live feed will start automatically at {new Date(runtime.live.scheduled_start_at).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST.</p>}
       {runtime?.bootstrap.live_start_error && <p className="notice error dashboard-notice">Preparation completed, but live feed did not start: {runtime.bootstrap.live_start_error}</p>}
+      {runtime?.enrichment.state === "paused_memory" && <p className="notice error dashboard-notice">Optional background enrichment paused to protect the VM: {runtime.enrichment.pause_reason}</p>}
 
       <section className="summary-grid" aria-label="Market data status">
         <article><span>Redis</span><strong>{runtime?.redis_available ? "Ready" : "Offline"}</strong></article>
         <article><span>PostgreSQL</span><strong>{runtime?.database_available ? "Ready" : "Offline"}</strong></article>
-        <article><span>History</span><strong>{runtime?.bootstrap.history_loaded ?? 0}/{pilotSize}</strong></article>
-        <article><span>Minute stored</span><strong>{runtime?.bootstrap.minute_history_persisted ?? 0}/{pilotSize}</strong></article>
-        <article><span>RVOL profiles</span><strong>{runtime?.bootstrap.minute_profiles_built ?? 0}/{pilotSize}</strong></article>
-        <article><span>Daily regimes</span><strong>{runtime?.bootstrap.daily_history_loaded ?? 0}/{pilotSize}</strong></article>
-        <article><span>Daily stored</span><strong>{runtime?.bootstrap.daily_history_persisted ?? 0}/{pilotSize}</strong></article>
-        <article><span>Sectors</span><strong>{runtime?.bootstrap.sectors_loaded ?? 0}/{pilotSize}</strong></article>
+        <article><span>History</span><strong>{runtime?.bootstrap.history_loaded ?? 0}/{universeSize}</strong></article>
+        <article><span>Minute stored</span><strong>{runtime?.bootstrap.minute_history_persisted ?? 0}/{universeSize}</strong></article>
+        <article><span>RVOL profiles</span><strong>{runtime?.bootstrap.minute_profiles_built ?? 0}/{universeSize}</strong></article>
+        <article><span>Daily regimes</span><strong>{runtime?.bootstrap.daily_history_loaded ?? 0}/{universeSize}</strong></article>
+        <article><span>Daily stored</span><strong>{runtime?.bootstrap.daily_history_persisted ?? 0}/{universeSize}</strong></article>
+        <article><span>Sectors</span><strong>{runtime?.bootstrap.sectors_loaded ?? 0}/{universeSize}</strong></article>
         <article><span>Financial fetched</span><strong>{runtime?.bootstrap.financial_results_fetched ?? 0}</strong></article>
         <article><span>Financial reused</span><strong>{runtime?.bootstrap.financial_results_reused ?? 0}</strong></article>
         <article><span>Active universe</span><strong>{runtime?.liquidity_universe.active ?? 0}</strong></article>
@@ -1955,6 +2009,7 @@ function Dashboard() {
         <article><span>Dormant</span><strong>{runtime?.liquidity_universe.dormant ?? 0}</strong></article>
         <article><span>Subscribed</span><strong>{runtime?.live.subscribed ?? 0}</strong></article>
         <article><span>Reconciliation</span><strong>{runtime?.reconciliation.state ?? "Idle"}</strong></article>
+        <article><span>Enrichment</span><strong>{runtime ? `${runtime.enrichment.state} · ${runtime.enrichment.processed}/${runtime.enrichment.total}` : "Idle"}</strong></article>
       </section>
 
       <MarketContextPanel context={context} regime={marketRegime} stockNames={stockNames} />
@@ -2002,7 +2057,7 @@ function Dashboard() {
       </section>
 
       <section className="financial-utility-card">
-        <div><p className="eyebrow">DATA UTILITIES</p><h2>Quarterly and annual results</h2><p>Check Upstox availability for the pilot stocks. Recent latest-quarter snapshots are protected from duplicate downloads for 30 days.</p></div>
+        <div><p className="eyebrow">DATA UTILITIES</p><h2>Quarterly and annual results</h2><p>Check the next bounded Upstox batch. Recent latest-quarter snapshots are protected from duplicate downloads for 30 days.</p></div>
         <button className="secondary" type="button" disabled={busy !== null || !runtime?.database_available} onClick={() => void checkFinancialResults()}>{busy === "financial-results" ? "Checking results…" : "Check financial results"}</button>
       </section>
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, SmallInteger, String, Text, func
+from sqlalchemy import BigInteger, Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric, SmallInteger, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -144,6 +144,77 @@ class EvidenceObservationRecord(Base):
     __table_args__ = (
         Index("ix_evidence_observations_time", "candle_timestamp"),
         Index("ix_evidence_observations_signal", "signal_state", "outcome_status"),
+    )
+
+
+class CompactEvidenceObservationRecord(Base):
+    """Storage-efficient background-universe checkpoint."""
+
+    __tablename__ = "compact_evidence_observations"
+
+    instrument_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    candle_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False)
+    sector: Mapped[str | None] = mapped_column(String(120))
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    reference_price: Mapped[Decimal] = mapped_column(Numeric(20, 6), nullable=False)
+    opportunity_score: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    coverage_percent: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False)
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    score_status: Mapped[str] = mapped_column(String(40), nullable=False)
+    confluence: Mapped[str] = mapped_column(String(40), nullable=False)
+    signal_state: Mapped[str] = mapped_column(String(40), nullable=False)
+    risk_status: Mapped[str | None] = mapped_column(String(40))
+    liquidity_tier: Mapped[str] = mapped_column(String(24), nullable=False)
+    market_regime_state: Mapped[str | None] = mapped_column(String(40))
+    flow_confirmation: Mapped[str | None] = mapped_column(String(40))
+    price_trend_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    participation_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    market_sector_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    fundamental_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    capture_reason: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_compact_evidence_time", "candle_timestamp"),
+        Index(
+            "ix_compact_evidence_candidate",
+            "eligible",
+            "opportunity_score",
+            "candle_timestamp",
+        ),
+    )
+
+
+class FocusTransitionRecord(Base):
+    """Durable audit trail for reversible intraday focus changes."""
+
+    __tablename__ = "focus_transitions"
+
+    instrument_key: Mapped[str] = mapped_column(String(160), primary_key=True)
+    candle_timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    symbol: Mapped[str] = mapped_column(String(80), nullable=False)
+    sector: Mapped[str | None] = mapped_column(String(120))
+    session_date: Mapped[date] = mapped_column(Date, nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    from_state: Mapped[str | None] = mapped_column(String(24))
+    to_state: Mapped[str] = mapped_column(String(24), nullable=False)
+    reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
+    opportunity_score: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    coverage_percent: Mapped[Decimal | None] = mapped_column(Numeric(8, 4))
+    market_regime_state: Mapped[str | None] = mapped_column(String(40))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("ix_focus_transitions_session", "session_date", "candle_timestamp"),
+        Index("ix_focus_transitions_state", "to_state", "candle_timestamp"),
     )
 
 

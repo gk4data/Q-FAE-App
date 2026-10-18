@@ -25,6 +25,42 @@ Upstox is the market-data provider; FastAPI is Q-FAE's backend. The backend will
 
 ## Local setup
 
+### One-click Windows start
+
+After completing the one-time Python and Node.js setup below, double-click
+`Start-QFAE.cmd` in the repository root. The launcher starts Docker Desktop when
+needed, starts Redis and PostgreSQL, applies database migrations, starts the
+backend and frontend in minimized service windows, waits for both applications,
+and opens `http://localhost:3000/` in the default browser.
+
+The launcher is safe to rerun when Q-FAE is already running. To see server logs
+or stop either development server, restore its minimized PowerShell window and
+press `Ctrl+C`. Docker data services can be stopped later from the repository
+root with `docker compose stop`.
+
+From PowerShell, the equivalent command is:
+
+```powershell
+.\Start-QFAE.ps1
+```
+
+Pass `-NoBrowser` when the browser should not be opened automatically.
+
+To stop Q-FAE, double-click `Stop-QFAE.cmd`. It first disconnects the Upstox
+stream or cancels a scheduled market-open start, then closes the Q-FAE backend
+and frontend and stops the project Redis/PostgreSQL containers. Docker volumes
+are preserved, so historical data is not deleted. Docker Desktop itself remains
+running to avoid interrupting unrelated containers.
+
+The PowerShell equivalent is:
+
+```powershell
+.\Stop-QFAE.ps1
+```
+
+Pass `-KeepContainers` to stop only the backend and frontend while leaving Redis
+and PostgreSQL running.
+
 1. Copy `.env.example` to `.env` and enter only local configuration values. Do not commit `.env`.
 2. Start Redis and PostgreSQL: `docker compose up -d`.
 3. Start the API:
@@ -74,6 +110,8 @@ http://localhost:8000/api/v1/auth/upstox/callback
 
 Set the same value for `UPSTOX_REDIRECT_URI` in your local `.env`; also set `QFAE_FRONTEND_URL=http://localhost:3000` when using the local Vite frontend.
 
+For this read-only application, `UPSTOX_ANALYTICS_TOKEN` may instead contain the one-year Analytics Token generated in Upstox Developer Apps. When configured, Q-FAE prefers it for REST and WebSocket market data and reports the session as authenticated without exposing the token to the frontend. Leave the variable blank to continue using the normal daily OAuth flow.
+
 ## Minute-based market data
 
 Q-FAE now has a provider-backed market-day foundation. It uses Upstox Historical Candle V3 for recent one-minute OHLCV, Company Profile for sector metadata, Market Data Feed V3 in `full` mode for live equity/index updates, Redis for transient candles, quotes, and minute-level context, and PostgreSQL for durable daily history.
@@ -86,9 +124,9 @@ cd backend
 .\.venv\Scripts\python.exe -m alembic upgrade head
 ```
 
-After signing in through the frontend, use the single **Prepare 139 stocks & start live** button. Preparation runs in the backend and automatically starts the live feed when it finishes, so there is no second action to remember. If the market is already closed, preparation still completes and the dashboard explains why streaming was not started. The dashboard displays LTP, change, one-minute OHLCV, relative volume, spread, sector, and whether each value is live, cached, historical, or waiting.
+After signing in through the frontend, use the single **Prepare universe & start live** button. The blocking path loads only the rolling admission window from PostgreSQL, refreshes benchmark history and selects the live universe. Q-FAE reads the official Upstox NSE timings for the date: before market open it arms the prepared feed to start automatically at the published opening time, during market hours it starts immediately, and after close or on a non-trading day it prepares without opening a stream. Full daily refreshes, missing minute profiles, sector metadata, execution-quality profiles and a capped financial-results batch continue afterward in memory-bounded 25-stock batches. Current-session minute backfill has priority over this optional enrichment. If available system memory falls below the configured reserve, enrichment pauses without stopping the live feed.
 
-One hundred thirty-nine stocks is the application default during the expanded evidence-collection phase (`QFAE_MARKET_PILOT_SIZE=139`). The pilot is selected from the fresh eligible universe by latest completed-session traded value and then market cap. This remains below the provider's Full-feed capacity while local one-minute calculation and persistence latency is measured. Historical loading runs in the background and is throttled below Upstox's published standard-API limits. The dashboard shows its progress; the API endpoints remain available for diagnostics and future automation. The live session also subscribes to NIFTY 50, India VIX, and thirteen NIFTY sector indices so sector direction is measured from provider benchmarks rather than inferred from the equity universe.
+Preparation now covers every company that passes the provider-led NSE mainboard, market-cap and price gates. Previous-day turnover no longer controls admission or ordering. Rolling 20-session continuity, median traded value and median spread classify each company as Active, Watch-only or Dormant; live D5 slippage is then enforced as an execution gate. Active stocks receive executable opportunity ranks, while strong Watch-only or live-risk-rejected signals remain visible in a separate non-executable group. Historical loading is incremental, stored in PostgreSQL and throttled below provider request limits. The live session also subscribes to NIFTY 50, India VIX, and thirteen NIFTY sector indices so sector direction is measured from provider benchmarks rather than inferred from the equity universe.
 
 Each manually started live session schedules a backend safety stop for the normal NSE cash-market close at 3:30 PM IST. The API refuses to start a new normal live session after that time. Exchange holidays and announced special sessions will be handled by the future market-calendar controller.
 
@@ -126,7 +164,7 @@ The [volume and liquidity confirmation contract](docs/volume-liquidity-confirmat
 
 The [decision-quality layer](docs/decision-quality-layer.md) adds two-of-three-minute signal persistence, D5 slippage/circuit/tradability checks, persistent market regime, and point-in-time forward-outcome tracking. NSE surveillance synchronization, global context and mapped F&O confirmation remain explicit staged inputs rather than silently assumed data.
 
-The [financial-result caching policy](docs/financial-result-caching.md) stores content-versioned quarterly and annual Upstox statements. **Prepare 139 stocks** and the dashboard utility reuse a latest-quarter snapshot for 30 days, while older-quarter, stale or missing data triggers a provider refresh.
+The [financial-result caching policy](docs/financial-result-caching.md) stores content-versioned quarterly and annual Upstox statements. Background preparation checks only a capped batch per run so fundamentals can never delay live data; the dashboard utility remains available for an explicit wider refresh. Both paths reuse a latest-quarter snapshot for 30 days, while older-quarter, stale or missing data triggers a provider refresh.
 
 The [financial-metric layer](docs/financial-metrics.md) calculates versioned QoQ/YoY growth, margins, cash conversion, explicit debt measures, ROE/ROCE and EPS history. Available metrics now feed the bounded fundamental component of the provisional pilot score; missing fields reduce coverage instead of becoming favourable values.
 
@@ -136,13 +174,13 @@ Selecting a stock name in **Opportunity Ranking** opens a dynamic stock-detail t
 
 The top of **Opportunity Ranking** contains an interactive Apache ECharts Alpha Matrix for the complete active universe. It plots Opportunity Score against a provisional coverage-and-persistence confidence proxy, sizes bubbles by liquidity/execution quality, colours them by status, and links every bubble to the same stock-detail view.
 
-The first preparation backfills configured daily and one-minute history into PostgreSQL. Later preparations hydrate Redis from PostgreSQL and request only overlapping updates: five days for daily candles and two days for one-minute candles. Completed live minutes are persisted once per minute, while the still-forming candle remains only in Redis. One-minute rows have configurable 35-day retention and produce per-stock minute-of-session profiles used as the durable RVOL baseline. See the [historical-data storage policy](docs/historical-data-storage.md) for the implemented boundary and remaining full-universe work.
+Preparation first hydrates a compact rolling daily admission window from PostgreSQL and starts live collection. A background worker then refreshes configured daily history and fills only missing minute profiles in bounded batches; it does not load full-universe minute history into Redis. Completed live minutes are persisted once per minute, while the still-forming candle remains only in Redis. Daily and one-minute candles remain durable by default. Full evidence JSON is retained for only the strongest bounded candidates each minute, while the wider universe receives compact 15-minute and state-change checkpoints. See the [local storage retention policy](docs/local-storage-retention.md) and [historical-data storage policy](docs/historical-data-storage.md).
 
 Order placement, scoring, ML predictions, and automated trading are intentionally outside this phase.
 
 The approved candidate inputs are maintained in [the model factor register](docs/model-factor-register.md). Pilot-v2 implements only the available long-continuation inputs. Its direction, weights, thresholds and interactions remain provisional until point-in-time Indian-market backtesting supports calibration.
 
-The approved [intraday focus-universe policy](docs/intraday-focus-universe.md) uses the first 30 minutes to form a provisional Focus list without discarding the rest of the 139-stock evidence universe. Background stocks remain monitored and recorded so late movers and early-leader failures remain measurable.
+The implemented [intraday focus-universe policy](docs/intraday-focus-universe.md) uses 9:15-9:30 as discovery, then promotes stocks after two qualifying completed minutes and demotes only after three materially weak red minutes. Constructive green pauses become visible **Focus - Cooling** candidates and return to active Focus immediately when strength resumes. Background stocks remain silently monitored every minute, and every state transition is retained in PostgreSQL for later funnel backtesting. A negative session return is never a standalone exclusion.
 
 The same policy applies rolling tradability admission before intraday ranking. A stock must trade in at least 18 of the latest 20 NIFTY sessions; otherwise it is Dormant. A qualifying stock remains Watch-only unless its 20-session median traded value is at least Rs 5 crore and its rolling median spread is at most 25 bps. Daily execution-quality profiles are built from recorded minute evidence. Ranking additionally requires the live D5 depth to support a Rs 1 lakh order within 20 bps estimated worst-side slippage.
 

@@ -59,5 +59,6 @@ def upstox_auth_status() -> dict[str, str | bool | None]:
 @router.post("/logout")
 def logout_upstox() -> dict[str, bool]:
     """Remove Q-FAE's local cached access token."""
-    get_auth_service().logout()
-    return {"authenticated": False}
+    service = get_auth_service()
+    service.logout()
+    return {"authenticated": bool(service.status()["authenticated"])}

@@ -1,10 +1,10 @@
 # Future historical-data storage policy
 
-Status: PostgreSQL daily candles, durable pilot minute history, and rolling minute-of-day profiles are implemented. Full-universe scaling and compressed research archives remain future phases.
+Status: PostgreSQL daily candles, durable approved-universe minute history, rolling minute-of-day profiles, memory-bounded full-universe preparation, and tiered evidence retention are implemented. External archives remain an optional future phase and are not required for the current release.
 
 Q-FAE must not download the complete historical dataset again every morning. Historical market data will use a rolling, incremental storage model with distinct policies for daily and one-minute data.
 
-The implemented foundation includes an Alembic-managed schema, idempotent candle upserts, per-instrument sync watermarks, Redis hydration from PostgreSQL, a five-day daily overlap, and a two-day one-minute overlap. PostgreSQL minute pruning is disabled by default so backtests remain reproducible. The 35-day setting applies only when `QFAE_PRUNE_PERSISTED_MINUTE_HISTORY=true`. Profiles are rebuilt from prior sessions and deliberately exclude the current live date.
+The implemented foundation includes an Alembic-managed schema, idempotent candle upserts, per-instrument sync watermarks, a compact PostgreSQL-to-Redis admission cache, a five-day daily overlap, and a two-day one-minute overlap. Live startup does not hydrate full-universe minute history into Redis. Missing profiles and deeper daily history are refreshed afterward in bounded batches. PostgreSQL minute pruning is disabled by default so backtests remain reproducible. The 35-day setting applies only when `QFAE_PRUNE_PERSISTED_MINUTE_HISTORY=true`. Profiles are rebuilt from prior sessions and deliberately exclude the current live date.
 
 ## Required storage tiers
 
@@ -48,7 +48,7 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 
 | Component | Responsibility |
 | --- | --- |
-| PostgreSQL | Durable daily/minute candles, calculated profiles, sync metadata, point-in-time evidence and saved backtest runs. |
+| PostgreSQL | Durable daily/minute candles, calculated profiles, sync metadata, bounded full evidence, compact universe evidence and saved backtest runs. |
 | Redis | Current quotes, forming/completed live minutes, latest feature snapshots, runtime status, and dashboard cache. |
 | Archive storage | Optional long-horizon raw minute data for reproducible research and backtesting. |
 
@@ -71,17 +71,17 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 
 ## Capacity and operational limits
 
-PostgreSQL does not impose a small fixed database quota; practical capacity is governed by the host/Docker disk, write throughput, indexes, vacuuming and backup time. The local Docker database was approximately 48 MB at the start of the 100-stock phase, and its container filesystem reported approximately 950 GB available. These figures are observations, not reserved capacity or a storage guarantee.
+PostgreSQL does not impose a small fixed database quota; practical capacity is governed by the host/Docker disk, write throughput, indexes, vacuuming and backup time. The local database measured approximately 4.07 GB before tiered evidence retention was introduced: about 2.77 GB of candle storage and 1.14 GB of legacy full evidence. These figures are observations, not a reserved-capacity guarantee.
 
-At 139 stocks and 375 normal NSE minutes, Q-FAE can create up to 52,125 point-in-time evidence rows per full session in addition to minute candles. Because evidence rows contain JSON payloads and outcomes are updated as horizons mature, write latency and table/index growth must be measured after real sessions. Both candles and evidence observations intended for backtesting now remain durable by default; retention and archival limits must be introduced deliberately as measured storage grows.
+At 1,686 approved stocks and 375 normal NSE minutes, the theoretical ceiling is 632,250 point-in-time rows per full session before liquidity and no-trade filtering. Q-FAE now limits large full-evidence JSON to the strongest 50 candidates per minute (at most 18,750 rows per normal session) and writes normalized compact checkpoints for the wider non-Dormant universe every 15 minutes or on coarse state changes. Existing evidence is preserved. Both candles and the new evidence tiers remain durable by default; growth must still be measured after real sessions.
 
-Before moving from 139 to 200 stocks:
+For continuing full-universe operation:
 
 - record per-minute calculation and persistence latency;
 - add database-size, table-size, latest-evidence and disk-usage health reporting;
 - set warning thresholds at 70% disk use and a critical threshold at 85%;
 - confirm autovacuum keeps up with progressively updated evidence outcomes;
 - partition `evidence_observations` by month when measured size/query plans justify it;
-- back up durable evidence and move long-horizon raw research data to compressed archive storage.
+- back up durable evidence locally; consider compressed external archives only when measured capacity or recovery requirements justify them.
 
-Before full-universe expansion, benchmark PostgreSQL write/query throughput, partition high-growth tables if justified, and implement the research archive policy.
+See [local PostgreSQL storage and retention](local-storage-retention.md) for the implemented checklist. Convert high-growth tables to native monthly partitions only during a planned maintenance window if query/vacuum measurements justify the rewrite.

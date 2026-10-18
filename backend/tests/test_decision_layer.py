@@ -109,6 +109,60 @@ def test_missing_visible_depth_makes_slippage_gate_ineligible() -> None:
     assert next(gate for gate in result.gates if gate.key == "d5_slippage").status == "reject"
 
 
+def test_rolling_watch_only_tier_is_an_execution_gate() -> None:
+    snapshot = LiveSnapshot(
+        instrument_key="NSE_EQ|TEST",
+        symbol="TEST",
+        received_at=NOW.astimezone(UTC),
+        ltp=100,
+        lower_circuit=80,
+        upper_circuit=120,
+        market_depth=[
+            MarketDepthLevel(
+                bid_price=99.9,
+                bid_quantity=2000,
+                ask_price=100.1,
+                ask_quantity=2000,
+            )
+        ],
+    )
+    feature = StockFeatureSnapshot.model_validate(
+        {
+            "instrument_key": "NSE_EQ|TEST",
+            "symbol": "TEST",
+            "as_of": NOW.astimezone(UTC),
+            "candle_timestamp": NOW - timedelta(minutes=1),
+            "data_quality": "complete",
+            "vwap": {},
+            "gap": {"gap_atr": 0.5},
+            "opening_ranges": [],
+            "relative_strength": {},
+            "momentum": {},
+            "volume": {},
+            "pullback": {},
+            "volatility": {},
+            "liquidity": {
+                "spread_bps": 10,
+                "total_traded_value_inr": 20_000_000,
+                "passes_spread_filter": True,
+                "passes_traded_value_filter": True,
+            },
+        }
+    )
+
+    result = build_risk_assessment(
+        feature,
+        snapshot,
+        as_of=NOW.astimezone(UTC),
+        rolling_liquidity_tier="watch_only",
+        rolling_liquidity_reason="rolling_median_spread_above_25_bps",
+    )
+
+    rolling_gate = next(gate for gate in result.gates if gate.key == "rolling_liquidity")
+    assert rolling_gate.status == "reject"
+    assert result.eligible is False
+
+
 def test_forward_outcomes_do_not_use_prices_before_each_horizon() -> None:
     observation = EvidenceOutcomeObservation(
         instrument_key="NSE_EQ|TEST", symbol="TEST", candle_timestamp=NOW,

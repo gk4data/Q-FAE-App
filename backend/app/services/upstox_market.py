@@ -361,6 +361,28 @@ class UpstoxMarketDataClient:
             )
         return parse_candle_rows(instrument_key, rows)
 
+    def fetch_nse_market_session(
+        self,
+        session_date: date,
+    ) -> tuple[datetime, datetime] | None:
+        """Return Upstox's NSE session window, or None on a non-trading day."""
+        payload = self._get(f"/v2/market/timings/{session_date.isoformat()}")
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise UpstoxMarketDataError("Upstox market timings response was invalid")
+        for row in rows:
+            if not isinstance(row, Mapping) or row.get("exchange") != "NSE":
+                continue
+            try:
+                start = datetime.fromtimestamp(float(row["start_time"]) / 1000, tz=UTC)
+                end = datetime.fromtimestamp(float(row["end_time"]) / 1000, tz=UTC)
+            except (KeyError, TypeError, ValueError, OSError) as exc:
+                raise UpstoxMarketDataError("Upstox returned invalid NSE market timings") from exc
+            if end <= start:
+                raise UpstoxMarketDataError("Upstox returned an invalid NSE session window")
+            return start.astimezone(INDIA_TIMEZONE), end.astimezone(INDIA_TIMEZONE)
+        return None
+
     def fetch_sector(self, isin: str) -> str | None:
         payload = self._get(f"/v2/fundamentals/{quote(isin, safe='')}/profile")
         data = payload.get("data")

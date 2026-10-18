@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.db.models import (
     BacktestRunRecord,
     BacktestTradeRecord,
+    CompactEvidenceObservationRecord,
     DataSyncStateRecord,
     CorporateActionRecord,
     CorporateActionAssessmentRecord,
@@ -27,6 +28,7 @@ from app.db.models import (
     CorporateFinancialContextRecord,
     DailyExecutionQualityRecord,
     EvidenceObservationRecord,
+    FocusTransitionRecord,
     FinancialResultSnapshotRecord,
     FinancialMetricSnapshotRecord,
     MarketCandleRecord,
@@ -34,7 +36,7 @@ from app.db.models import (
     SessionReconciliationRecord,
 )
 from app.models.backtest import BacktestRun, BacktestRunListItem
-from app.models.market import Candle, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, MinuteOfDayProfile
+from app.models.market import Candle, CompactEvidenceObservation, CorporateAction, CorporateActionAdjustment, CorporateActionAIAnalysis, CorporateActionAssessment, CorporateActionDocument, CorporateActionOutcome, CorporateFinancialContext, DailyReconciliationRecord, EvidenceOutcomeObservation, FinancialMetricSnapshot, FinancialResultSnapshot, FocusTransition, MinuteOfDayProfile
 from app.services.evidence_outcomes import evaluate_observation
 from app.services.market_context import INDIA_TIMEZONE
 from app.services.minute_profiles import build_minute_profiles, minute_of_session
@@ -114,6 +116,84 @@ class HistoricalMarketRepository:
         with Session(self.engine) as session:
             records = list(session.scalars(query))
         return [self._to_candle(record) for record in reversed(records)]
+
+    def get_candles_many(
+        self,
+        instrument_keys: Sequence[str],
+        interval: str,
+        limit: int = 300,
+    ) -> dict[str, list[Candle]]:
+        """Load a bounded recent window per instrument in one database query.
+
+        The per-instrument row number is important here: a global LIMIT would let
+        the most recently updated symbols crowd every other symbol out of the
+        admission cache.
+        """
+        keys = list(dict.fromkeys(instrument_keys))
+        result = {key: [] for key in keys}
+        if not keys or limit <= 0:
+            return result
+        ranked = (
+            select(
+                MarketCandleRecord.instrument_key,
+                MarketCandleRecord.interval,
+                MarketCandleRecord.timestamp,
+                MarketCandleRecord.open,
+                MarketCandleRecord.high,
+                MarketCandleRecord.low,
+                MarketCandleRecord.close,
+                MarketCandleRecord.volume,
+                MarketCandleRecord.open_interest,
+                MarketCandleRecord.source,
+                func.row_number()
+                .over(
+                    partition_by=MarketCandleRecord.instrument_key,
+                    order_by=MarketCandleRecord.timestamp.desc(),
+                )
+                .label("recent_rank"),
+            )
+            .where(
+                MarketCandleRecord.instrument_key.in_(keys),
+                MarketCandleRecord.interval == interval,
+            )
+            .subquery()
+        )
+        query = (
+            select(ranked)
+            .where(ranked.c.recent_rank <= limit)
+            .order_by(ranked.c.instrument_key, ranked.c.timestamp)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).mappings()
+            for row in rows:
+                timestamp = row["timestamp"]
+                if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+                    timestamp = timestamp.replace(tzinfo=UTC)
+                result[str(row["instrument_key"])].append(
+                    Candle(
+                        instrument_key=str(row["instrument_key"]),
+                        interval=str(row["interval"]),
+                        timestamp=timestamp,
+                        open=float(row["open"]),
+                        high=float(row["high"]),
+                        low=float(row["low"]),
+                        close=float(row["close"]),
+                        volume=int(row["volume"]),
+                        open_interest=int(row["open_interest"]),
+                        source=str(row["source"]),
+                    )
+                )
+        return result
+
+    def get_profile_instrument_keys(self, instrument_keys: Sequence[str]) -> set[str]:
+        """Return instruments that already have a durable minute-of-day profile."""
+        if not instrument_keys:
+            return set()
+        query = select(MinuteOfDayProfileRecord.instrument_key).where(
+            MinuteOfDayProfileRecord.instrument_key.in_(instrument_keys)
+        ).distinct()
+        with self.engine.connect() as connection:
+            return {str(value) for value in connection.execute(query).scalars()}
 
     def latest_candle_timestamp(self, instrument_key: str, interval: str) -> datetime | None:
         query = select(func.max(MarketCandleRecord.timestamp)).where(
@@ -466,6 +546,68 @@ class HistoricalMarketRepository:
             connection.execute(statement)
         return len(values)
 
+    def save_compact_evidence_observations(
+        self,
+        observations: Iterable[CompactEvidenceObservation],
+    ) -> int:
+        """Upsert storage-efficient background-universe checkpoints."""
+        items = list(observations)
+        if not items:
+            return 0
+        numeric_fields = (
+            "reference_price",
+            "opportunity_score",
+            "coverage_percent",
+            "price_trend_score",
+            "participation_score",
+            "market_sector_score",
+            "fundamental_score",
+        )
+        values: list[dict[str, object]] = []
+        for item in items:
+            payload = item.model_dump()
+            for field in numeric_fields:
+                value = payload[field]
+                payload[field] = Decimal(str(value)) if value is not None else None
+            values.append(payload)
+        statement = insert(CompactEvidenceObservationRecord).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["instrument_key", "candle_timestamp"],
+            set_={
+                key: getattr(statement.excluded, key)
+                for key in values[0]
+                if key not in {"instrument_key", "candle_timestamp"}
+            },
+        )
+        with self.engine.begin() as connection:
+            connection.execute(statement)
+        return len(values)
+
+    def save_focus_transitions(self, transitions: Iterable[FocusTransition]) -> int:
+        """Persist focus changes idempotently for later funnel backtesting."""
+        items = list(transitions)
+        if not items:
+            return 0
+        values: list[dict[str, object]] = []
+        for item in items:
+            payload = item.model_dump()
+            for field in ("opportunity_score", "coverage_percent"):
+                value = payload[field]
+                payload[field] = Decimal(str(value)) if value is not None else None
+            values.append(payload)
+        statement = insert(FocusTransitionRecord).values(values)
+        statement = statement.on_conflict_do_update(
+            index_elements=["instrument_key", "candle_timestamp"],
+            set_={
+                key: getattr(statement.excluded, key)
+                for key in values[0]
+                if key not in {"instrument_key", "candle_timestamp"}
+            },
+        )
+        with self.engine.begin() as connection:
+            connection.execute(statement)
+        return len(values)
+
     @staticmethod
     def _evidence_observation_values(
         observation: EvidenceOutcomeObservation,
@@ -754,6 +896,28 @@ class HistoricalMarketRepository:
             for key in instrument_keys
             if (snapshot := self.get_latest_financial_result_snapshot(instrument_key=key))
         }
+
+    def get_financial_result_recency(
+        self,
+        instrument_keys: Sequence[str],
+    ) -> dict[str, datetime]:
+        """Return the latest stored provider-check time without loading statement payloads."""
+        if not instrument_keys:
+            return {}
+        query = (
+            select(
+                FinancialResultSnapshotRecord.instrument_key,
+                func.max(FinancialResultSnapshotRecord.last_seen_at),
+            )
+            .where(FinancialResultSnapshotRecord.instrument_key.in_(instrument_keys))
+            .group_by(FinancialResultSnapshotRecord.instrument_key)
+        )
+        with self.engine.connect() as connection:
+            return {
+                str(instrument_key): last_seen_at
+                for instrument_key, last_seen_at in connection.execute(query)
+                if last_seen_at is not None
+            }
 
     def upsert_financial_metric_snapshot(self, item: FinancialMetricSnapshot) -> None:
         payload = item.model_dump()

@@ -17,14 +17,14 @@ from app.models.market import (
     RiskAssessment,
 )
 
-MODEL_VERSION = "long-continuation-pilot-v2"
+MODEL_VERSION = "long-continuation-v3"
 STRATEGY = "long_continuation"
 CALIBRATION_STATUS = "provisional_not_backtested"
 DEFAULT_WEIGHTS = {
     "price_trend": 30.0,
     "participation": 20.0,
     "market_sector": 20.0,
-    "liquidity_execution": 15.0,
+    "liquidity_execution": 0.0,
     "fundamental": 15.0,
 }
 FINANCIAL_SECTORS = {"bank", "banking", "nbfc", "finance", "financial services"}
@@ -346,13 +346,27 @@ def build_opportunity_score(
             for gate in evidence.risk_assessment.gates
             if gate.status == "reject"
         )
+    if evidence.liquidity_tier != "active":
+        invalidations.append(
+            f"rolling_liquidity_filter:{evidence.liquidity_tier}:"
+            f"{evidence.liquidity_tier_reason or 'not_active'}"
+        )
     if "intraday_evidence_stale" in evidence.validation_notes:
         invalidations.append("intraday_evidence_stale")
     if coverage < 45:
         invalidations.append("score_coverage_below_45_percent")
     eligible = not invalidations
     if not eligible:
-        status = "ineligible" if any(item.startswith("risk_gate_rejected") or item == "intraday_evidence_stale" for item in invalidations) else "insufficient_data"
+        status = (
+            "ineligible"
+            if any(
+                item.startswith("risk_gate_rejected")
+                or item.startswith("rolling_liquidity_filter")
+                or item == "intraday_evidence_stale"
+                for item in invalidations
+            )
+            else "insufficient_data"
+        )
     elif final_score >= 70:
         status = "high_priority"
     elif final_score >= 55:
@@ -418,6 +432,8 @@ def rank_opportunities(
             day_low=(day_candles[row.instrument_key].low if row.instrument_key in day_candles else None),
             day_close=(day_candles[row.instrument_key].close if row.instrument_key in day_candles else None),
             price_trace=traces.get(row.instrument_key, []),
+            liquidity_tier=row.liquidity_tier,
+            liquidity_tier_reason=row.liquidity_tier_reason,
             score=build_opportunity_score(row, metrics.get(row.instrument_key), weights=weights),
         )
         for row in evidence_rows

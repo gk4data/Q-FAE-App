@@ -91,6 +91,15 @@ class TokenCache:
             self.path.unlink()
 
 
+def analytics_access_token(settings: Settings) -> str | None:
+    """Return the configured long-lived read-only token without exposing it."""
+    token = settings.upstox_analytics_token
+    if not isinstance(token, str):
+        return None
+    token = token.strip()
+    return token or None
+
+
 def next_upstox_token_expiry(now: datetime | None = None) -> datetime:
     """Return the next 03:30 Asia/Kolkata token cutoff as an offset-aware time."""
     now = now or datetime.now(UTC)
@@ -142,18 +151,20 @@ class UpstoxAuthService:
         self.token_cache.save(access_token, next_upstox_token_expiry())
 
     def status(self) -> dict[str, str | bool | None]:
-        configured = all(
+        analytics_token = analytics_access_token(self.settings)
+        oauth_configured = all(
             [
                 self.settings.upstox_client_id,
                 self.settings.upstox_client_secret,
                 self.settings.upstox_redirect_uri,
             ]
         )
-        token = self.token_cache.load() if configured else None
+        token = self.token_cache.load() if oauth_configured else None
         return {
-            "configured": configured,
-            "authenticated": token is not None,
-            "expires_at": token["expires_at"] if token else None,
+            "configured": bool(analytics_token or oauth_configured),
+            "authenticated": bool(analytics_token or token),
+            "expires_at": None if analytics_token else token["expires_at"] if token else None,
+            "auth_mode": "analytics" if analytics_token else "oauth" if token else "none",
         }
 
     def logout(self) -> None:

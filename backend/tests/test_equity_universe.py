@@ -199,3 +199,47 @@ def test_dynamic_universe_applies_market_cap_and_non_company_gates() -> None:
     assert by_symbol["LOWCAP"]["status"] == "excluded_market_cap"
     assert by_symbol["INDEXETF"]["status"] == "excluded_non_company"
     assert by_symbol["PENNY"]["status"] == "excluded_share_price"
+
+
+def test_resolved_universe_order_does_not_rank_by_previous_day_turnover() -> None:
+    master = [
+        {
+            "segment": "NSE_EQ",
+            "instrument_type": "EQ",
+            "name": "ZETA LIMITED",
+            "trading_symbol": "ZETA",
+            "instrument_key": "NSE_EQ|INE000A01040",
+            "isin": "INE000A01040",
+        },
+        {
+            "segment": "NSE_EQ",
+            "instrument_type": "EQ",
+            "name": "ALPHA LIMITED",
+            "trading_symbol": "ALPHA",
+            "instrument_key": "NSE_EQ|INE000A01041",
+            "isin": "INE000A01041",
+        },
+    ]
+    reference = NseMarketReference(
+        security_as_of=date(2026, 10, 15),
+        price_as_of=date(2026, 10, 15),
+        issued_capital={
+            ("INE000A01040", "ZETA"): 10_000_000,
+            ("INE000A01041", "ALPHA"): 10_000_000,
+        },
+        security_type_flags={
+            ("INE000A01040", "ZETA"): "0",
+            ("INE000A01041", "ALPHA"): "0",
+        },
+        close_prices={"ZETA": 600.0, "ALPHA": 600.0},
+        traded_values_inr={"ZETA": 1_000_000_000.0, "ALPHA": 10_000_000.0},
+    )
+
+    rows = build_dynamic_universe(
+        master,
+        set(),
+        reference,
+        minimum_market_cap_crore=500.0,
+    )
+
+    assert [row["candidate"]["trading_symbol"] for row in rows] == ["ALPHA", "ZETA"]

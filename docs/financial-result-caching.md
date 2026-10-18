@@ -14,6 +14,8 @@ For each approved stock with an ISIN, a refresh collects consolidated:
 
 The latest quarterly revenue, operating profit and net profit plus annual operating cash flow continue to populate the lightweight corporate financial context used by later evidence features.
 
+Financial-result retrieval is never part of the blocking live-start path. Normal preparation checks a configurable oldest-first batch (25 stocks by default) after current-session minute backfill completes. The utility endpoint is also bounded to at most 250 stocks per request.
+
 ## Thirty-day cache guard
 
 `QFAE_FINANCIAL_RESULTS_CACHE_DAYS` defaults to 30. A provider call is skipped only when both conditions are true for that stock:
@@ -21,7 +23,7 @@ The latest quarterly revenue, operating profit and net profit plus annual operat
 1. the stored quarterly period is the most recently completed calendar quarter; and
 2. the snapshot was last confirmed within the configured cache window.
 
-A recent snapshot containing an older quarter does not block a refresh. This permits Q-FAE to discover a newly published result. The cache rule is applied both by the configured **Prepare stocks** workflow and by the financial-results utility.
+A recent snapshot containing an older quarter does not block a refresh. This permits Q-FAE to discover a newly published result. The cache rule is applied both by background preparation and by the financial-results utility.
 
 ## Frontend utility
 

@@ -100,7 +100,7 @@ class MinuteOfDayProfile(FrozenModel):
 
 
 class WatchlistItem(FrozenModel):
-    """Frontend-ready state for one stock in the active pilot universe."""
+    """Frontend-ready state for one stock in the approved universe."""
 
     instrument_key: str
     symbol: str
@@ -345,6 +345,39 @@ class OpportunityScoreSnapshot(FrozenModel):
     invalidation_reasons: list[str] = Field(default_factory=list)
 
 
+class IntradayFocusState(FrozenModel):
+    """Current reversible attention state for a silently monitored stock."""
+
+    instrument_key: str
+    symbol: str
+    sector: str | None = None
+    state: str
+    as_of: datetime
+    candle_timestamp: datetime
+    state_since: datetime
+    promote_streak: int = Field(default=0, ge=0)
+    cooling_streak: int = Field(default=0, ge=0)
+    demote_streak: int = Field(default=0, ge=0)
+    reasons: list[str] = Field(default_factory=list)
+
+
+class FocusTransition(FrozenModel):
+    """Durable point-in-time record of an intraday focus-state transition."""
+
+    instrument_key: str
+    symbol: str
+    sector: str | None = None
+    session_date: date
+    candle_timestamp: datetime
+    observed_at: datetime
+    from_state: str | None = None
+    to_state: str
+    reasons: list[str] = Field(default_factory=list)
+    opportunity_score: float | None = Field(default=None, ge=0, le=100)
+    coverage_percent: float | None = Field(default=None, ge=0, le=100)
+    market_regime_state: str | None = None
+
+
 class RankedOpportunity(FrozenModel):
     rank: int | None = Field(default=None, ge=1)
     instrument_key: str
@@ -358,6 +391,11 @@ class RankedOpportunity(FrozenModel):
     day_low: float | None = Field(default=None, gt=0)
     day_close: float | None = Field(default=None, gt=0)
     price_trace: list[float] = Field(default_factory=list, max_length=390)
+    liquidity_tier: str = "active"
+    liquidity_tier_reason: str | None = None
+    focus_state: str = "background"
+    focus_reasons: list[str] = Field(default_factory=list)
+    focus_since: datetime | None = None
     score: OpportunityScoreSnapshot
 
 
@@ -398,6 +436,8 @@ class OpportunityEvidenceSnapshot(FrozenModel):
     derivatives_confirmation: DerivativesConfirmation = Field(
         default_factory=lambda: DerivativesConfirmation()
     )
+    liquidity_tier: str = "active"
+    liquidity_tier_reason: str | None = None
     market_regime: MarketRegimeSnapshot | None = None
     opportunity_score: OpportunityScoreSnapshot | None = None
     validation_notes: list[str] = Field(default_factory=list)
@@ -495,6 +535,32 @@ class EvidenceOutcomeObservation(FrozenModel):
     mae_60m_percent: float | None = None
     outcome_status: str = "pending"
     evaluated_through: datetime | None = None
+
+
+class CompactEvidenceObservation(FrozenModel):
+    """Small background-universe checkpoint retained without large JSON payloads."""
+
+    instrument_key: str
+    symbol: str
+    sector: str | None = None
+    candle_timestamp: datetime
+    observed_at: datetime
+    reference_price: float = Field(gt=0)
+    opportunity_score: float = Field(ge=0, le=100)
+    coverage_percent: float = Field(ge=0, le=100)
+    eligible: bool
+    score_status: str
+    confluence: str
+    signal_state: str
+    risk_status: str | None = None
+    liquidity_tier: str
+    market_regime_state: str | None = None
+    flow_confirmation: str | None = None
+    price_trend_score: float | None = Field(default=None, ge=0, le=100)
+    participation_score: float | None = Field(default=None, ge=0, le=100)
+    market_sector_score: float | None = Field(default=None, ge=0, le=100)
+    fundamental_score: float | None = Field(default=None, ge=0, le=100)
+    capture_reason: str
 
 
 class CorporateAction(FrozenModel):

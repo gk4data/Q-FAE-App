@@ -93,6 +93,12 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .feature-card { margin-bottom: 1.2rem; }
 .evidence-card { margin-bottom: 1.2rem; }
 .opportunity-card { margin-bottom: 1.2rem; border-color: #2c493f; }
+.focus-funnel-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 0.7rem 1.1rem; padding: 0.75rem 1rem; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); color: var(--muted); }
+.focus-funnel-summary span { white-space: nowrap; }
+.focus-funnel-summary b, .focus-funnel-summary .focus-count { color: var(--mint); }
+.focus-funnel-summary .cooling-count, .focus-funnel-summary .cooling-count b { color: #e8b968; }
+.focus-state.cooling { display: inline-flex; width: fit-content; margin-top: 0.35rem; padding: 0.18rem 0.45rem; border: 1px solid rgba(232, 185, 104, 0.38); border-radius: 999px; color: #e8b968; font-size: 0.68rem; letter-spacing: 0.05em; text-transform: uppercase; }
+.focus-funnel-summary small { margin-left: auto; }
 .alpha-matrix-shell { position: relative; padding: 1rem 1.15rem .75rem; border-bottom: 1px solid #253141; background: radial-gradient(circle at 78% 18%, rgb(97 211 164 / 7%), transparent 34%), #0d141c; }
 .alpha-matrix-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1.2rem; }
 .alpha-matrix-heading h3 { margin: 0; color: #e8eef7; font-size: 1rem; }
@@ -107,6 +113,11 @@ h2 { font-size: 2rem; letter-spacing: -.04em; margin: .5rem 0 1rem; }
 .opportunity-table td { min-width: 155px; vertical-align: top; white-space: normal; }
 .opportunity-table td:nth-child(2), .opportunity-table td:nth-last-child(-n+2) { min-width: 220px; }
 .opportunity-table .setup-cell { min-width: 155px; padding-top: .72rem; padding-bottom: .72rem; vertical-align: middle; }
+.non-executable-board { border-top: 1px solid #443329; background: #11171f; }
+.non-executable-board .table-heading { background: rgb(116 83 38 / 8%); }
+.non-executable-board table { min-width: 1180px; }
+.non-executable-board td { min-width: 150px; vertical-align: top; white-space: normal; }
+.non-executable-board td:first-child, .non-executable-board td:last-child { min-width: 230px; }
 .price-sparkline { display: block; width: 132px; height: 48px; overflow: visible; color: #61d3a4; }
 .price-sparkline.falling { color: #e3646d; }
 .sparkline-line { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }

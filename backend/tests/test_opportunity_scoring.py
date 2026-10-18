@@ -115,6 +115,7 @@ def test_supportive_complete_evidence_produces_explainable_high_priority_score()
         "liquidity_execution", "fundamental",
     }
     assert "intraday_support" in result.top_positive_factors
+    assert result.weights["liquidity_execution"] == 0
 
 
 def test_rejected_risk_gate_makes_candidate_ineligible_even_with_positive_evidence() -> None:
@@ -123,6 +124,25 @@ def test_rejected_risk_gate_makes_candidate_ineligible_even_with_positive_eviden
     assert result.eligible is False
     assert result.status == "ineligible"
     assert "risk_gate_rejected:spread" in result.invalidation_reasons
+
+
+def test_watch_only_stock_keeps_opportunity_strength_but_is_not_executable() -> None:
+    evidence = _evidence("WATCH").model_copy(
+        update={
+            "liquidity_tier": "watch_only",
+            "liquidity_tier_reason": "rolling_spread_history_unavailable",
+        }
+    )
+
+    result = build_opportunity_score(evidence, _financials("WATCH"))
+
+    assert result.final_score >= 90
+    assert result.eligible is False
+    assert result.status == "ineligible"
+    assert (
+        "rolling_liquidity_filter:watch_only:rolling_spread_history_unavailable"
+        in result.invalidation_reasons
+    )
 
 
 def test_missing_inputs_reduce_coverage_instead_of_becoming_neutral_values() -> None:

@@ -255,8 +255,6 @@ def build_dynamic_universe(
     rows.sort(
         key=lambda row: (
             status_order.get(str(row["status"]), 9),
-            -float(row.get("daily_traded_value_inr") or 0),
-            -float(row.get("market_cap_crore") or 0),
             str(row["candidate"]["trading_symbol"]),
         )
     )

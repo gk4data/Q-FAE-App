@@ -28,9 +28,11 @@ class MarketStateStore(Protocol):
     def ping(self) -> bool: ...
     def save_candles(self, candles: Iterable[Candle]) -> int: ...
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]: ...
+    def get_candles_many(self, instrument_keys: Iterable[str], limit: int = 500) -> dict[str, list[Candle]]: ...
     def has_candles(self, instrument_key: str) -> bool: ...
     def save_daily_candles(self, candles: Iterable[Candle]) -> int: ...
     def get_daily_candles(self, instrument_key: str, limit: int = 300) -> list[Candle]: ...
+    def get_daily_candles_many(self, instrument_keys: Iterable[str], limit: int = 300) -> dict[str, list[Candle]]: ...
     def has_daily_candles(self, instrument_key: str) -> bool: ...
     def save_snapshot(self, snapshot: LiveSnapshot) -> None: ...
     def get_snapshots(self) -> list[LiveSnapshot]: ...
@@ -119,6 +121,21 @@ class RedisMarketStateStore:
         values = self._redis.zrange(self._candle_key(instrument_key), -limit, -1)
         return [Candle.model_validate_json(value) for value in values]
 
+    def get_candles_many(
+        self,
+        instrument_keys: Iterable[str],
+        limit: int = 500,
+    ) -> dict[str, list[Candle]]:
+        keys = list(dict.fromkeys(instrument_keys))
+        with self._redis.pipeline(transaction=False) as pipeline:
+            for instrument_key in keys:
+                pipeline.zrange(self._candle_key(instrument_key), -limit, -1)
+            values = pipeline.execute()
+        return {
+            instrument_key: [Candle.model_validate_json(value) for value in rows]
+            for instrument_key, rows in zip(keys, values, strict=True)
+        }
+
     def has_candles(self, instrument_key: str) -> bool:
         return bool(self._redis.exists(self._candle_key(instrument_key)))
 
@@ -144,6 +161,21 @@ class RedisMarketStateStore:
     def get_daily_candles(self, instrument_key: str, limit: int = 300) -> list[Candle]:
         values = self._redis.zrange(self._daily_candle_key(instrument_key), -limit, -1)
         return [Candle.model_validate_json(value) for value in values]
+
+    def get_daily_candles_many(
+        self,
+        instrument_keys: Iterable[str],
+        limit: int = 300,
+    ) -> dict[str, list[Candle]]:
+        keys = list(dict.fromkeys(instrument_keys))
+        with self._redis.pipeline(transaction=False) as pipeline:
+            for instrument_key in keys:
+                pipeline.zrange(self._daily_candle_key(instrument_key), -limit, -1)
+            values = pipeline.execute()
+        return {
+            instrument_key: [Candle.model_validate_json(value) for value in rows]
+            for instrument_key, rows in zip(keys, values, strict=True)
+        }
 
     def has_daily_candles(self, instrument_key: str) -> bool:
         return bool(self._redis.exists(self._daily_candle_key(instrument_key)))
@@ -283,6 +315,20 @@ class InMemoryMarketStateStore:
             candles = sorted(self._candles.get(instrument_key, {}).values(), key=lambda item: item.timestamp)
         return candles[-limit:]
 
+    def get_candles_many(
+        self,
+        instrument_keys: Iterable[str],
+        limit: int = 500,
+    ) -> dict[str, list[Candle]]:
+        with self._lock:
+            return {
+                instrument_key: sorted(
+                    self._candles.get(instrument_key, {}).values(),
+                    key=lambda item: item.timestamp,
+                )[-limit:]
+                for instrument_key in dict.fromkeys(instrument_keys)
+            }
+
     def has_candles(self, instrument_key: str) -> bool:
         with self._lock:
             return bool(self._candles.get(instrument_key))
@@ -301,6 +347,20 @@ class InMemoryMarketStateStore:
                 key=lambda item: item.timestamp,
             )
         return candles[-limit:]
+
+    def get_daily_candles_many(
+        self,
+        instrument_keys: Iterable[str],
+        limit: int = 300,
+    ) -> dict[str, list[Candle]]:
+        with self._lock:
+            return {
+                instrument_key: sorted(
+                    self._daily_candles.get(instrument_key, {}).values(),
+                    key=lambda item: item.timestamp,
+                )[-limit:]
+                for instrument_key in dict.fromkeys(instrument_keys)
+            }
 
     def has_daily_candles(self, instrument_key: str) -> bool:
         with self._lock:

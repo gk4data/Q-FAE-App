@@ -97,7 +97,7 @@ def market_runtime_status() -> dict[str, Any]:
 def get_pilot_watchlist(
     limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
 ) -> list[WatchlistItem]:
-    """Return the configured pilot stocks with their latest cached minute data."""
+    """Return approved stocks with their latest cached minute data."""
     try:
         return get_market_runtime().get_watchlist(limit)
     except MarketRuntimeError as exc:
@@ -187,7 +187,7 @@ def get_flow_liquidity_confirmations(
 def get_risk_assessments(
     limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
 ) -> list[RiskAssessment]:
-    """Return execution-quality and tradability gates for the pilot universe."""
+    """Return execution-quality and tradability gates for the approved universe."""
     try:
         return get_market_runtime().get_risk_assessments(limit)
     except MarketRuntimeError as exc:
@@ -241,9 +241,9 @@ def get_opportunity_backtest(run_id: str) -> BacktestRun:
 
 @router.post("/financial-results/check", response_model=FinancialResultCheckReport)
 def check_financial_results(
-    limit: Annotated[int | None, Query(ge=1, le=2000)] = None,
+    limit: Annotated[int | None, Query(ge=1, le=250)] = None,
 ) -> FinancialResultCheckReport:
-    """Check quarterly/annual availability, reusing protected recent snapshots by default."""
+    """Check a bounded quarterly/annual batch, reusing protected recent snapshots."""
     try:
         return get_market_runtime().check_financial_results(limit)
     except MarketRuntimeError as exc:

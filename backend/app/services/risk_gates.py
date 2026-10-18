@@ -51,6 +51,8 @@ def build_risk_assessment(
     recent_spreads_bps: list[float] | None = None,
     recent_depth_imbalances: list[float] | None = None,
     max_spread_range_bps: float = 10,
+    rolling_liquidity_tier: str = "active",
+    rolling_liquidity_reason: str | None = None,
 ) -> RiskAssessment:
     now = as_of or datetime.now(UTC)
     gates: list[RiskGateResult] = []
@@ -61,6 +63,20 @@ def build_risk_assessment(
     gates.append(RiskGateResult(key="spread", status="unavailable" if spread_pass is None else "pass" if spread_pass else "reject", value=feature.liquidity.spread_bps, reason="spread_within_limit" if spread_pass else "spread_exceeds_limit_or_is_unavailable"))
     value_pass = feature.liquidity.passes_traded_value_filter
     gates.append(RiskGateResult(key="traded_value", status="unavailable" if value_pass is None else "pass" if value_pass else "reject", value=feature.liquidity.total_traded_value_inr, reason="traded_value_sufficient" if value_pass else "traded_value_below_limit_or_unavailable"))
+    rolling_liquidity_pass = rolling_liquidity_tier == "active"
+    gates.append(
+        RiskGateResult(
+            key="rolling_liquidity",
+            status="pass" if rolling_liquidity_pass else "reject",
+            value=rolling_liquidity_tier,
+            threshold="active",
+            reason=(
+                "rolling_liquidity_filter_passed"
+                if rolling_liquidity_pass
+                else rolling_liquidity_reason or "rolling_liquidity_filter_failed"
+            ),
+        )
+    )
 
     buy_slippage = estimate_slippage_bps(snapshot, reference_order_value_inr, side="buy") if snapshot else None
     sell_slippage = estimate_slippage_bps(snapshot, reference_order_value_inr, side="sell") if snapshot else None

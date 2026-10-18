@@ -149,6 +149,122 @@ def test_current_session_minute_candles_use_intraday_v3_endpoint() -> None:
     assert all(item.interval == "1minute" for item in result)
 
 
+def test_nse_market_session_uses_provider_timings_and_detects_closed_day() -> None:
+    requested: list[str] = []
+    client = object.__new__(UpstoxMarketDataClient)
+    client._get = lambda path: (
+        requested.append(path)
+        or {
+            "data": [
+                {
+                    "exchange": "NSE",
+                    "start_time": 1_789_353_900_000,
+                    "end_time": 1_789_376_400_000,
+                }
+            ]
+        }
+    )
+
+    session = client.fetch_nse_market_session(datetime(2026, 9, 15).date())
+
+    assert requested == ["/v2/market/timings/2026-09-15"]
+    assert session is not None
+    assert session[0].tzinfo is not None
+    assert session[1] > session[0]
+
+    client._get = lambda _path: {"data": []}
+    assert client.fetch_nse_market_session(datetime(2026, 9, 13).date()) is None
+
+
+def test_pre_open_preparation_arms_live_start_for_market_open(monkeypatch) -> None:
+    scheduled: list[object] = []
+
+    class Timer:
+        def __init__(self, delay, callback, args=()):
+            self.delay = delay
+            self.callback = callback
+            self.args = args
+            self.name = ""
+            self.daemon = False
+            self.started = False
+            self.cancelled = False
+            scheduled.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+    )
+    monkeypatch.setattr("app.services.market_runtime.threading.Timer", Timer)
+    monkeypatch.setattr(runtime, "_require_access_token", lambda: "token")
+    started: list[tuple[object, object]] = []
+    monkeypatch.setattr(
+        runtime,
+        "start_live",
+        lambda **kwargs: started.append(
+            (kwargs["prepared_instruments"], kwargs["session_window"])
+        ) or {"state": "connecting"},
+    )
+    instruments = [{"instrument_key": "NSE_EQ|TEST", "symbol": "TEST"}]
+    now = datetime(2026, 9, 15, 8, 0, tzinfo=IST)
+    market_open = datetime(2026, 9, 15, 9, 15, tzinfo=IST)
+    market_close = datetime(2026, 9, 15, 15, 30, tzinfo=IST)
+
+    result = runtime.arm_or_start_live(
+        prepared_instruments=instruments,
+        now=now,
+        session_window=(market_open, market_close),
+    )
+
+    assert result["state"] == "scheduled"
+    assert result["scheduled_start_at"] == market_open.isoformat()
+    assert len(scheduled) == 1
+    assert scheduled[0].delay == 75 * 60
+    assert scheduled[0].started is True
+    assert started == []
+
+    scheduled[0].callback(*scheduled[0].args)
+    assert started == [(instruments, (market_open, market_close))]
+
+
+def test_prepared_live_starts_immediately_during_market_hours(monkeypatch) -> None:
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+    )
+    monkeypatch.setattr(runtime, "_require_access_token", lambda: "token")
+    started: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runtime,
+        "start_live",
+        lambda **kwargs: started.append(kwargs) or {"state": "connecting"},
+    )
+    instruments = [{"instrument_key": "NSE_EQ|TEST", "symbol": "TEST"}]
+    now = datetime(2026, 9, 15, 11, 0, tzinfo=IST)
+    session = (
+        datetime(2026, 9, 15, 9, 15, tzinfo=IST),
+        datetime(2026, 9, 15, 15, 30, tzinfo=IST),
+    )
+
+    result = runtime.arm_or_start_live(
+        prepared_instruments=instruments,
+        now=now,
+        session_window=session,
+    )
+
+    assert result == {"state": "connecting"}
+    assert started[0]["prepared_instruments"] == instruments
+    assert started[0]["now"] == now
+    assert started[0]["session_window"] == session
+
+
 def test_session_backfill_keeps_regular_hours_and_completed_minutes_only() -> None:
     key = "NSE_EQ|TEST"
     session_date = datetime(2026, 9, 15, tzinfo=IST).date()
@@ -235,6 +351,85 @@ def test_session_backfill_merges_into_cache_and_database(monkeypatch) -> None:
     assert runtime._live["backfill_state"] == "completed"
     assert runtime._live["backfill_processed"] == 1
     assert runtime._live["backfill_candles_loaded"] == 2
+
+
+def test_admission_cache_hydrates_daily_history_in_bounded_batches() -> None:
+    instruments = [
+        {"instrument_key": f"NSE_EQ|{index}", "symbol": f"STOCK{index}"}
+        for index in range(5)
+    ]
+
+    class Repository:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        @staticmethod
+        def get_profile_instrument_keys(_keys):
+            return {"NSE_EQ|0", "NSE_EQ|1"}
+
+        def get_candles_many(self, keys, interval, limit):
+            assert interval == "day"
+            assert limit == 25
+            self.batches.append(list(keys))
+            return {
+                key: [
+                    candle(
+                        key,
+                        datetime(2026, 9, 14, tzinfo=IST),
+                        1_000,
+                    ).model_copy(update={"interval": "day"})
+                ]
+                for key in keys
+            }
+
+    repository = Repository()
+    store = InMemoryMarketStateStore()
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(
+            qfae_bootstrap_batch_size=2,
+            qfae_bootstrap_admission_history_sessions=25,
+        ),
+        state_store=store,
+        universe_service=SimpleNamespace(),
+        historical_repository=repository,
+    )
+
+    runtime._hydrate_daily_admission_cache(instruments)
+
+    assert repository.batches == [
+        ["NSE_EQ|0", "NSE_EQ|1"],
+        ["NSE_EQ|2", "NSE_EQ|3"],
+        ["NSE_EQ|4"],
+    ]
+    assert runtime._bootstrap["daily_history_loaded"] == 5
+    assert runtime._bootstrap["minute_profiles_built"] == 2
+
+
+def test_financial_refresh_batch_prioritises_never_checked_then_oldest() -> None:
+    instruments = [
+        {"instrument_key": "NSE_EQ|NEW", "symbol": "NEW"},
+        {"instrument_key": "NSE_EQ|RECENT", "symbol": "RECENT"},
+        {"instrument_key": "NSE_EQ|OLD", "symbol": "OLD"},
+    ]
+
+    class Repository:
+        @staticmethod
+        def get_financial_result_recency(_keys):
+            return {
+                "NSE_EQ|RECENT": datetime(2026, 9, 14, tzinfo=UTC),
+                "NSE_EQ|OLD": datetime(2026, 8, 1, tzinfo=UTC),
+            }
+
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+        historical_repository=Repository(),
+    )
+
+    selected = runtime._financial_refresh_batch(instruments, 2)
+
+    assert [item["symbol"] for item in selected] == ["NEW", "OLD"]
 
 
 def test_full_feed_message_is_normalized() -> None:
@@ -414,7 +609,7 @@ def test_in_memory_store_replaces_an_updating_minute_candle() -> None:
     assert stored[0].volume == 250
 
 
-def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached() -> None:
+def test_watchlist_defaults_to_full_approved_universe_and_marks_stale_snapshot_cached() -> None:
     instruments = [
         {
             "requested_name": f"Company {index}",
@@ -443,6 +638,10 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
             self.requested_candle_limits.append(limit)
             return super().get_candles(instrument_key, limit)
 
+        def get_candles_many(self, instrument_keys, limit: int = 500):
+            self.requested_candle_limits.append(limit)
+            return super().get_candles_many(instrument_keys, limit)
+
     store = TrackingStore()
     completed = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 30, tzinfo=IST), 250)
     current = candle("NSE_EQ|0", datetime(2026, 9, 8, 9, 31, tzinfo=IST), 100)
@@ -468,17 +667,14 @@ def test_watchlist_defaults_to_ten_pilot_stocks_and_marks_stale_snapshot_cached(
         )
     )
     runtime = MarketRuntime(
-        settings=SimpleNamespace(
-            qfae_market_pilot_size=10,
-            qfae_market_history_days=14,
-        ),
+        settings=SimpleNamespace(qfae_market_history_days=14),
         state_store=store,
         universe_service=UniverseService(),
     )
 
     rows = runtime.get_watchlist()
 
-    assert len(rows) == 10
+    assert len(rows) == 12
     assert rows[0].symbol == "STOCK0"
     assert rows[0].change_percent == 1
     assert rows[0].relative_volume == 2.5
@@ -581,7 +777,7 @@ def test_live_persistence_collects_all_completed_minutes_after_watermark() -> No
     assert list(pending.values()) == [first, second]
 
 
-def test_provider_ranked_order_is_preserved_and_instrument_keys_are_unique() -> None:
+def test_full_provider_universe_is_preserved_and_instrument_keys_are_unique() -> None:
     def row(
         symbol: str,
         key: str,
@@ -609,7 +805,7 @@ def test_provider_ranked_order_is_preserved_and_instrument_keys_are_unique() -> 
         ]
     }
     runtime = MarketRuntime(
-        settings=SimpleNamespace(qfae_market_pilot_size=3),
+        settings=SimpleNamespace(),
         state_store=InMemoryMarketStateStore(),
         universe_service=SimpleNamespace(load=lambda: universe),
     )

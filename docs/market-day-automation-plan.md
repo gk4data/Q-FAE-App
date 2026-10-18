@@ -16,9 +16,9 @@ evidence reliably; it must not place, modify or cancel orders.
 | 08:30 | Azure starts the VM. |
 | 08:35 | Docker starts Q-FAE, Redis and PostgreSQL and verifies health. |
 | 08:40 | The controller verifies credentials, database/Redis availability and the NSE calendar. |
-| 08:45 | Incrementally refresh the approved 139-stock universe, instrument mapping, history and profiles. |
+| 08:45 | Refresh instrument mapping and hydrate the compact rolling admission window from PostgreSQL. |
 | 09:14 | Connect the Upstox Market Data Feed and confirm exchange/session state. |
-| 09:15–15:30 | Build completed one-minute candles and persist features, context, evidence and outcomes. |
+| 09:15–15:30 | Build completed one-minute candles and persist features, context, evidence and outcomes; run optional enrichment in bounded background batches. |
 | 15:30 | Stop the live feed. |
 | 15:40 | Reconcile official daily candles, refresh daily regimes and update minute profiles. |
 | 16:15 | Record a completeness/health report and raise any missing or stale-data warning. |
@@ -47,7 +47,11 @@ holiday and special-session behavior.
 - Run one controller instance with a database-backed session/state record.
 - Check weekends, official NSE holidays and live exchange status.
 - Make preparation, stream start/stop and reconciliation idempotent.
-- Automatically prepare the configured 139-stock universe before open.
+- Automatically prepare the complete approved universe before open.
+- Keep the blocking preparation path limited to admission data and benchmarks;
+  financial statements, missing profiles and metadata must never delay the stream.
+- Give current-session backfill priority over optional provider enrichment.
+- Pause enrichment under memory pressure while leaving live collection running.
 - Connect shortly before 09:15 and begin calculations only from completed
   regular-session minutes.
 - Retain the existing 15:30 safety stop and 15:40 reconciliation/retry flow.
