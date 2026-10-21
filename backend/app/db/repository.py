@@ -203,6 +203,29 @@ class HistoricalMarketRepository:
         with self.engine.connect() as connection:
             return connection.execute(query).scalar_one_or_none()
 
+    def latest_candle_timestamps(
+        self,
+        instrument_keys: Sequence[str],
+        interval: str,
+    ) -> dict[str, datetime]:
+        """Load persistence watermarks for a universe in one indexed query."""
+        if not instrument_keys:
+            return {}
+        query = (
+            select(
+                MarketCandleRecord.instrument_key,
+                func.max(MarketCandleRecord.timestamp),
+            )
+            .where(
+                MarketCandleRecord.instrument_key.in_(instrument_keys),
+                MarketCandleRecord.interval == interval,
+            )
+            .group_by(MarketCandleRecord.instrument_key)
+        )
+        with self.engine.connect() as connection:
+            rows = connection.execute(query).all()
+        return {str(instrument_key): timestamp for instrument_key, timestamp in rows if timestamp}
+
     def count_instruments(self, interval: str, instrument_keys: Sequence[str]) -> int:
         if not instrument_keys:
             return 0
@@ -293,6 +316,32 @@ class HistoricalMarketRepository:
         with Session(self.engine) as session:
             records = list(session.scalars(query))
         return [self._to_profile(record) for record in records]
+
+    def get_minute_profiles_for_candles(
+        self,
+        candles: Sequence[Candle],
+    ) -> dict[str, MinuteOfDayProfile]:
+        """Load the matching minute-of-session profile for many instruments."""
+        requested = {
+            (candle.instrument_key, minute)
+            for candle in candles
+            if (minute := minute_of_session(candle.timestamp)) is not None
+        }
+        if not requested:
+            return {}
+        instrument_keys = {item[0] for item in requested}
+        minutes = {item[1] for item in requested}
+        query = select(MinuteOfDayProfileRecord).where(
+            MinuteOfDayProfileRecord.instrument_key.in_(instrument_keys),
+            MinuteOfDayProfileRecord.minute_of_session.in_(minutes),
+        )
+        with Session(self.engine) as session:
+            records = list(session.scalars(query))
+        return {
+            record.instrument_key: self._to_profile(record)
+            for record in records
+            if (record.instrument_key, record.minute_of_session) in requested
+        }
 
     def count_profile_instruments(self, instrument_keys: Sequence[str]) -> int:
         if not instrument_keys:

@@ -17,6 +17,7 @@ from app.models.market import (
     MarketContext,
     MarketRegimeSnapshot,
     OpportunityEvidenceSnapshot,
+    RankedOpportunity,
     RelativeVolumeMetric,
     RiskAssessment,
     SignalPersistenceSnapshot,
@@ -27,6 +28,7 @@ from app.models.market import (
 class MarketStateStore(Protocol):
     def ping(self) -> bool: ...
     def save_candles(self, candles: Iterable[Candle]) -> int: ...
+    def reset_minute_candles(self) -> int: ...
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]: ...
     def get_candles_many(self, instrument_keys: Iterable[str], limit: int = 500) -> dict[str, list[Candle]]: ...
     def has_candles(self, instrument_key: str) -> bool: ...
@@ -53,6 +55,8 @@ class MarketStateStore(Protocol):
     def get_market_regime(self) -> MarketRegimeSnapshot | None: ...
     def save_evidence(self, evidence: OpportunityEvidenceSnapshot) -> None: ...
     def get_evidence_history(self, instrument_key: str, limit: int = 3) -> list[OpportunityEvidenceSnapshot]: ...
+    def save_ranked_opportunities(self, rows: Iterable[RankedOpportunity]) -> None: ...
+    def get_ranked_opportunities(self) -> list[RankedOpportunity]: ...
     def save_signal(self, signal: SignalPersistenceSnapshot) -> None: ...
     def get_signals(self) -> dict[str, SignalPersistenceSnapshot]: ...
     def save_risk_assessment(self, risk: RiskAssessment) -> None: ...
@@ -72,6 +76,7 @@ class RedisMarketStateStore:
     _MARKET_REGIME_KEY = "qfae:market:regime"
     _SIGNALS_KEY = "qfae:market:signals"
     _RISK_KEY = "qfae:market:risk"
+    _RANKED_OPPORTUNITIES_KEY = "qfae:market:ranked-opportunities:latest"
 
     def __init__(self, redis_url: str, retention_days: int = 35) -> None:
         self._redis = Redis.from_url(
@@ -117,6 +122,26 @@ class RedisMarketStateStore:
             pipeline.execute()
         return len(candle_list)
 
+    def reset_minute_candles(self) -> int:
+        """Asynchronously clear the transient minute working set."""
+        removed_keys = 0
+        keys: list[str] = []
+
+        def unlink_batch(batch: list[str]) -> int:
+            return int(self._redis.unlink(*batch))
+
+        for key in self._redis.scan_iter(
+            match="qfae:market:candles:1m:*",
+            count=100,
+        ):
+            keys.append(key)
+            if len(keys) >= 100:
+                removed_keys += unlink_batch(keys)
+                keys = []
+        if keys:
+            removed_keys += unlink_batch(keys)
+        return removed_keys
+
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]:
         values = self._redis.zrange(self._candle_key(instrument_key), -limit, -1)
         return [Candle.model_validate_json(value) for value in values]
@@ -127,14 +152,20 @@ class RedisMarketStateStore:
         limit: int = 500,
     ) -> dict[str, list[Candle]]:
         keys = list(dict.fromkeys(instrument_keys))
-        with self._redis.pipeline(transaction=False) as pipeline:
-            for instrument_key in keys:
-                pipeline.zrange(self._candle_key(instrument_key), -limit, -1)
-            values = pipeline.execute()
-        return {
-            instrument_key: [Candle.model_validate_json(value) for value in rows]
-            for instrument_key, rows in zip(keys, values, strict=True)
-        }
+        result: dict[str, list[Candle]] = {}
+        for offset in range(0, len(keys), 50):
+            batch = keys[offset : offset + 50]
+            with self._redis.pipeline(transaction=False) as pipeline:
+                for instrument_key in batch:
+                    pipeline.zrange(self._candle_key(instrument_key), -limit, -1)
+                values = pipeline.execute()
+            result.update(
+                {
+                    instrument_key: [Candle.model_validate_json(value) for value in rows]
+                    for instrument_key, rows in zip(batch, values, strict=True)
+                }
+            )
+        return result
 
     def has_candles(self, instrument_key: str) -> bool:
         return bool(self._redis.exists(self._candle_key(instrument_key)))
@@ -168,14 +199,20 @@ class RedisMarketStateStore:
         limit: int = 300,
     ) -> dict[str, list[Candle]]:
         keys = list(dict.fromkeys(instrument_keys))
-        with self._redis.pipeline(transaction=False) as pipeline:
-            for instrument_key in keys:
-                pipeline.zrange(self._daily_candle_key(instrument_key), -limit, -1)
-            values = pipeline.execute()
-        return {
-            instrument_key: [Candle.model_validate_json(value) for value in rows]
-            for instrument_key, rows in zip(keys, values, strict=True)
-        }
+        result: dict[str, list[Candle]] = {}
+        for offset in range(0, len(keys), 50):
+            batch = keys[offset : offset + 50]
+            with self._redis.pipeline(transaction=False) as pipeline:
+                for instrument_key in batch:
+                    pipeline.zrange(self._daily_candle_key(instrument_key), -limit, -1)
+                values = pipeline.execute()
+            result.update(
+                {
+                    instrument_key: [Candle.model_validate_json(value) for value in rows]
+                    for instrument_key, rows in zip(batch, values, strict=True)
+                }
+            )
+        return result
 
     def has_daily_candles(self, instrument_key: str) -> bool:
         return bool(self._redis.exists(self._daily_candle_key(instrument_key)))
@@ -269,6 +306,16 @@ class RedisMarketStateStore:
         values = self._redis.zrange(self._evidence_key(instrument_key), -limit, -1)
         return [OpportunityEvidenceSnapshot.model_validate_json(value) for value in values]
 
+    def save_ranked_opportunities(self, rows: Iterable[RankedOpportunity]) -> None:
+        payload = [row.model_dump(mode="json") for row in rows]
+        self._redis.set(self._RANKED_OPPORTUNITIES_KEY, json.dumps(payload))
+
+    def get_ranked_opportunities(self) -> list[RankedOpportunity]:
+        value = self._redis.get(self._RANKED_OPPORTUNITIES_KEY)
+        if not value:
+            return []
+        return [RankedOpportunity.model_validate(item) for item in json.loads(value)]
+
     def save_signal(self, signal: SignalPersistenceSnapshot) -> None:
         self._redis.hset(self._SIGNALS_KEY, signal.instrument_key, signal.model_dump_json())
 
@@ -298,6 +345,7 @@ class InMemoryMarketStateStore:
         self._evidence: dict[str, list[OpportunityEvidenceSnapshot]] = {}
         self._signals: dict[str, SignalPersistenceSnapshot] = {}
         self._risk: dict[str, RiskAssessment] = {}
+        self._ranked_opportunities: list[RankedOpportunity] = []
         self._lock = threading.RLock()
 
     def ping(self) -> bool:
@@ -309,6 +357,12 @@ class InMemoryMarketStateStore:
             for candle in candle_list:
                 self._candles.setdefault(candle.instrument_key, {})[candle.timestamp] = candle
         return len(candle_list)
+
+    def reset_minute_candles(self) -> int:
+        with self._lock:
+            removed = len(self._candles)
+            self._candles.clear()
+        return removed
 
     def get_candles(self, instrument_key: str, limit: int = 500) -> list[Candle]:
         with self._lock:
@@ -446,6 +500,14 @@ class InMemoryMarketStateStore:
     def get_evidence_history(self, instrument_key: str, limit: int = 3) -> list[OpportunityEvidenceSnapshot]:
         with self._lock:
             return list(self._evidence.get(instrument_key, [])[-limit:])
+
+    def save_ranked_opportunities(self, rows: Iterable[RankedOpportunity]) -> None:
+        with self._lock:
+            self._ranked_opportunities = list(rows)
+
+    def get_ranked_opportunities(self) -> list[RankedOpportunity]:
+        with self._lock:
+            return list(self._ranked_opportunities)
 
     def save_signal(self, signal: SignalPersistenceSnapshot) -> None:
         with self._lock:

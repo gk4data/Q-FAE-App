@@ -46,8 +46,21 @@ function Wait-ForEndpoint {
 }
 
 function Test-DockerEngine {
-    & docker info *> $null
-    return $LASTEXITCODE -eq 0
+    $dockerCommand = Get-Command docker.exe -ErrorAction SilentlyContinue
+    if (-not $dockerCommand) {
+        return $false
+    }
+    $process = Start-Process `
+        -FilePath $dockerCommand.Source `
+        -ArgumentList @("info", "--format", "{{.ServerVersion}}") `
+        -WindowStyle Hidden `
+        -PassThru
+    if (-not $process.WaitForExit(5000)) {
+        $process.Kill()
+        $process.WaitForExit()
+        return $false
+    }
+    return $process.ExitCode -eq 0
 }
 
 Set-Location -LiteralPath $projectRoot

@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from app.models.market import Candle, LiveSnapshot, RelativeVolumeMetric
+from app.models.market import Candle, LiveSnapshot, RankedOpportunity, RelativeVolumeMetric
 from app.services.market_context import build_market_context, calculate_relative_volume
 from app.services.market_runtime import (
     MarketRuntime,
@@ -40,6 +40,34 @@ def candle(instrument_key: str, timestamp: datetime, volume: int) -> Candle:
     )
 
 
+def ranked_opportunity(symbol: str = "TEST") -> RankedOpportunity:
+    return RankedOpportunity.model_validate(
+        {
+            "rank": 1,
+            "instrument_key": f"NSE_EQ|{symbol}",
+            "symbol": symbol,
+            "as_of": datetime(2026, 9, 14, 15, 29, tzinfo=IST),
+            "current_market_price": 101,
+            "session_return_percent": 2.5,
+            "focus_state": "focus",
+            "score": {
+                "model_version": "test-v1",
+                "strategy": "long_continuation",
+                "calibration_status": "test",
+                "evidence_score": 80,
+                "coverage_percent": 90,
+                "coverage_adjusted_score": 72,
+                "persistence_multiplier": 1,
+                "final_score": 72,
+                "eligible": True,
+                "status": "promising",
+                "weights": {},
+                "components": [],
+            },
+        }
+    )
+
+
 def test_parse_candles_and_keep_latest_sessions() -> None:
     rows = [
         ["2026-09-01T09:15:00+05:30", 100, 102, 99, 101, 1200, 0],
@@ -57,6 +85,34 @@ def test_parse_candles_and_keep_latest_sessions() -> None:
 def test_invalid_candle_contract_is_rejected() -> None:
     with pytest.raises(UpstoxMarketDataError):
         parse_candle_rows("NSE_EQ|TEST", [["2026-09-01", 100]])
+
+
+def test_memory_paused_enrichment_rechecks_and_resumes(monkeypatch) -> None:
+    class RetryEvent:
+        def __init__(self) -> None:
+            self.wait_calls: list[float] = []
+
+        def is_set(self) -> bool:
+            return False
+
+        def wait(self, timeout: float) -> bool:
+            self.wait_calls.append(timeout)
+            return False
+
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(qfae_enrichment_memory_retry_minutes=15),
+        state_store=InMemoryMarketStateStore(),
+        universe_service=SimpleNamespace(),
+    )
+    checks = iter(["Available system memory is 1018 MB", None])
+    monkeypatch.setattr(runtime, "_memory_pressure_reason", lambda: next(checks))
+    retry_event = RetryEvent()
+
+    assert runtime._wait_for_memory_capacity(retry_event) is True
+    assert retry_event.wait_calls == [15 * 60]
+    assert runtime._enrichment["state"] == "running"
+    assert runtime._enrichment["pause_reason"] is None
+    assert runtime._enrichment["next_memory_retry_at"] is None
 
 
 def test_readable_company_names_prefer_familiar_names_over_cryptic_symbols() -> None:
@@ -403,6 +459,97 @@ def test_admission_cache_hydrates_daily_history_in_bounded_batches() -> None:
     ]
     assert runtime._bootstrap["daily_history_loaded"] == 5
     assert runtime._bootstrap["minute_profiles_built"] == 2
+
+
+def test_admission_cache_only_reads_missing_daily_history_from_database() -> None:
+    instruments = [
+        {"instrument_key": f"NSE_EQ|{index}", "symbol": f"STOCK{index}"}
+        for index in range(4)
+    ]
+
+    class Repository:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        @staticmethod
+        def get_profile_instrument_keys(_keys):
+            return set()
+
+        def get_candles_many(self, keys, interval, limit):
+            assert interval == "day"
+            assert limit == 25
+            self.batches.append(list(keys))
+            return {
+                key: [
+                    candle(
+                        key,
+                        datetime(2026, 9, 14, tzinfo=IST),
+                        1_000,
+                    ).model_copy(update={"interval": "day"})
+                ]
+                for key in keys
+            }
+
+    repository = Repository()
+    store = InMemoryMarketStateStore()
+    store.save_daily_candles(
+        [
+            candle(
+                "NSE_EQ|0",
+                datetime(2026, 9, 13, tzinfo=IST),
+                900,
+            ).model_copy(update={"interval": "day"}),
+            candle(
+                "NSE_EQ|2",
+                datetime(2026, 9, 13, tzinfo=IST),
+                900,
+            ).model_copy(update={"interval": "day"}),
+        ]
+    )
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(
+            qfae_bootstrap_batch_size=2,
+            qfae_bootstrap_admission_history_sessions=25,
+        ),
+        state_store=store,
+        universe_service=SimpleNamespace(),
+        historical_repository=repository,
+    )
+
+    runtime._hydrate_daily_admission_cache(instruments)
+
+    assert repository.batches == [["NSE_EQ|1", "NSE_EQ|3"]]
+    assert runtime._bootstrap["daily_history_loaded"] == 4
+    assert runtime._bootstrap["daily_history_persisted"] == 4
+
+
+def test_transient_minute_cache_can_be_reset_without_touching_daily_history() -> None:
+    store = InMemoryMarketStateStore()
+    old = candle("NSE_EQ|TEST", datetime(2026, 9, 10, tzinfo=IST), 100)
+    recent = candle("NSE_EQ|TEST", datetime(2026, 9, 14, tzinfo=IST), 200)
+    store.save_candles([old, recent])
+    store.save_daily_candles([recent.model_copy(update={"interval": "day"})])
+
+    removed = store.reset_minute_candles()
+
+    assert removed == 1
+    assert store.get_candles("NSE_EQ|TEST") == []
+    assert store.get_daily_candles("NSE_EQ|TEST")
+
+
+def test_latest_ranked_opportunity_snapshot_survives_live_runtime_state() -> None:
+    store = InMemoryMarketStateStore()
+    expected = ranked_opportunity()
+    store.save_ranked_opportunities([expected])
+    runtime = MarketRuntime(
+        settings=SimpleNamespace(qfae_market_snapshot_interval_seconds=60),
+        state_store=store,
+        universe_service=SimpleNamespace(),
+    )
+
+    result = runtime.get_ranked_opportunities()
+
+    assert result == [expected]
 
 
 def test_financial_refresh_batch_prioritises_never_checked_then_oldest() -> None:

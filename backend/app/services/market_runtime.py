@@ -240,6 +240,12 @@ class MarketRuntime:
         self._liquidity_decision_cache: dict[str, LiquidityUniverseDecision] = {}
         self._liquidity_decision_cache_at: datetime | None = None
         self._liquidity_decision_cache_keys: tuple[str, ...] = ()
+        self._prepared_liquidity_decisions: dict[str, LiquidityUniverseDecision] = {}
+        self._approved_universe_size = 0
+        self._analysis_rotation_offset = 0
+        self._last_daily_regime_bucket: int | None = None
+        self._ranked_opportunity_cache: list[RankedOpportunity] = []
+        self._ranked_opportunity_cache_at: datetime | None = None
         self._bootstrap: dict[str, Any] = {
             "state": "idle",
             "phase": "idle",
@@ -247,6 +253,7 @@ class MarketRuntime:
             "processed": 0,
             "history_loaded": 0,
             "minute_history_persisted": 0,
+            "minute_cache_pruned": 0,
             "minute_profiles_built": 0,
             "daily_history_loaded": 0,
             "daily_history_persisted": 0,
@@ -303,6 +310,8 @@ class MarketRuntime:
             "backfill_recent_errors": [],
             "scheduled_stop_at": None,
             "scheduled_start_at": None,
+            "analysis_count": 0,
+            "last_context_duration_ms": None,
             "error": None,
         }
         self._reconciliation: dict[str, Any] = {
@@ -339,58 +348,18 @@ class MarketRuntime:
             enrichment = dict(self._enrichment)
             live = dict(self._live)
             reconciliation = dict(self._reconciliation)
-        liquidity_universe = {"active": 0, "watch_only": 0, "dormant": 0}
-        approved_universe_size = 0
-        if redis_available and bootstrap["state"] != "running":
+        liquidity_universe = {
+            "active": int(live.get("liquidity_active", 0)),
+            "watch_only": int(live.get("liquidity_watch_only", 0)),
+            "dormant": int(live.get("liquidity_dormant", 0)),
+        }
+        approved_universe_size = self._approved_universe_size or int(bootstrap["total"])
+        if approved_universe_size == 0:
             try:
-                instruments = self._resolved_instruments(None)
-                decisions = self._liquidity_decisions(instruments)
-                keys = [instrument["instrument_key"] for instrument in instruments]
-                approved_universe_size = len(keys)
-                sectors = self.state_store.get_sectors()
-                minute_histories = self.state_store.get_candles_many(keys, limit=1)
-                daily_histories = self.state_store.get_daily_candles_many(keys, limit=1)
-                benchmark_keys = tuple(dict.fromkeys((NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())))
-                benchmark_histories = self.state_store.get_daily_candles_many(
-                    benchmark_keys,
-                    limit=1,
-                )
-                bootstrap.update(
-                    {
-                        "total": len(keys),
-                        "history_loaded": sum(bool(minute_histories.get(key)) for key in keys),
-                        "daily_history_loaded": sum(bool(daily_histories.get(key)) for key in keys),
-                        "benchmark_daily_loaded": sum(
-                            bool(benchmark_histories.get(key)) for key in benchmark_keys
-                        ),
-                        "sectors_loaded": sum(key in sectors for key in keys),
-                    }
-                )
-                for decision in decisions.values():
-                    liquidity_universe[decision.tier] += 1
+                approved_universe_size = len(self._resolved_instruments(None))
+                self._approved_universe_size = approved_universe_size
             except Exception:
-                pass
-        if database_available and bootstrap["state"] != "running":
-            try:
-                instruments = self._resolved_instruments(None)
-                keys = [instrument["instrument_key"] for instrument in instruments]
-                bootstrap["daily_history_persisted"] = (
-                    self.historical_repository.count_instruments("day", keys)
-                    if self.historical_repository
-                    else 0
-                )
-                bootstrap["minute_history_persisted"] = (
-                    self.historical_repository.count_instruments("1minute", keys)
-                    if self.historical_repository
-                    else 0
-                )
-                bootstrap["minute_profiles_built"] = (
-                    self.historical_repository.count_profile_instruments(keys)
-                    if self.historical_repository
-                    else 0
-                )
-            except Exception:
-                pass
+                approved_universe_size = 0
         return {
             "cadence_seconds": self.settings.qfae_market_snapshot_interval_seconds,
             "approved_universe_size": approved_universe_size or bootstrap["total"],
@@ -407,7 +376,16 @@ class MarketRuntime:
         """Build a compact view of cached historical and live data for the approved universe."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
-        liquidity_decisions = self._liquidity_decisions(instruments)
+        self._approved_universe_size = len(instruments)
+        with self._lock:
+            prepared_decisions = dict(self._prepared_liquidity_decisions)
+        if all(item["instrument_key"] in prepared_decisions for item in instruments):
+            liquidity_decisions = {
+                item["instrument_key"]: prepared_decisions[item["instrument_key"]]
+                for item in instruments
+            }
+        else:
+            liquidity_decisions = self._liquidity_decisions(instruments)
         snapshots = {
             snapshot.instrument_key: snapshot
             for snapshot in self.state_store.get_snapshots()
@@ -560,7 +538,7 @@ class MarketRuntime:
             return context
 
     def get_features(self, limit: int | None = None) -> list[StockFeatureSnapshot]:
-        """Return current-session features in approved-universe order."""
+        """Return current-session features, or the latest saved minute after the feed stops."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
         active_keys = self._active_liquidity_keys(instruments)
@@ -570,6 +548,8 @@ class MarketRuntime:
             for snapshot in self.state_store.get_snapshots()
         }
         today = datetime.now(INDIA_TIMEZONE).date()
+        with self._lock:
+            live_connected = bool(self._live["connected"])
         rows = []
         for instrument in instruments:
             key = instrument["instrument_key"]
@@ -577,7 +557,12 @@ class MarketRuntime:
                 continue
             feature = features.get(key)
             snapshot = snapshots.get(key)
-            if feature is None or snapshot is None or snapshot.current_candle is None:
+            if feature is None:
+                continue
+            if not live_connected:
+                rows.append(feature)
+                continue
+            if snapshot is None or snapshot.current_candle is None:
                 continue
             feature_date = feature.candle_timestamp.astimezone(INDIA_TIMEZONE).date()
             snapshot_date = snapshot.current_candle.timestamp.astimezone(INDIA_TIMEZONE).date()
@@ -604,7 +589,15 @@ class MarketRuntime:
         """Return validated feature families and their stored point-in-time score."""
         self._require_state_store()
         instruments = self._resolved_instruments(limit)
-        liquidity_decisions = self._liquidity_decisions(instruments)
+        with self._lock:
+            prepared_decisions = dict(self._prepared_liquidity_decisions)
+        if all(item["instrument_key"] in prepared_decisions for item in instruments):
+            liquidity_decisions = {
+                item["instrument_key"]: prepared_decisions[item["instrument_key"]]
+                for item in instruments
+            }
+        else:
+            liquidity_decisions = self._liquidity_decisions(instruments)
         observed_keys = {
             key for key, decision in liquidity_decisions.items() if decision.tier != "dormant"
         }
@@ -664,7 +657,20 @@ class MarketRuntime:
 
     def get_ranked_opportunities(self, limit: int | None = None) -> list[RankedOpportunity]:
         """Rank current long-continuation candidates with explicit coverage and gates."""
-        evidence = self.get_opportunity_evidence(limit)
+        with self._lock:
+            live_connected = bool(self._live["connected"])
+            if (
+                self._ranked_opportunity_cache_at is not None
+                and datetime.now(UTC) - self._ranked_opportunity_cache_at
+                <= timedelta(seconds=self.settings.qfae_market_snapshot_interval_seconds)
+            ):
+                cached = list(self._ranked_opportunity_cache)
+                return cached[:limit] if limit is not None else cached
+        if not live_connected:
+            saved = self.state_store.get_ranked_opportunities()
+            if saved:
+                return saved[:limit] if limit is not None else saved
+        evidence = self.get_opportunity_evidence(None)
         market_regime = self.state_store.get_market_regime()
         features = self.state_store.get_features()
         snapshots = {
@@ -744,7 +750,11 @@ class MarketRuntime:
                     focus_rank += 1
                     rank = focus_rank
                 result.append(item.model_copy(update={"rank": rank}))
-            return result
+            with self._lock:
+                self._ranked_opportunity_cache = list(result)
+                self._ranked_opportunity_cache_at = datetime.now(UTC)
+            self.state_store.save_ranked_opportunities(result)
+            return result[:limit] if limit is not None else result
         except ValueError as exc:
             raise MarketRuntimeError(f"Opportunity scoring configuration is invalid: {exc}") from exc
 
@@ -968,6 +978,7 @@ class MarketRuntime:
                 "processed": 0,
                 "history_loaded": 0,
                 "minute_history_persisted": 0,
+                "minute_cache_pruned": 0,
                 "minute_profiles_built": 0,
                 "daily_history_loaded": 0,
                 "daily_history_persisted": 0,
@@ -996,6 +1007,7 @@ class MarketRuntime:
                 "finished_at": None,
                 "recent_errors": [],
                 "pause_reason": None,
+                "next_memory_retry_at": None,
             }
             self._bootstrap_thread = threading.Thread(
                 target=self._run_bootstrap,
@@ -1196,6 +1208,9 @@ class MarketRuntime:
             self.settings.qfae_market_request_rate_per_minute,
         )
         try:
+            pruned = self.state_store.reset_minute_candles()
+            with self._lock:
+                self._bootstrap["minute_cache_pruned"] = pruned
             self._hydrate_daily_admission_cache(instruments)
             with UpstoxMarketDataClient(self._require_access_token(), limiter) as client:
                 benchmark_keys = (NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())
@@ -1214,11 +1229,28 @@ class MarketRuntime:
                             )[-25:]
 
             decisions = self._liquidity_decisions(instruments)
+            with self._lock:
+                self._prepared_liquidity_decisions = dict(decisions)
+                self._live["liquidity_active"] = sum(
+                    decision.tier == "active" for decision in decisions.values()
+                )
+                self._live["liquidity_watch_only"] = sum(
+                    decision.tier == "watch_only" for decision in decisions.values()
+                )
+                self._live["liquidity_dormant"] = sum(
+                    decision.tier == "dormant" for decision in decisions.values()
+                )
             live_instruments = [
                 item
                 for item in instruments
                 if decisions[item["instrument_key"]].tier != "dormant"
             ]
+            live_instruments.sort(
+                key=lambda item: (
+                    decisions[item["instrument_key"]].tier != "active",
+                    item["symbol"],
+                )
+            )
             if not live_instruments:
                 # A new database has no 20-session admission history yet. Keep
                 # collecting the provider universe, while the risk layer still
@@ -1281,11 +1313,17 @@ class MarketRuntime:
         keys = [item["instrument_key"] for item in instruments]
         profile_keys = repository.get_profile_instrument_keys(keys)
         sectors = self.state_store.get_sectors()
+        cached_daily = self.state_store.get_daily_candles_many(keys, limit=1)
+        cached_keys = {key for key, candles in cached_daily.items() if candles}
         with self._lock:
             self._bootstrap["minute_profiles_built"] = len(profile_keys)
             self._bootstrap["sectors_loaded"] = sum(key in sectors for key in keys)
-        for offset in range(0, len(keys), batch_size):
-            batch_keys = keys[offset : offset + batch_size]
+            self._bootstrap["daily_history_loaded"] = len(cached_keys)
+            self._bootstrap["daily_history_persisted"] = len(cached_keys)
+        missing_keys = [key for key in keys if key not in cached_keys]
+        del cached_daily
+        for offset in range(0, len(missing_keys), batch_size):
+            batch_keys = missing_keys[offset : offset + batch_size]
             histories = repository.get_candles_many(batch_keys, "day", history_limit)
             loaded = 0
             for candles in histories.values():
@@ -1360,11 +1398,8 @@ class MarketRuntime:
                     if cancel_event.is_set():
                         self._finish_enrichment("cancelled")
                         return
-                    pressure = self._memory_pressure_reason()
-                    if pressure:
-                        with self._lock:
-                            self._enrichment["pause_reason"] = pressure
-                        self._finish_enrichment("paused_memory")
+                    if not self._wait_for_memory_capacity(cancel_event):
+                        self._finish_enrichment("cancelled")
                         return
 
                     batch = instruments[offset : offset + batch_size]
@@ -1474,6 +1509,26 @@ class MarketRuntime:
                 f"enrichment requires at least {minimum_mb} MB"
             )
         return None
+
+    def _wait_for_memory_capacity(self, cancel_event: threading.Event) -> bool:
+        """Wait for the configured memory reserve, preserving enrichment progress."""
+        retry_seconds = self.settings.qfae_enrichment_memory_retry_minutes * 60
+        while not cancel_event.is_set():
+            pressure = self._memory_pressure_reason()
+            if pressure is None:
+                with self._lock:
+                    self._enrichment["state"] = "running"
+                    self._enrichment["pause_reason"] = None
+                    self._enrichment["next_memory_retry_at"] = None
+                return True
+
+            next_retry_at = datetime.now(UTC) + timedelta(seconds=retry_seconds)
+            with self._lock:
+                self._enrichment["state"] = "paused_memory"
+                self._enrichment["pause_reason"] = pressure
+                self._enrichment["next_memory_retry_at"] = next_retry_at.isoformat()
+            cancel_event.wait(retry_seconds)
+        return False
 
     def _finish_enrichment(self, state: str) -> None:
         with self._lock:
@@ -1832,6 +1887,21 @@ class MarketRuntime:
         instrument_keys = list(dict.fromkeys([*symbols.keys()]))
         if len(instrument_keys) > MAX_FULL_FEED_INSTRUMENTS:
             raise MarketRuntimeError("A Full-feed connection supports at most 2,000 instrument keys")
+        elapsed_minutes = max(0.0, (now - market_open).total_seconds() / 60)
+        needs_session_backfill = (
+            elapsed_minutes
+            >= self.settings.qfae_intraday_backfill_min_elapsed_minutes
+        )
+        if self.historical_repository is not None:
+            try:
+                self._persisted_minute_watermarks.update(
+                    self.historical_repository.latest_candle_timestamps(
+                        instrument_keys,
+                        "1minute",
+                    )
+                )
+            except Exception:
+                logger.exception("Could not preload minute persistence watermarks")
         with self._lock:
             if self._stream_thread and self._stream_thread.is_alive():
                 raise MarketRuntimeError("Live market stream is already running")
@@ -1859,8 +1929,10 @@ class MarketRuntime:
                 "cooling_count": 0,
                 "background_count": 0,
                 "evidence_queue_depth": 0,
-                "backfill_state": "waiting_for_stream",
-                "backfill_total": len(instrument_keys),
+                "backfill_state": (
+                    "waiting_for_stream" if needs_session_backfill else "skipped_at_open"
+                ),
+                "backfill_total": len(instrument_keys) if needs_session_backfill else 0,
                 "backfill_processed": 0,
                 "backfill_instruments_loaded": 0,
                 "backfill_candles_loaded": 0,
@@ -1870,6 +1942,8 @@ class MarketRuntime:
                 "backfill_recent_errors": [],
                 "scheduled_stop_at": market_close.isoformat(),
                 "scheduled_start_at": None,
+                "analysis_count": 0,
+                "last_context_duration_ms": None,
                 "error": None,
             }
             self._last_context_bucket = None
@@ -1992,7 +2066,11 @@ class MarketRuntime:
         self._schedule_reconciliation_monitor(session_date)
 
     def _schedule_reconciliation_monitor(self, session_date: date) -> None:
-        timer = threading.Timer(5.0, self._monitor_automatic_reconciliation, args=(session_date,))
+        timer = threading.Timer(
+            self.settings.qfae_market_snapshot_interval_seconds,
+            self._monitor_automatic_reconciliation,
+            args=(session_date,),
+        )
         timer.name = "qfae-after-market-reconciliation-monitor"
         timer.daemon = True
         with self._lock:
@@ -2225,7 +2303,75 @@ class MarketRuntime:
         finally:
             self._context_calculation_lock.release()
 
+    def _select_analysis_instruments(
+        self,
+        instruments: list[dict[str, str]],
+        snapshots: dict[str, LiveSnapshot],
+    ) -> list[dict[str, str]]:
+        """Bound heavy features while screening every live quote for promotion."""
+        available = [
+            item for item in instruments if item["instrument_key"] in snapshots
+        ]
+        maximum = min(
+            len(available),
+            int(getattr(self.settings, "qfae_full_analysis_max_per_minute", 300)),
+        )
+        if len(available) <= maximum:
+            return available
+
+        rotating_size = min(
+            int(getattr(self.settings, "qfae_background_analysis_batch_size", 50)),
+            maximum,
+        )
+        with self._lock:
+            focus_keys = {
+                key
+                for key, state in self._focus_states.items()
+                if state.state in {"focus", "cooling"}
+            }
+
+        def cheap_opportunity(item: dict[str, str]) -> tuple[float, float, str]:
+            snapshot = snapshots[item["instrument_key"]]
+            session_return = float("-inf")
+            if snapshot.ltp is not None and snapshot.previous_close:
+                session_return = (
+                    snapshot.ltp / snapshot.previous_close - 1
+                ) * 100
+            traded_value = (
+                snapshot.ltp * snapshot.total_traded_volume
+                if snapshot.ltp is not None and snapshot.total_traded_volume is not None
+                else 0.0
+            )
+            return session_return, traded_value, item["instrument_key"]
+
+        focused = [item for item in available if item["instrument_key"] in focus_keys]
+        focused.sort(key=cheap_opportunity, reverse=True)
+        chosen = focused[:maximum]
+        chosen_keys = {item["instrument_key"] for item in chosen}
+        core_capacity = max(0, maximum - len(chosen) - rotating_size)
+        ranked = sorted(
+            (item for item in available if item["instrument_key"] not in chosen_keys),
+            key=cheap_opportunity,
+            reverse=True,
+        )
+        core = ranked[:core_capacity]
+        chosen.extend(core)
+        chosen_keys.update(item["instrument_key"] for item in core)
+
+        background = [
+            item for item in available if item["instrument_key"] not in chosen_keys
+        ]
+        remaining = maximum - len(chosen)
+        if background and remaining:
+            with self._lock:
+                start = self._analysis_rotation_offset % len(background)
+                self._analysis_rotation_offset = (start + remaining) % len(background)
+            rotated = background[start:] + background[:start]
+            chosen.extend(rotated[:remaining])
+        return chosen
+
     def _run_minute_context_calculation(self) -> None:
+        started_at = time.monotonic()
         try:
             as_of = datetime.now(UTC)
             all_snapshots = self.state_store.get_snapshots()
@@ -2239,58 +2385,116 @@ class MarketRuntime:
                 feature_snapshots_by_key[instrument_key] = snapshot.model_copy(
                     update={"ltp": completed.close if completed else None}
                 )
-            active_equity_keys = {
-                instrument["instrument_key"]
-                for instrument in self._resolved_instruments(None)
-            }
+            instruments = self._resolved_instruments(None)
+            active_equity_keys = {instrument["instrument_key"] for instrument in instruments}
             selected_snapshots = [
                 snapshot
                 for snapshot in all_snapshots
                 if not snapshot.instrument_key.startswith("NSE_EQ|")
                 or snapshot.instrument_key in active_equity_keys
             ]
+            analysis_instruments = self._select_analysis_instruments(
+                instruments,
+                snapshots_by_key,
+            )
+            analysis_keys = {
+                instrument["instrument_key"] for instrument in analysis_instruments
+            }
             sectors = self.state_store.get_sectors()
-            enriched: list[LiveSnapshot] = []
+            enriched_by_key = {
+                snapshot.instrument_key: snapshot for snapshot in selected_snapshots
+            }
             calculated_features: list[StockFeatureSnapshot] = []
             session_histories: dict[str, list[Candle]] = {}
             completed_for_persistence: dict[tuple[str, datetime], Candle] = {}
-            for snapshot in selected_snapshots:
-                if not snapshot.instrument_key.startswith("NSE_EQ|"):
-                    enriched.append(snapshot)
+
+            equity_snapshots = [
+                snapshot
+                for snapshot in selected_snapshots
+                if snapshot.instrument_key.startswith("NSE_EQ|")
+            ]
+            recent_histories = self.state_store.get_candles_many(
+                [snapshot.instrument_key for snapshot in equity_snapshots],
+                limit=2,
+            )
+            for snapshot in equity_snapshots:
+                completed = self._latest_completed_candle(
+                    snapshot,
+                    recent_histories.get(snapshot.instrument_key, []),
+                )
+                if completed is None:
                     continue
-                history = self.state_store.get_candles(
-                    snapshot.instrument_key,
+                watermark = self._persisted_minute_watermarks.get(snapshot.instrument_key)
+                if watermark is None or completed.timestamp > watermark:
+                    completed_for_persistence[(snapshot.instrument_key, completed.timestamp)] = completed
+            del recent_histories
+
+            batch_size = max(10, min(self.settings.qfae_bootstrap_batch_size, 100))
+            for offset in range(0, len(analysis_instruments), batch_size):
+                batch = analysis_instruments[offset : offset + batch_size]
+                batch_keys = [item["instrument_key"] for item in batch]
+                histories = self.state_store.get_candles_many(
+                    batch_keys,
                     limit=NSE_SESSION_CANDLE_LIMIT,
                 )
-                session_histories[snapshot.instrument_key] = history
-                completed = self._latest_completed_candle(snapshot, history)
-                relative_volume = self._profile_relative_volume(completed) if completed else None
-                if completed and relative_volume is None:
-                    relative_volume = calculate_relative_volume(completed, history)
-                relative_volume_metric = None
-                if completed and relative_volume is not None:
-                    relative_volume_metric = RelativeVolumeMetric(
-                        instrument_key=snapshot.instrument_key,
-                        relative_volume=relative_volume,
-                        candle_timestamp=completed.timestamp,
-                        calculated_at=as_of,
+                daily_histories = self.state_store.get_daily_candles_many(
+                    batch_keys,
+                    limit=20,
+                )
+                completed_by_key = {
+                    key: completed
+                    for key in batch_keys
+                    if (
+                        completed := self._latest_completed_candle(
+                            snapshots_by_key[key],
+                            histories.get(key, []),
+                        )
+                    ) is not None
+                }
+                profiles = (
+                    self.historical_repository.get_minute_profiles_for_candles(
+                        list(completed_by_key.values())
                     )
-                    self.state_store.save_relative_volume(relative_volume_metric)
-                    snapshot = snapshot.model_copy(
-                        update={
-                            "completed_candle_relative_volume": relative_volume,
-                            "completed_candle_timestamp": completed.timestamp,
-                        }
-                    )
-                else:
-                    self.state_store.delete_relative_volume(snapshot.instrument_key)
-                if completed:
-                    self._collect_unpersisted_minutes(
-                        snapshot,
-                        history,
-                        completed,
-                        completed_for_persistence,
-                    )
+                    if self.historical_repository is not None
+                    else {}
+                )
+                for instrument in batch:
+                    key = instrument["instrument_key"]
+                    snapshot = snapshots_by_key[key]
+                    history = histories.get(key, [])
+                    completed = completed_by_key.get(key)
+                    if completed is None:
+                        self.state_store.delete_features(key)
+                        continue
+                    session_histories[key] = history
+                    profile = profiles.get(key)
+                    relative_volume = None
+                    if (
+                        profile is not None
+                        and profile.sample_count >= self.settings.qfae_minute_profile_min_samples
+                        and profile.median_volume > 0
+                    ):
+                        relative_volume = round(completed.volume / profile.median_volume, 4)
+                    if relative_volume is None:
+                        relative_volume = calculate_relative_volume(completed, history)
+                    relative_volume_metric = None
+                    if relative_volume is not None:
+                        relative_volume_metric = RelativeVolumeMetric(
+                            instrument_key=key,
+                            relative_volume=relative_volume,
+                            candle_timestamp=completed.timestamp,
+                            calculated_at=as_of,
+                        )
+                        self.state_store.save_relative_volume(relative_volume_metric)
+                        snapshot = snapshot.model_copy(
+                            update={
+                                "completed_candle_relative_volume": relative_volume,
+                                "completed_candle_timestamp": completed.timestamp,
+                            }
+                        )
+                        enriched_by_key[key] = snapshot
+                    else:
+                        self.state_store.delete_relative_volume(key)
                     try:
                         calculated_features.append(
                             build_stock_features(
@@ -2298,23 +2502,21 @@ class MarketRuntime:
                                 completed,
                                 history,
                                 feature_snapshots_by_key,
-                                sectors.get(snapshot.instrument_key),
+                                sectors.get(key),
                                 relative_volume_metric,
                                 as_of=as_of,
-                                daily_history=self.state_store.get_daily_candles(
-                                    snapshot.instrument_key,
-                                    limit=20,
-                                ),
+                                daily_history=daily_histories.get(key, []),
                                 max_spread_bps=self.settings.qfae_feature_max_spread_bps,
                                 min_traded_value_inr=self.settings.qfae_feature_min_traded_value_inr,
                             )
                         )
                     except Exception:
                         logger.exception("Feature calculation failed for %s", snapshot.symbol)
-                        self.state_store.delete_features(snapshot.instrument_key)
-                else:
-                    self.state_store.delete_features(snapshot.instrument_key)
-                enriched.append(snapshot)
+                        self.state_store.delete_features(key)
+                del histories, daily_histories, completed_by_key, profiles
+
+            for key in set(self.state_store.get_features()) - analysis_keys:
+                self.state_store.delete_features(key)
 
             if self.historical_repository is not None and completed_for_persistence:
                 try:
@@ -2347,9 +2549,18 @@ class MarketRuntime:
                     }
                 )
                 self.state_store.save_features(feature)
-            self._calculate_daily_regimes(as_of, session_histories=session_histories)
+            regime_bucket = int(as_of.timestamp()) // (
+                self.settings.qfae_daily_regime_refresh_minutes * 60
+            )
+            if regime_bucket != self._last_daily_regime_bucket:
+                self._calculate_daily_regimes(
+                    as_of,
+                    session_histories=session_histories,
+                    instruments=analysis_instruments,
+                )
+                self._last_daily_regime_bucket = regime_bucket
             context = build_market_context(
-                enriched,
+                list(enriched_by_key.values()),
                 sectors,
                 as_of=as_of,
                 cadence_seconds=self.settings.qfae_market_snapshot_interval_seconds,
@@ -2360,6 +2571,11 @@ class MarketRuntime:
             self.state_store.save_market_regime(market_regime)
             with self._lock:
                 self._live["last_context_at"] = context.as_of.isoformat()
+                self._live["analysis_count"] = len(calculated_features)
+                self._live["last_context_duration_ms"] = round(
+                    (time.monotonic() - started_at) * 1000,
+                    2,
+                )
             self._queue_minute_evidence(
                 list(self.state_store.get_features().values()),
                 snapshots_by_key,
@@ -2370,6 +2586,8 @@ class MarketRuntime:
         except Exception as exc:
             logger.exception("Minute-level market context calculation failed")
             self._on_stream_error(exc)
+        finally:
+            gc.collect()
 
     def _queue_minute_evidence(
         self,
@@ -2422,7 +2640,12 @@ class MarketRuntime:
         previous_signals = self.state_store.get_signals()
         repository = self.historical_repository
         financial_metrics = self._latest_financial_metrics_by_instrument()
-        liquidity_decisions = self._liquidity_decisions(self._resolved_instruments(None))
+        with self._lock:
+            liquidity_decisions = dict(self._prepared_liquidity_decisions)
+        if not liquidity_decisions:
+            liquidity_decisions = self._liquidity_decisions(
+                self._resolved_instruments(None)
+            )
         observed_keys = {
             key for key, decision in liquidity_decisions.items() if decision.tier != "dormant"
         }
@@ -2660,6 +2883,8 @@ class MarketRuntime:
             except Exception:
                 logger.exception("Could not persist focus transition batch")
         with self._lock:
+            self._ranked_opportunity_cache = []
+            self._ranked_opportunity_cache_at = None
             self._live["last_full_evidence_saved"] = full_saved
             self._live["last_compact_evidence_saved"] = compact_saved
             self._live["last_focus_transitions_saved"] = focus_transitions_saved
@@ -2672,6 +2897,10 @@ class MarketRuntime:
             self._live["background_count"] = sum(
                 item.state == "background" for item in self._focus_states.values()
             )
+        try:
+            self.get_ranked_opportunities()
+        except Exception:
+            logger.exception("Could not refresh the latest ranked-opportunity snapshot")
 
     def _opportunity_scoring_weights(self) -> dict[str, float]:
         return {
@@ -2758,12 +2987,14 @@ class MarketRuntime:
             for snapshot in self.state_store.get_snapshots()
         }
         benchmark_keys = tuple(dict.fromkeys((NIFTY_50_KEY, *SECTOR_INDEX_SYMBOLS.keys())))
+        instrument_keys = [item["instrument_key"] for item in instruments]
+        daily_histories = self.state_store.get_daily_candles_many(
+            [*benchmark_keys, *instrument_keys],
+            limit=self.settings.qfae_daily_history_sessions,
+        )
         benchmark_histories: dict[str, list[Candle]] = {}
         for instrument_key in benchmark_keys:
-            history = self.state_store.get_daily_candles(
-                instrument_key,
-                self.settings.qfae_daily_history_sessions,
-            )
+            history = daily_histories.get(instrument_key, [])
             provisional, _ = (
                 self._provisional_daily_evidence(
                     instrument_key,
@@ -2778,10 +3009,7 @@ class MarketRuntime:
 
         for instrument in instruments:
             instrument_key = instrument["instrument_key"]
-            history = self.state_store.get_daily_candles(
-                instrument_key,
-                self.settings.qfae_daily_history_sessions,
-            )
+            history = daily_histories.get(instrument_key, [])
             provisional, live_relative_volume = (
                 self._provisional_daily_evidence(
                     instrument_key,

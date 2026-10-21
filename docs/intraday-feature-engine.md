@@ -22,7 +22,7 @@ Q-FAE calculates one explainable feature snapshot per pilot stock after each com
 - The opening-range feature stays pending until its full 5/15/30-minute window has elapsed.
 - Each snapshot includes `data_quality` and an `unavailable` list. A missing input remains `N/A`; it is never replaced with zero.
 - Features are kept in Redis and exposed through `GET /api/v1/market/features` in approved-universe order.
-- The dashboard polls the latest snapshot every five seconds, while calculation cadence remains once per minute.
+- The dashboard polls live and analytical state together once per minute. Calculations use completed one-minute candles.
 
 The historical bootstrap retains 14 recent sessions. Upstox permits a maximum one-month date span for 1-to-15-minute Historical Candle V3 requests, so Q-FAE requests at most 29 calendar days and keeps the newest configured exchange sessions.
 

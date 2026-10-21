@@ -49,7 +49,7 @@ Q-FAE now uses the persisted median-volume profile for intraday RVOL when at lea
 | Component | Responsibility |
 | --- | --- |
 | PostgreSQL | Durable daily/minute candles, calculated profiles, sync metadata, bounded full evidence, compact universe evidence and saved backtest runs. |
-| Redis | Current quotes, forming/completed live minutes, latest feature snapshots, runtime status, and dashboard cache. |
+| Redis | Current quotes, forming/completed live-session minutes, latest feature snapshots, runtime status, and dashboard cache. The transient minute keys are reset during preparation and rebuilt from Upstox when starting mid-session; PostgreSQL history is not deleted. |
 | Archive storage | Optional long-horizon raw minute data for reproducible research and backtesting. |
 
 ## Incremental market-day flow

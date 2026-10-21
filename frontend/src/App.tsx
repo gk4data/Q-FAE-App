@@ -17,7 +17,7 @@ type RuntimeStatus = {
   database_available: boolean;
   liquidity_universe: { active: number; watch_only: number; dormant: number };
   bootstrap: { state: string; phase: string; total: number; processed: number; history_loaded: number; minute_history_persisted: number; minute_profiles_built: number; daily_history_loaded: number; daily_history_persisted: number; benchmark_daily_loaded: number; sectors_loaded: number; financial_results_fetched: number; financial_results_reused: number; errors: number; auto_start_live: boolean; live_start_error: string | null };
-  enrichment: { state: string; total: number; processed: number; daily_refreshed: number; minute_profiles_built: number; sectors_loaded: number; financial_processed: number; errors: number; pause_reason: string | null };
+  enrichment: { state: string; total: number; processed: number; daily_refreshed: number; minute_profiles_built: number; sectors_loaded: number; financial_processed: number; errors: number; pause_reason: string | null; next_memory_retry_at: string | null };
   live: { state: string; connected: boolean; subscribed: number; liquidity_active: number; liquidity_watch_only: number; liquidity_dormant: number; last_message_at: string | null; scheduled_start_at: string | null; scheduled_stop_at: string | null; error: string | null };
   reconciliation: { state: string; session_date: string | null; total: number; processed: number; matched: number; with_differences: number; official_only: number; missing: number; errors: number };
 };
@@ -1127,6 +1127,23 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
     positives: (row) => row.score.top_positive_factors.length,
     risks: (row) => row.score.invalidation_reasons.length + row.score.top_cautions.length,
   }, "score");
+  const ineligibleTierOrder: Record<string, number> = {
+    active: 3,
+    watch_only: 2,
+    dormant: 1,
+  };
+  const {
+    sortedRows: sortedHighSignalIneligibleRows,
+    sort: ineligibleSort,
+    requestSort: requestIneligibleSort,
+  } = useSortableRows(highSignalIneligibleRows, {
+    symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
+    setup: traceReturn,
+    cmp: (row) => row.session_return_percent,
+    score: (row) => row.score.final_score,
+    tier: (row) => ineligibleTierOrder[row.liquidity_tier] ?? 0,
+    blocked: (row) => row.score.invalidation_reasons.length,
+  }, "score");
   return (
     <section className="table-card opportunity-card">
       <div className="table-heading">
@@ -1199,9 +1216,16 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
         </div>
         <div className="table-scroll">
           <table>
-            <thead><tr><th>Stock</th><th>Current setup</th><th>CMP</th><th>Opportunity score</th><th>Tracking tier</th><th>Why blocked</th></tr></thead>
+            <thead><tr>
+              <SortableHeader label="Stock" sortKey="symbol" sort={ineligibleSort} onSort={requestIneligibleSort} defaultDirection="asc" />
+              <SortableHeader label="Current setup" sortKey="setup" sort={ineligibleSort} onSort={requestIneligibleSort} />
+              <SortableHeader label="CMP" sortKey="cmp" sort={ineligibleSort} onSort={requestIneligibleSort} />
+              <SortableHeader label="Opportunity score" sortKey="score" sort={ineligibleSort} onSort={requestIneligibleSort} />
+              <SortableHeader label="Tracking tier" sortKey="tier" sort={ineligibleSort} onSort={requestIneligibleSort} />
+              <SortableHeader label="Why blocked" sortKey="blocked" sort={ineligibleSort} onSort={requestIneligibleSort} defaultDirection="asc" />
+            </tr></thead>
             <tbody>
-              {highSignalIneligibleRows.map((row) => (
+              {sortedHighSignalIneligibleRows.map((row) => (
                 <tr key={`ineligible-${row.instrument_key}`}>
                   <td><button className="stock-detail-link" type="button" onClick={() => onSelectStock(row.instrument_key)}><CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} /><small>View details →</small></button><small>{row.sector ?? "Sector unavailable"}</small></td>
                   <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
@@ -1315,7 +1339,7 @@ function ApprovedStocksPanel({ stocks }: { stocks: WatchlistItem[] }) {
     <section className="table-card">
       <div className="table-heading">
         <div><h2>Approved stocks</h2><p>Latest available one-minute values</p></div>
-        <span>Live quotes refresh every 5 seconds · analysis refreshes every 15 seconds · calculations every 60 seconds</span>
+        <span>Dashboard and analysis refresh every 60 seconds · calculations use completed one-minute data</span>
       </div>
       <div className="table-scroll">
         <table>
@@ -1854,14 +1878,14 @@ function Dashboard() {
         fetch(`${apiBaseUrl}/market/features`),
         fetch(`${apiBaseUrl}/market/daily-regimes`),
         fetch(`${apiBaseUrl}/market/evidence`),
-        fetch(`${apiBaseUrl}/market/opportunities`),
+        fetch(`${apiBaseUrl}/market/opportunities?limit=250`),
       ]);
-      setContext(contextResponse.ok ? await contextResponse.json() as MarketContext : null);
-      setMarketRegime(marketRegimeResponse.ok ? await marketRegimeResponse.json() as MarketRegime : null);
-      setFeatures(featuresResponse.ok ? await featuresResponse.json() as StockFeatures[] : []);
-      setRegimes(regimesResponse.ok ? await regimesResponse.json() as DailyRegime[] : []);
-      setEvidence(evidenceResponse.ok ? await evidenceResponse.json() as OpportunityEvidence[] : []);
-      setOpportunities(opportunitiesResponse.ok ? await opportunitiesResponse.json() as RankedOpportunity[] : []);
+      if (contextResponse.ok) setContext(await contextResponse.json() as MarketContext);
+      if (marketRegimeResponse.ok) setMarketRegime(await marketRegimeResponse.json() as MarketRegime);
+      if (featuresResponse.ok) setFeatures(await featuresResponse.json() as StockFeatures[]);
+      if (regimesResponse.ok) setRegimes(await regimesResponse.json() as DailyRegime[]);
+      if (evidenceResponse.ok) setEvidence(await evidenceResponse.json() as OpportunityEvidence[]);
+      if (opportunitiesResponse.ok) setOpportunities(await opportunitiesResponse.json() as RankedOpportunity[]);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not load minute analysis");
     }
@@ -1882,13 +1906,11 @@ function Dashboard() {
 
   useEffect(() => {
     void refresh();
-    const liveTimer = window.setInterval(() => void refreshLive(), 5_000);
-    const analysisTimer = window.setInterval(() => void refreshAnalysis(), 15_000);
+    const dashboardTimer = window.setInterval(() => void refresh(), 60_000);
     return () => {
-      window.clearInterval(liveTimer);
-      window.clearInterval(analysisTimer);
+      window.clearInterval(dashboardTimer);
     };
-  }, [refresh, refreshAnalysis, refreshLive]);
+  }, [refresh]);
 
   useEffect(() => {
     if (activeAnalysisTab === "financials" || activeAnalysisTab === "stock_detail") void loadFinancialMetrics();
@@ -1935,6 +1957,7 @@ function Dashboard() {
   const liveScheduled = runtime?.live.state === "scheduled";
   const liveStarting = ["scheduled", "connecting", "reconnecting"].includes(runtime?.live.state ?? "");
   const universeSize = runtime?.approved_universe_size ?? runtime?.bootstrap.total ?? 0;
+  const latestSnapshotAsOf = opportunities[0]?.as_of ?? context?.as_of ?? features[0]?.as_of ?? null;
   const stockNames = useMemo<StockNameLookup>(() => {
     const byInstrumentKey: Record<string, string> = {};
     const bySymbol: Record<string, string> = {};
@@ -1979,7 +2002,7 @@ function Dashboard() {
         </div>
         <div className="actions">
           {!live && !liveStarting ? (
-            <button type="button" disabled={bootstrapping || busy !== null || !runtime?.redis_available} onClick={() => void runAction("bootstrap")}>
+            <button type="button" disabled={bootstrapping || busy !== null || runtime?.redis_available === false} onClick={() => void runAction("bootstrap")}>
               {bootstrapping ? `Starting market session ${runtime?.bootstrap.processed ?? 0}/${runtime?.bootstrap.total ?? universeSize}` : `Prepare universe${universeSize ? ` (${universeSize})` : ""} & start live`}
             </button>
           ) : (
@@ -1989,9 +2012,10 @@ function Dashboard() {
       </section>
 
       {error && <p className="notice error dashboard-notice">{error}</p>}
+      {!live && latestSnapshotAsOf && <p className="notice dashboard-notice">Showing the most recent saved market snapshot from {new Date(latestSnapshotAsOf).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short", timeZone: "Asia/Kolkata" })} IST. It will remain visible until the next completed live minute is available.</p>}
       {liveScheduled && runtime?.live.scheduled_start_at && <p className="notice dashboard-notice">Universe prepared. Live feed will start automatically at {new Date(runtime.live.scheduled_start_at).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kolkata" })} IST.</p>}
       {runtime?.bootstrap.live_start_error && <p className="notice error dashboard-notice">Preparation completed, but live feed did not start: {runtime.bootstrap.live_start_error}</p>}
-      {runtime?.enrichment.state === "paused_memory" && <p className="notice error dashboard-notice">Optional background enrichment paused to protect the VM: {runtime.enrichment.pause_reason}</p>}
+      {runtime?.enrichment.state === "paused_memory" && <p className="notice error dashboard-notice">Optional background enrichment paused to protect the VM: {runtime.enrichment.pause_reason}. It will retry at {runtime.enrichment.next_memory_retry_at ? new Date(runtime.enrichment.next_memory_retry_at).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit", timeZone: "Asia/Kolkata" }) : "the next scheduled check"} IST.</p>}
 
       <section className="summary-grid" aria-label="Market data status">
         <article><span>Redis</span><strong>{runtime?.redis_available ? "Ready" : "Offline"}</strong></article>

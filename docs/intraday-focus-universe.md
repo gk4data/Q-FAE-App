@@ -30,7 +30,7 @@ This separation prevents late breakouts, sector rotations, news reactions, VWAP 
 
 1. **9:15-9:30 AM - discovery:** process all liquidity-qualified approved stocks each completed minute without prematurely labelling opening noise as Focus.
 2. **From 9:30 AM - provisional classification:** require two consecutive promotable completed minutes before a stock enters Focus.
-3. **Continuous rotation:** show Focus and Focus-Cooling stocks in the opportunity table while scanning every Background stock once per completed minute. Require three materially weak completed minutes before demotion to Background.
+3. **Continuous rotation:** show Focus and Focus-Cooling stocks in the opportunity table. Screen every live quote with inexpensive current-session measures, then run full history-dependent features for the strongest candidates plus a rotating Background discovery batch each completed minute. Require three materially weak completed minutes before demotion to Background.
 4. **After market close:** retain every group's evidence and outcomes. Reconcile the official close and evaluate whether early Focus membership improved forward returns after costs.
 
 ## Groups
@@ -39,7 +39,7 @@ This separation prevents late breakouts, sector rotations, news reactions, VWAP 
 | --- | ---: | --- |
 | Focus | Dynamic | Confirmed long-opportunity candidates shown and ranked prominently. |
 | Focus - Cooling | Dynamic | Green Focus stocks with paused momentum or a constructive pullback; still visible and ranked so the next leg is not missed. |
-| Background | Remaining Active stocks | Hidden from the primary ranking but scanned every minute and retained through compact evidence. |
+| Background | Remaining Active stocks | Hidden from the primary ranking, screened from every live quote, periodically selected for full feature discovery, and retained through compact evidence. |
 | Watch-only | Rolling-liquidity or execution constraint | Streamed and scored for observation but never given an executable rank. |
 | Dormant | Failed trading-continuity gate | Excluded from live subscription while daily history continues to refresh. |
 

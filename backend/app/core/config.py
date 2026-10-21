@@ -38,7 +38,8 @@ class Settings(BaseSettings):
     postgres_user: str = "qfae"
     postgres_password: str | None = None
     qfae_market_history_days: int = 14
-    qfae_market_history_retention_days: int = 35
+    # Redis is a live working set; durable minute history remains in PostgreSQL.
+    qfae_market_history_retention_days: int = Field(default=2, ge=1, le=7)
     qfae_minute_history_retention_days: int = 35
     qfae_prune_persisted_minute_history: bool = False
     qfae_minute_profile_min_samples: int = 5
@@ -46,6 +47,10 @@ class Settings(BaseSettings):
     qfae_market_request_rate_per_second: int = 8
     qfae_market_request_rate_per_minute: int = 450
     qfae_market_snapshot_interval_seconds: int = 60
+    qfae_full_analysis_max_per_minute: int = Field(default=300, ge=50, le=750)
+    qfae_background_analysis_batch_size: int = Field(default=50, ge=10, le=250)
+    qfae_daily_regime_refresh_minutes: int = Field(default=15, ge=5, le=60)
+    qfae_intraday_backfill_min_elapsed_minutes: int = Field(default=2, ge=0, le=30)
     qfae_full_evidence_max_per_minute: int = Field(default=50, ge=1, le=250)
     qfae_compact_evidence_interval_minutes: int = Field(default=15, ge=5, le=60)
     qfae_compact_evidence_score_bucket: int = Field(default=5, ge=1, le=25)
@@ -58,6 +63,7 @@ class Settings(BaseSettings):
     qfae_bootstrap_admission_history_sessions: int = Field(default=25, ge=20, le=60)
     qfae_enrichment_financial_limit_per_run: int = Field(default=25, ge=0, le=250)
     qfae_memory_min_available_mb: int = Field(default=1024, ge=256, le=8192)
+    qfae_enrichment_memory_retry_minutes: int = Field(default=15, ge=1, le=60)
     qfae_reconciliation_delay_minutes: int = Field(default=10, ge=0, le=60)
     qfae_reconciliation_retry_minutes: int = Field(default=5, ge=1, le=30)
     qfae_reconciliation_max_attempts: int = Field(default=8, ge=1, le=24)
