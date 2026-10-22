@@ -13,6 +13,7 @@ from app.services.market_runtime import (
     opportunity_display_values,
     readable_company_name,
 )
+from app.services.opportunity_scoring import MODEL_VERSION
 from app.services.market_state import InMemoryMarketStateStore
 from app.services.upstox_market import (
     INDIA_VIX_KEY,
@@ -51,7 +52,7 @@ def ranked_opportunity(symbol: str = "TEST") -> RankedOpportunity:
             "session_return_percent": 2.5,
             "focus_state": "focus",
             "score": {
-                "model_version": "test-v1",
+                "model_version": MODEL_VERSION,
                 "strategy": "long_continuation",
                 "calibration_status": "test",
                 "evidence_score": 80,

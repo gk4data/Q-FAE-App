@@ -8,7 +8,7 @@ Q-FAE records what the system knew at each completed minute before any strategy 
 - **Forward outcomes:** 5, 15, 30, and 60-minute returns plus 60-minute maximum favourable/adverse excursion are filled only when those candles exist. The official close fills the EOD return during reconciliation.
 - **Signal persistence:** a supportive classification starts as `building` and becomes `confirmed` only when at least two of the latest three completed minutes support it. Prior confirmation can become `weakening` or `failed`.
 - **Execution quality:** the Upstox D5 book is normalized. Q-FAE estimates buy/sell slippage for a configurable reference order and checks current spread, three-minute spread stability, depth-imbalance stability, traded value, and quote freshness.
-- **Tradability gates:** circuit distance and opening-gap/ATR are enforced. Missing ASM/GSM/trade-to-trade and portfolio-capital inputs remain visibly `unavailable`; they never silently pass.
+- **Execution cautions:** circuit distance, opening-gap/ATR, spread and depth conditions are evaluated and displayed independently. Missing ASM/GSM/trade-to-trade and portfolio-capital inputs remain visibly `unavailable`; none of these live execution checks changes the opportunity score or rank.
 - **Persistent market regime:** NIFTY direction, current and rolling breadth, sector participation, India VIX direction and acceleration produce `risk_on`, `mixed`, `risk_off`, or `insufficient` once per completed minute.
 - **F&O contract:** evidence responses expose a provider-neutral derivatives-confirmation object. It remains unavailable until cash-to-derivative mapping and expiry selection are implemented.
 - **Financial context:** Upstox quarterly consolidated income-statement and cash-flow facts are stored separately from event facts and interpretations.
@@ -28,10 +28,10 @@ The existing `GET /api/v1/market/evidence` response includes `signal_persistence
 ## Configuration
 
 - `QFAE_RISK_REFERENCE_ORDER_VALUE_INR` controls the cash amount used for D5 slippage estimation.
-- `QFAE_RISK_MAX_SLIPPAGE_BPS` rejects visible-book slippage above the limit.
-- `QFAE_RISK_MIN_CIRCUIT_DISTANCE_PERCENT` rejects prices too close to either circuit.
-- `QFAE_RISK_MAX_GAP_ATR` rejects unusually large opening gaps relative to daily ATR.
-- `QFAE_RISK_MAX_SPREAD_RANGE_BPS` rejects unstable spreads across the latest three observations.
+- `QFAE_RISK_MAX_SLIPPAGE_BPS` marks visible-book slippage above the limit as an execution caution.
+- `QFAE_RISK_MIN_CIRCUIT_DISTANCE_PERCENT` flags prices too close to either circuit.
+- `QFAE_RISK_MAX_GAP_ATR` flags unusually large opening gaps relative to daily ATR.
+- `QFAE_RISK_MAX_SPREAD_RANGE_BPS` flags unstable spreads across the latest three observations.
 - `QFAE_RISK_CAPITAL_INR` is intentionally optional. Position, loss, and sector-exposure limits must not be presented as active without an explicit capital budget and portfolio state.
 
 ## Inputs staged next

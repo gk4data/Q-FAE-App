@@ -14,17 +14,15 @@ from app.models.market import (
     OpportunityScoreComponent,
     OpportunityScoreSnapshot,
     RankedOpportunity,
-    RiskAssessment,
 )
 
-MODEL_VERSION = "long-continuation-v3"
+MODEL_VERSION = "long-continuation-v5"
 STRATEGY = "long_continuation"
 CALIBRATION_STATUS = "provisional_not_backtested"
 DEFAULT_WEIGHTS = {
     "price_trend": 30.0,
     "participation": 20.0,
     "market_sector": 20.0,
-    "liquidity_execution": 0.0,
     "fundamental": 15.0,
 }
 FINANCIAL_SECTORS = {"bank", "banking", "nbfc", "finance", "financial services"}
@@ -180,54 +178,6 @@ def _market_sector_component(
     )
 
 
-def _liquidity_component(
-    flow: FlowLiquidityConfirmation,
-    risk: RiskAssessment | None,
-    weight: float,
-) -> OpportunityScoreComponent:
-    ignored = {"surveillance", "risk_budget"}
-    status_scores = {"pass": 100.0, "caution": 50.0, "reject": 0.0}
-    measures: list[_Measure] = []
-    if risk is not None:
-        measures = [
-            _Measure(
-                f"risk_{gate.key}",
-                status_scores.get(gate.status),
-                positive=f"{gate.key}_gate_passed",
-                caution=f"{gate.key}_gate_{gate.status}",
-            )
-            for gate in risk.gates
-            if gate.key not in ignored
-        ]
-    else:
-        measures = [
-            _Measure(
-                "spread_filter",
-                None if flow.passes_spread_filter is None else 100 if flow.passes_spread_filter else 0,
-                positive="spread_filter_passed",
-                caution="spread_filter_failed",
-            ),
-            _Measure(
-                "traded_value_filter",
-                None
-                if flow.passes_traded_value_filter is None
-                else 100
-                if flow.passes_traded_value_filter
-                else 0,
-                positive="traded_value_filter_passed",
-                caution="traded_value_filter_failed",
-            ),
-        ]
-    return _component(
-        "liquidity_execution",
-        "Liquidity and execution",
-        weight,
-        measures,
-        extra_positive=[item for item in flow.evidence if "volume" not in item],
-        extra_cautions=[item for item in flow.cautions if "volume" not in item],
-    )
-
-
 def _fundamental_component(
     metrics: FinancialMetricSnapshot | None,
     sector: str | None,
@@ -321,7 +271,6 @@ def build_opportunity_score(
             evidence.market_regime,
             normalized["market_sector"],
         ),
-        _liquidity_component(evidence.flow_liquidity, evidence.risk_assessment, normalized["liquidity_execution"]),
         _fundamental_component(
             point_in_time_metrics,
             evidence.sector,
@@ -338,14 +287,6 @@ def build_opportunity_score(
     final_score = _clamp(coverage_adjusted * persistence)
 
     invalidations: list[str] = []
-    if evidence.risk_assessment is None:
-        invalidations.append("risk_assessment_unavailable")
-    elif not evidence.risk_assessment.eligible:
-        invalidations.extend(
-            f"risk_gate_rejected:{gate.key}"
-            for gate in evidence.risk_assessment.gates
-            if gate.status == "reject"
-        )
     if evidence.liquidity_tier != "active":
         invalidations.append(
             f"rolling_liquidity_filter:{evidence.liquidity_tier}:"
@@ -360,8 +301,7 @@ def build_opportunity_score(
         status = (
             "ineligible"
             if any(
-                item.startswith("risk_gate_rejected")
-                or item.startswith("rolling_liquidity_filter")
+                item.startswith("rolling_liquidity_filter")
                 or item == "intraday_evidence_stale"
                 for item in invalidations
             )
@@ -434,6 +374,7 @@ def rank_opportunities(
             price_trace=traces.get(row.instrument_key, []),
             liquidity_tier=row.liquidity_tier,
             liquidity_tier_reason=row.liquidity_tier_reason,
+            execution_risk=row.risk_assessment,
             score=build_opportunity_score(row, metrics.get(row.instrument_key), weights=weights),
         )
         for row in evidence_rows

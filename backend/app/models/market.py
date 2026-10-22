@@ -396,6 +396,7 @@ class RankedOpportunity(FrozenModel):
     focus_state: str = "background"
     focus_reasons: list[str] = Field(default_factory=list)
     focus_since: datetime | None = None
+    execution_risk: RiskAssessment | None = None
     score: OpportunityScoreSnapshot
 
 

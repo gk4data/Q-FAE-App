@@ -28,7 +28,7 @@ The storage policy separates durable market history from large point-in-time dec
 | Compact evidence | Session start, each 15-minute checkpoint, and coarse state changes | Permanent | Whole-universe discovery, diagnostics and future funnel analysis |
 | Redis live state | Current/short rolling state | Transient | Dashboard and live calculations |
 
-Full evidence selection prioritizes executable candidates, then opportunity score and data coverage. It does not use turnover or previous trading activity as a score component. The liquidity policy remains an admission/execution gate only.
+Full evidence selection prioritizes Active-universe candidates by opportunity score and data coverage. It does not use turnover, previous trading activity or live execution quality as a score component. Continuity and rolling median traded value control admission; spread, slippage and depth remain separately retained cautions.
 
 The compact row contains score, coverage, eligibility, confluence, signal/risk/liquidity states, market regime, flow confirmation and component scores. It deliberately contains no large JSON payload.
 

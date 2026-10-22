@@ -163,7 +163,7 @@ def evaluate_focus_state(
         if prior_state in {"focus", "cooling"}:
             if score is not None and not score.eligible:
                 target = "background"
-                reasons = ["execution_or_risk_gate_failed", *score.invalidation_reasons]
+                reasons = ["opportunity_eligibility_failed", *score.invalidation_reasons]
                 promote_streak = cooling_streak = demote_streak = 0
             elif demote_streak >= demote_confirmation_minutes:
                 target = "background"

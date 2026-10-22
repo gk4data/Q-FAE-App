@@ -91,7 +91,7 @@ Displayed orders may be cancelled or misleading, so order-book variables must no
 
 Community attention is an attention/catalyst feature, not a standalone recommendation or truth signal. Unverified tips and raw follower counts must not directly create a trade decision.
 
-## Candidate model components
+## Candidate opportunity-model components
 
 The final decision layer should retain explainable component scores for:
 
@@ -99,9 +99,10 @@ The final decision layer should retain explainable component scores for:
 2. Participation strength
 3. Price and trend quality
 4. Market and sector alignment
-5. Liquidity and execution quality
-6. Fundamental quality and risk
-7. News/community confirmation and manipulation risk
+5. Fundamental quality and risk
+6. News/community confirmation and manipulation risk
+
+Liquidity and execution quality remains a separate pre-trade overlay. It can produce spread, slippage, depth or order-size cautions, but it does not change the opportunity score, rank or Focus state.
 
 Weights, thresholds, interactions, and long/short direction will be decided only after backtesting. Q-FAE should show the underlying reasons, invalidation conditions, data freshness, and confidence—not only a single score.
 

@@ -111,26 +111,25 @@ def test_supportive_complete_evidence_produces_explainable_high_priority_score()
     assert result.coverage_percent == 100
     assert sum(result.weights.values()) == 100
     assert {item.key for item in result.components} == {
-        "price_trend", "participation", "market_sector",
-        "liquidity_execution", "fundamental",
+        "price_trend", "participation", "market_sector", "fundamental",
     }
     assert "intraday_support" in result.top_positive_factors
-    assert result.weights["liquidity_execution"] == 0
+    assert "liquidity_execution" not in result.weights
 
 
-def test_rejected_risk_gate_makes_candidate_ineligible_even_with_positive_evidence() -> None:
+def test_rejected_execution_gate_does_not_change_opportunity_eligibility() -> None:
     result = build_opportunity_score(_evidence("WIDE", rejected=True), _financials("WIDE"))
 
-    assert result.eligible is False
-    assert result.status == "ineligible"
-    assert "risk_gate_rejected:spread" in result.invalidation_reasons
+    assert result.eligible is True
+    assert result.status == "high_priority"
+    assert not any(item.startswith("risk_gate_rejected") for item in result.invalidation_reasons)
 
 
-def test_watch_only_stock_keeps_opportunity_strength_but_is_not_executable() -> None:
+def test_low_turnover_watch_only_stock_keeps_strength_but_stays_outside_active_rank() -> None:
     evidence = _evidence("WATCH").model_copy(
         update={
             "liquidity_tier": "watch_only",
-            "liquidity_tier_reason": "rolling_spread_history_unavailable",
+            "liquidity_tier_reason": "rolling_median_traded_value_below_active_threshold",
         }
     )
 
@@ -140,7 +139,7 @@ def test_watch_only_stock_keeps_opportunity_strength_but_is_not_executable() -> 
     assert result.eligible is False
     assert result.status == "ineligible"
     assert (
-        "rolling_liquidity_filter:watch_only:rolling_spread_history_unavailable"
+        "rolling_liquidity_filter:watch_only:rolling_median_traded_value_below_active_threshold"
         in result.invalidation_reasons
     )
 
@@ -152,8 +151,8 @@ def test_missing_inputs_reduce_coverage_instead_of_becoming_neutral_values() -> 
     result = build_opportunity_score(evidence, None)
 
     assert result.coverage_percent < 100
-    assert result.eligible is False
-    assert "risk_assessment_unavailable" in result.invalidation_reasons
+    assert result.eligible is True
+    assert "risk_assessment_unavailable" not in result.invalidation_reasons
     fundamental = next(item for item in result.components if item.key == "fundamental")
     assert fundamental.score is None
     assert fundamental.unavailable_inputs == ["financial_metrics"]
@@ -171,7 +170,7 @@ def test_financial_snapshot_newer_than_the_evidence_is_not_used() -> None:
     assert fundamental.unavailable_inputs == ["financial_metrics_newer_than_evidence"]
 
 
-def test_ranking_orders_eligible_candidates_and_leaves_rejected_candidate_unranked() -> None:
+def test_ranking_ignores_execution_rejection_but_preserves_it_as_separate_context() -> None:
     good = _evidence("GOOD")
     weak = _evidence("WEAK", supportive=False)
     rejected = _evidence("REJECT", rejected=True)
@@ -199,8 +198,10 @@ def test_ranking_orders_eligible_candidates_and_leaves_rejected_candidate_unrank
         {good.instrument_key: [120, 121.5, 123, 125.5]},
     )
 
-    assert [item.symbol for item in rows] == ["GOOD", "WEAK", "REJECT"]
-    assert [item.rank for item in rows] == [1, 2, None]
+    assert [item.symbol for item in rows] == ["GOOD", "REJECT", "WEAK"]
+    assert [item.rank for item in rows] == [1, 2, 3]
+    assert rows[1].execution_risk is not None
+    assert rows[1].execution_risk.eligible is False
     assert rows[0].session_return_percent == 3.25
     assert rows[0].current_market_price == 125.5
     assert (rows[0].day_open, rows[0].day_high, rows[0].day_low, rows[0].day_close) == (
@@ -210,4 +211,4 @@ def test_ranking_orders_eligible_candidates_and_leaves_rejected_candidate_unrank
         125.5,
     )
     assert rows[0].price_trace == [120, 121.5, 123, 125.5]
-    assert rows[1].session_return_percent == -1.5
+    assert rows[2].session_return_percent == -1.5

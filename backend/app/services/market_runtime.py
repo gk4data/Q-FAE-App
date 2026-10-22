@@ -63,7 +63,7 @@ from app.services.financial_results import (
 )
 from app.services.financial_metrics import calculate_financial_metrics
 from app.services.focus_universe import evaluate_focus_state
-from app.services.opportunity_scoring import build_opportunity_score, rank_opportunities
+from app.services.opportunity_scoring import MODEL_VERSION, build_opportunity_score, rank_opportunities
 from app.services.market_regime import build_market_regime
 from app.services.market_features import build_stock_features
 from app.services.liquidity_universe import (
@@ -668,7 +668,7 @@ class MarketRuntime:
                 return cached[:limit] if limit is not None else cached
         if not live_connected:
             saved = self.state_store.get_ranked_opportunities()
-            if saved:
+            if saved and all(item.score.model_version == MODEL_VERSION for item in saved):
                 return saved[:limit] if limit is not None else saved
         evidence = self.get_opportunity_evidence(None)
         market_regime = self.state_store.get_market_regime()
@@ -1252,9 +1252,9 @@ class MarketRuntime:
                 )
             )
             if not live_instruments:
-                # A new database has no 20-session admission history yet. Keep
-                # collecting the provider universe, while the risk layer still
-                # marks these unclassified stocks ineligible for ranking.
+                # A new database may not have enough rolling admission history
+                # yet. Keep collecting the provider universe while the liquidity
+                # tier keeps these unclassified stocks outside Active ranking.
                 live_instruments = list(instruments)
                 with self._lock:
                     self._bootstrap["universe_warning"] = (
@@ -2907,7 +2907,6 @@ class MarketRuntime:
             "price_trend": self.settings.qfae_score_weight_price_trend,
             "participation": self.settings.qfae_score_weight_participation,
             "market_sector": self.settings.qfae_score_weight_market_sector,
-            "liquidity_execution": self.settings.qfae_score_weight_liquidity_execution,
             "fundamental": self.settings.qfae_score_weight_fundamental,
         }
 
@@ -3162,22 +3161,15 @@ class MarketRuntime:
         ):
             return dict(self._liquidity_decision_cache)
         as_of_date = datetime.now(INDIA_TIMEZONE).date()
-        lookback = int(getattr(self.settings, "qfae_liquidity_lookback_sessions", 20))
+        lookback = int(getattr(self.settings, "qfae_liquidity_lookback_sessions", 10))
         minimum_traded_sessions = int(
-            getattr(self.settings, "qfae_liquidity_min_traded_sessions", 18)
+            getattr(self.settings, "qfae_liquidity_min_traded_sessions", 8)
         )
         active_threshold = float(
             getattr(
                 self.settings,
                 "qfae_liquidity_active_median_traded_value_inr",
-                50_000_000.0,
-            )
-        )
-        max_median_spread = float(
-            getattr(
-                self.settings,
-                "qfae_liquidity_max_median_spread_bps",
-                25.0,
+                20_000_000.0,
             )
         )
         reference_session_dates = [
@@ -3207,7 +3199,6 @@ class MarketRuntime:
                 daily_median_spreads_bps=spread_histories.get(
                     instrument["instrument_key"], []
                 ),
-                max_median_spread_bps=max_median_spread,
             )
             for instrument in instruments
         }

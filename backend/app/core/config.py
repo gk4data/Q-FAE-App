@@ -80,16 +80,14 @@ class Settings(BaseSettings):
     qfae_risk_max_spread_range_bps: float = 10.0
     qfae_risk_capital_inr: float | None = None
     qfae_financial_results_cache_days: int = 30
-    qfae_liquidity_lookback_sessions: int = Field(default=20, ge=10, le=60)
-    qfae_liquidity_min_traded_sessions: int = Field(default=18, ge=1, le=60)
+    qfae_liquidity_lookback_sessions: int = Field(default=10, ge=5, le=60)
+    qfae_liquidity_min_traded_sessions: int = Field(default=8, ge=1, le=60)
     qfae_liquidity_active_median_traded_value_inr: float = Field(
-        default=50_000_000.0, gt=0
+        default=20_000_000.0, gt=0
     )
-    qfae_liquidity_max_median_spread_bps: float = Field(default=25.0, gt=0)
     qfae_score_weight_price_trend: float = Field(default=30.0, ge=0)
     qfae_score_weight_participation: float = Field(default=20.0, ge=0)
     qfae_score_weight_market_sector: float = Field(default=20.0, ge=0)
-    qfae_score_weight_liquidity_execution: float = Field(default=0.0, ge=0)
     qfae_score_weight_fundamental: float = Field(default=15.0, ge=0)
 
     @property

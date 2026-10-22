@@ -32,17 +32,16 @@ def classify_liquidity_tier(
     daily_candles: list[Candle],
     *,
     as_of_date: date,
-    lookback_sessions: int = 20,
-    minimum_traded_sessions: int = 18,
-    active_median_traded_value_inr: float = 50_000_000,
+    lookback_sessions: int = 10,
+    minimum_traded_sessions: int = 8,
+    active_median_traded_value_inr: float = 20_000_000,
     reference_session_dates: list[date] | None = None,
     daily_median_spreads_bps: list[float] | None = None,
-    max_median_spread_bps: float = 25.0,
 ) -> LiquidityUniverseDecision:
-    """Apply rolling trading-continuity, turnover and spread admission rules."""
+    """Apply rolling trading-continuity and turnover admission rules."""
     if not 1 <= minimum_traded_sessions <= lookback_sessions:
         raise ValueError("minimum traded sessions must fit inside the lookback")
-    if active_median_traded_value_inr <= 0 or max_median_spread_bps <= 0:
+    if active_median_traded_value_inr <= 0:
         raise ValueError("liquidity thresholds must be positive")
 
     completed_by_date = {
@@ -84,23 +83,20 @@ def classify_liquidity_tier(
             latest_daily_traded_value_inr=round(values[-1], 2) if values else None,
             spread_sessions_available=len(spreads),
             median_spread_bps=round(median_spread, 4) if median_spread is not None else None,
-            reason="traded_fewer_than_18_of_last_20_sessions",
+            reason=(
+                f"traded_fewer_than_{minimum_traded_sessions}_of_last_"
+                f"{lookback_sessions}_sessions"
+            ),
         )
 
     median_value = float(median(values))
     latest_value = values[-1]
     if median_value < active_median_traded_value_inr:
         tier = "watch_only"
-        reason = "rolling_median_traded_value_below_five_crore"
-    elif median_spread is None:
-        tier = "watch_only"
-        reason = "rolling_spread_history_unavailable"
-    elif median_spread > max_median_spread_bps:
-        tier = "watch_only"
-        reason = "rolling_median_spread_above_25_bps"
+        reason = "rolling_median_traded_value_below_active_threshold"
     else:
         tier = "active"
-        reason = "continuity_turnover_and_spread_active"
+        reason = "continuity_and_turnover_active"
 
     return LiquidityUniverseDecision(
         tier=tier,

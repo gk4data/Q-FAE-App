@@ -294,6 +294,24 @@ type EvidencePillar = {
   cautions: string[];
 };
 
+type ExecutionRisk = {
+  eligible: boolean;
+  status: "pass" | "partial" | "rejected";
+  reference_order_value_inr: number;
+  estimated_buy_slippage_bps: number | null;
+  estimated_sell_slippage_bps: number | null;
+  spread_range_bps: number | null;
+  distance_to_upper_circuit_percent: number | null;
+  distance_to_lower_circuit_percent: number | null;
+  gates: Array<{
+    key: string;
+    status: string;
+    value: number | string | boolean | null;
+    threshold: number | string | null;
+    reason: string;
+  }>;
+};
+
 type OpportunityEvidence = {
   instrument_key: string;
   symbol: string;
@@ -327,16 +345,7 @@ type OpportunityEvidence = {
     transition: string | null;
     reason: string;
   };
-  risk_assessment: null | {
-    eligible: boolean;
-    status: "pass" | "partial" | "rejected";
-    reference_order_value_inr: number;
-    estimated_buy_slippage_bps: number | null;
-    estimated_sell_slippage_bps: number | null;
-    distance_to_upper_circuit_percent: number | null;
-    distance_to_lower_circuit_percent: number | null;
-    gates: Array<{ key: string; status: string; reason: string }>;
-  };
+  risk_assessment: ExecutionRisk | null;
   validation_notes: string[];
 };
 
@@ -370,6 +379,7 @@ type RankedOpportunity = {
   focus_state: "focus" | "cooling" | "background" | "watch_only" | "dormant";
   focus_reasons: string[];
   focus_since: string | null;
+  execution_risk: ExecutionRisk | null;
   score: {
     model_version: string;
     strategy: string;
@@ -819,11 +829,16 @@ function DailyRegimePanel({ regimes, stockNames }: { regimes: DailyRegime[]; sto
   );
 }
 
-function FeatureMatrix({ features, stockNames }: { features: StockFeatures[]; stockNames: StockNameLookup }) {
+function FeatureMatrix({ features, stocks, stockNames }: { features: StockFeatures[]; stocks: WatchlistItem[]; stockNames: StockNameLookup }) {
   const openingRange = (feature: StockFeatures, minutes: number) =>
     feature.opening_ranges.find((range) => range.minutes === minutes);
+  const stockByInstrument = useMemo(
+    () => new Map(stocks.map((stock) => [stock.instrument_key, stock])),
+    [stocks],
+  );
   const { sortedRows, sort, requestSort } = useSortableRows(features, {
     symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
+    cmp: (row) => stockByInstrument.get(row.instrument_key)?.change_percent ?? row.relative_strength.session_return_percent,
     vwap: (row) => row.vwap.position_percent,
     gap: (row) => row.gap.gap_percent,
     opening_ranges: (row) => openingRange(row, 30)?.breakout_percent,
@@ -846,6 +861,7 @@ function FeatureMatrix({ features, stockNames }: { features: StockFeatures[]; st
           <thead>
             <tr>
               <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+              <SortableHeader label="CMP" sortKey="cmp" sort={sort} onSort={requestSort} />
               <SortableHeader label="VWAP" sortKey="vwap" sort={sort} onSort={requestSort} />
               <SortableHeader label="Opening gap" sortKey="gap" sort={sort} onSort={requestSort} />
               <SortableHeader label="Opening ranges" sortKey="opening_ranges" sort={sort} onSort={requestSort} />
@@ -860,12 +876,18 @@ function FeatureMatrix({ features, stockNames }: { features: StockFeatures[]; st
           <tbody>
             {sortedRows.map((feature) => {
               const ranges = [5, 15, 30].map((minutes) => ({ minutes, range: openingRange(feature, minutes) }));
+              const stock = stockByInstrument.get(feature.instrument_key);
+              const sessionChange = stock?.change_percent ?? feature.relative_strength.session_return_percent;
               return (
                 <tr key={feature.instrument_key}>
                   <td>
                     <CompanyName names={stockNames} instrumentKey={feature.instrument_key} symbol={feature.symbol} />
                     <small>{feature.sector ?? "Sector unavailable"}</small>
                     <span className={`quality-badge ${feature.data_quality}`}>{feature.data_quality}</span>
+                  </td>
+                  <td className="numeric cmp-cell">
+                    <strong className={`cmp-price ${tone(sessionChange)}`}>{stock?.ltp == null ? "—" : `₹${number(stock.ltp)}`}</strong>
+                    <span className={`cmp-change ${tone(sessionChange)}`}>{signedPercent(sessionChange)}</span>
                   </td>
                   <td>
                     <MetricLine label="Position" value={signedPercent(feature.vwap.position_percent)} valueClass={tone(feature.vwap.position_percent)} />
@@ -926,7 +948,7 @@ function FeatureMatrix({ features, stockNames }: { features: StockFeatures[]; st
               );
             })}
             {!features.length && (
-              <tr><td className="feature-empty" colSpan={10}>Waiting for a completed current-session candle. Use Prepare stocks &amp; start live during market hours.</td></tr>
+              <tr><td className="feature-empty" colSpan={11}>Waiting for a completed current-session candle. Use Prepare stocks &amp; start live during market hours.</td></tr>
             )}
           </tbody>
         </table>
@@ -947,7 +969,6 @@ type AlphaMatrixDatum = {
   status: RankedOpportunity["score"]["status"];
   sessionReturn: number | null;
   participationScore: number | null;
-  liquidityScore: number | null;
 };
 
 const MATRIX_STATUS_COLORS: Record<RankedOpportunity["score"]["status"], string> = {
@@ -991,9 +1012,9 @@ function AlphaMatrix({ rows, onSelectStock, stockNames }: { rows: RankedOpportun
       const componentByKey = Object.fromEntries(row.score.components.map((component) => [component.key, component]));
       const confidenceBeforeGates = row.score.coverage_percent * row.score.persistence_multiplier;
       const confidenceProxy = row.score.eligible ? confidenceBeforeGates : Math.min(confidenceBeforeGates, 30);
-      const liquidityScore = componentByKey.liquidity_execution?.score ?? null;
+      const participationScore = componentByKey.participation?.score ?? null;
       return {
-        value: [row.score.final_score, Math.max(0, Math.min(100, confidenceProxy)), liquidityScore ?? 0],
+        value: [row.score.final_score, Math.max(0, Math.min(100, confidenceProxy)), participationScore ?? 0],
         name: companyNameFor(stockNames, row.instrument_key, row.symbol),
         instrumentKey: row.instrument_key,
         sector: row.sector ?? "Sector unavailable",
@@ -1003,8 +1024,7 @@ function AlphaMatrix({ rows, onSelectStock, stockNames }: { rows: RankedOpportun
         persistence: row.score.persistence_multiplier,
         status: row.score.status,
         sessionReturn: row.session_return_percent,
-        participationScore: componentByKey.participation?.score ?? null,
-        liquidityScore,
+        participationScore,
       };
     });
 
@@ -1027,7 +1047,6 @@ function AlphaMatrix({ rows, onSelectStock, stockNames }: { rows: RankedOpportun
             `Evidence strength: ${item.evidenceStrength.toFixed(1)}`,
             `Confidence proxy: ${item.value[1].toFixed(1)}`,
             `Coverage: ${item.coverage.toFixed(0)}% · persistence ${item.persistence.toFixed(2)}x`,
-            `Liquidity score: ${item.liquidityScore == null ? "N/A" : item.liquidityScore.toFixed(0)}`,
             `Participation score: ${item.participationScore == null ? "N/A" : item.participationScore.toFixed(0)}`,
             `Session: ${item.sessionReturn == null ? "N/A" : `${item.sessionReturn > 0 ? "+" : ""}${item.sessionReturn.toFixed(2)}%`}`,
             `<span style="color:#91a0b5">Click for the consolidated stock view</span>`,
@@ -1093,14 +1112,15 @@ function AlphaMatrix({ rows, onSelectStock, stockNames }: { rows: RankedOpportun
       </div>
       <div className="alpha-matrix-chart" ref={containerRef} role="img" aria-label="Interactive Alpha Matrix. Select a stock bubble to open its detailed view." />
       {!rows.length && <p className="alpha-matrix-empty">Waiting for completed-minute opportunities.</p>}
-      <p className="alpha-matrix-note">Bubble size represents liquidity/execution score. Ineligible stocks are pulled into the low-confidence region. Axes and quadrant boundaries are provisional until backtested.</p>
+      <p className="alpha-matrix-note">Bubble size represents participation score. Execution quality is reported separately as a caution and does not affect this matrix. Axes and quadrant boundaries are provisional until backtested.</p>
     </div>
   );
 }
 
-function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void; stockNames: StockNameLookup }) {
-  const componentKeys = ["price_trend", "participation", "market_sector", "liquidity_execution", "fundamental"];
+function OpportunityRankingBoard({ rows, onSelectStock, stockNames, snapshotMode = false }: { rows: RankedOpportunity[]; onSelectStock: (instrumentKey: string) => void; stockNames: StockNameLookup; snapshotMode?: boolean }) {
+  const componentKeys = ["price_trend", "participation", "market_sector", "fundamental"];
   const componentScore = (row: RankedOpportunity, key: string) => row.score.components.find((item) => item.key === key)?.score;
+  const executionCautions = (row: RankedOpportunity) => row.execution_risk?.gates.filter((gate) => ["reject", "caution"].includes(gate.status)) ?? [];
   const traceReturn = (row: RankedOpportunity) => row.price_trace.length > 1 && row.price_trace[0] > 0
     ? ((row.price_trace.at(-1)! - row.price_trace[0]) / row.price_trace[0]) * 100
     : null;
@@ -1112,8 +1132,16 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
   const highSignalIneligibleRows = rows
     .filter((row) => !row.score.eligible && row.score.final_score >= 55)
     .sort((left, right) => right.score.final_score - left.score.final_score || right.score.coverage_percent - left.score.coverage_percent);
-  const matrixRows = [...executableRows, ...highSignalIneligibleRows];
-  const { sortedRows, sort, requestSort } = useSortableRows(executableRows, {
+  const snapshotFallbackRows = snapshotMode && !executableRows.length
+    ? rows.filter((row) => row.score.eligible).slice(0, 25)
+    : [];
+  const rankingRows = executableRows.length ? executableRows : snapshotFallbackRows;
+  // Keep the matrix populated from the complete ranked snapshot. At the close,
+  // the focus funnel deliberately moves stocks back to background/watch-only;
+  // limiting this chart to actionable rows made the persisted EOD snapshot
+  // appear empty even though valid ranked evidence was still available.
+  const matrixRows = rows;
+  const { sortedRows, sort, requestSort } = useSortableRows(rankingRows, {
     rank: (row) => row.rank,
     symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
     setup: traceReturn,
@@ -1122,10 +1150,9 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
     price_trend: (row) => componentScore(row, "price_trend"),
     participation: (row) => componentScore(row, "participation"),
     market_sector: (row) => componentScore(row, "market_sector"),
-    liquidity_execution: (row) => componentScore(row, "liquidity_execution"),
     fundamental: (row) => componentScore(row, "fundamental"),
     positives: (row) => row.score.top_positive_factors.length,
-    risks: (row) => row.score.invalidation_reasons.length + row.score.top_cautions.length,
+    risks: (row) => row.score.invalidation_reasons.length + row.score.top_cautions.length + executionCautions(row).length,
   }, "score");
   const ineligibleTierOrder: Record<string, number> = {
     active: 3,
@@ -1147,8 +1174,8 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
   return (
     <section className="table-card opportunity-card">
       <div className="table-heading">
-        <div><h2>Explainable opportunity ranking</h2><p>Focus and Cooling stocks stay visible; Background stocks remain silently evaluated every completed minute</p></div>
-        <span>Model v3 · reversible focus funnel · provisional thresholds</span>
+        <div><h2>Explainable opportunity ranking</h2><p>{snapshotFallbackRows.length ? "Latest saved eligible background candidates are shown for review; they are not active Focus calls" : "Focus and Cooling stocks stay visible; Background stocks remain silently evaluated every completed minute"}</p></div>
+        <span>Model v5 · opportunity and execution separated · provisional thresholds</span>
       </div>
       <div className="focus-funnel-summary" aria-label="Intraday focus funnel status">
         <span className="focus-count"><b>{activeFocusRows.length}</b> Focus</span>
@@ -1168,7 +1195,7 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
             <SortableHeader label="Opportunity score" sortKey="score" sort={sort} onSort={requestSort} />
             {componentKeys.map((key) => <SortableHeader key={key} label={key.replaceAll("_", " ")} sortKey={key} sort={sort} onSort={requestSort} />)}
             <SortableHeader label="Why it ranks" sortKey="positives" sort={sort} onSort={requestSort} />
-            <SortableHeader label="Risk / missing" sortKey="risks" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="Cautions / execution" sortKey="risks" sort={sort} onSort={requestSort} defaultDirection="asc" />
           </tr></thead>
           <tbody>
             {sortedRows.map((row) => {
@@ -1182,6 +1209,7 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
                     </button>
                     <small>{row.sector ?? "Sector unavailable"}</small>
                     <span className={`score-status ${row.score.status}`}>{row.score.status.replaceAll("_", " ")}</span>
+                    {row.execution_risk?.status === "rejected" && <span className="score-status ineligible">Execution caution</span>}
                     {row.focus_state === "cooling" && <span className="focus-state cooling">Focus — Cooling</span>}
                   </td>
                   <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
@@ -1201,17 +1229,21 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
                     return <td key={key}>{component ? <><strong>{component.score == null ? "N/A" : number(component.score, 0)}</strong><small>{number(component.weight_percent, 0)}% weight · {number(component.coverage_percent, 0)}% covered</small><small>{number(component.contribution_points, 1)} points</small></> : "N/A"}</td>;
                   })}
                   <td className="tag-cell">{[...new Set([...row.focus_reasons, ...row.score.top_positive_factors])].slice(0, 5).map((item) => <span className="evidence-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</td>
-                  <td className="tag-cell">{[...row.score.invalidation_reasons, ...row.score.top_cautions].slice(0, 5).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}{!row.score.invalidation_reasons.length && !row.score.top_cautions.length && <span className="evidence-tag">No active caution</span>}</td>
+                  <td className="tag-cell">
+                    {[...row.score.invalidation_reasons, ...row.score.top_cautions].slice(0, 3).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}
+                    {executionCautions(row).slice(0, 3).map((gate) => <span className="caution-tag" key={`execution-${gate.key}`}>Execution: {gate.key.replaceAll("_", " ")} {gate.status}</span>)}
+                    {!row.score.invalidation_reasons.length && !row.score.top_cautions.length && !executionCautions(row).length && <span className="evidence-tag">No active caution</span>}
+                  </td>
                 </tr>
               );
             })}
-            {!executableRows.length && <tr><td className="feature-empty" colSpan={13}>No stock currently has confirmed Focus or Cooling status. Background stocks are still monitored every completed minute.</td></tr>}
+            {!rankingRows.length && <tr><td className="feature-empty" colSpan={11}>No stock currently has confirmed Focus or Cooling status. Background stocks are still monitored every completed minute.</td></tr>}
           </tbody>
         </table>
       </div>
       <div className="non-executable-board">
         <div className="table-heading">
-          <div><h3>High signal, not executable</h3><p>Opportunity score at least 55, but blocked by liquidity, spread, slippage, freshness or another risk gate</p></div>
+          <div><h3>High signal, outside active universe</h3><p>Opportunity score at least 55, but excluded by the rolling universe, stale evidence or insufficient score coverage—not by live execution cost</p></div>
           <span>{highSignalIneligibleRows.length} observed</span>
         </div>
         <div className="table-scroll">
@@ -1231,7 +1263,7 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
                   <td className="setup-cell"><PriceSparkline values={row.price_trace} instrumentKey={row.instrument_key} sessionReturn={row.session_return_percent} /></td>
                   <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(row.session_return_percent)}`}>{row.current_market_price == null ? "—" : `₹${number(row.current_market_price)}`}</strong><span className={`cmp-change ${tone(row.session_return_percent)}`}>{signedPercent(row.session_return_percent)}</span></td>
                   <td><strong className="opportunity-score">{number(row.score.final_score, 1)}</strong><small>Coverage {number(row.score.coverage_percent, 0)}%</small></td>
-                  <td><span className={`liquidity-tier ${row.liquidity_tier}`}>{row.liquidity_tier.replace("_", " ")}</span><small>{row.liquidity_tier_reason?.replaceAll("_", " ") ?? "Live execution gate"}</small></td>
+                  <td><span className={`liquidity-tier ${row.liquidity_tier}`}>{row.liquidity_tier.replace("_", " ")}</span><small>{row.liquidity_tier_reason?.replaceAll("_", " ") ?? "Rolling universe classification"}</small></td>
                   <td className="tag-cell">{row.score.invalidation_reasons.slice(0, 4).map((item) => <span className="caution-tag" key={item}>{item.replaceAll("_", " ")}</span>)}</td>
                 </tr>
               ))}
@@ -1244,16 +1276,21 @@ function OpportunityRankingBoard({ rows, onSelectStock, stockNames }: { rows: Ra
   );
 }
 
-function EvidenceBoard({ rows, stockNames }: { rows: OpportunityEvidence[]; stockNames: StockNameLookup }) {
+function EvidenceBoard({ rows, stocks, stockNames }: { rows: OpportunityEvidence[]; stocks: WatchlistItem[]; stockNames: StockNameLookup }) {
   const confluenceOrder: Record<OpportunityEvidence["confluence"], number> = {
     strong_support: 5, supportive: 4, mixed: 3, caution: 2, insufficient: 1,
   };
+  const stockByInstrument = useMemo(
+    () => new Map(stocks.map((stock) => [stock.instrument_key, stock])),
+    [stocks],
+  );
   const pillarStrength = (row: OpportunityEvidence, key: string) => {
     const pillar = row.pillars.find((item) => item.key === key);
     return pillar ? pillar.supportive_checks - pillar.caution_checks : null;
   };
   const { sortedRows, sort, requestSort } = useSortableRows(rows, {
     symbol: (row) => companyNameFor(stockNames, row.instrument_key, row.symbol),
+    cmp: (row) => stockByInstrument.get(row.instrument_key)?.change_percent,
     confluence: (row) => confluenceOrder[row.confluence],
     persistence: (row) => row.signal_persistence?.supportive_minutes,
     risk: (row) => row.risk_assessment?.eligible,
@@ -1273,6 +1310,7 @@ function EvidenceBoard({ rows, stockNames }: { rows: OpportunityEvidence[]; stoc
         <table className="evidence-table">
           <thead><tr>
             <SortableHeader label="Stock" sortKey="symbol" sort={sort} onSort={requestSort} defaultDirection="asc" />
+            <SortableHeader label="CMP" sortKey="cmp" sort={sort} onSort={requestSort} />
             <SortableHeader label="Confluence" sortKey="confluence" sort={sort} onSort={requestSort} />
             <SortableHeader label="Persistence" sortKey="persistence" sort={sort} onSort={requestSort} />
             <SortableHeader label="Risk gates" sortKey="risk" sort={sort} onSort={requestSort} />
@@ -1285,9 +1323,12 @@ function EvidenceBoard({ rows, stockNames }: { rows: OpportunityEvidence[]; stoc
           <tbody>
             {sortedRows.map((row) => {
               const pillars = Object.fromEntries(row.pillars.map((pillar) => [pillar.key, pillar]));
+              const stock = stockByInstrument.get(row.instrument_key);
+              const sessionChange = stock?.change_percent ?? null;
               return (
                 <tr key={row.instrument_key}>
                   <td><CompanyName names={stockNames} instrumentKey={row.instrument_key} symbol={row.symbol} /><small>{row.sector ?? "Sector unavailable"}</small><span className={`quality-badge ${row.data_quality}`}>{row.data_quality}</span></td>
+                  <td className="numeric cmp-cell"><strong className={`cmp-price ${tone(sessionChange)}`}>{stock?.ltp == null ? "—" : `₹${number(stock.ltp)}`}</strong><span className={`cmp-change ${tone(sessionChange)}`}>{signedPercent(sessionChange)}</span></td>
                   <td><span className={`confluence-badge ${row.confluence}`}>{row.confluence.replaceAll("_", " ")}</span></td>
                   <td>{row.signal_persistence ? <><span className={`signal-badge ${row.signal_persistence.state}`}>{row.signal_persistence.state}</span><small>{row.signal_persistence.supportive_minutes}/{row.signal_persistence.observed_minutes} supportive minutes</small>{row.signal_persistence.transition && <span className="evidence-tag">{row.signal_persistence.transition.replaceAll("_", " ")}</span>}</> : "N/A"}</td>
                   <td>{row.risk_assessment ? <><span className={`filter-badge ${row.risk_assessment.status === "rejected" ? "reject" : row.risk_assessment.status}`}>{row.risk_assessment.status}</span><MetricLine label="Buy slip" value={row.risk_assessment.estimated_buy_slippage_bps == null ? "N/A" : `${number(row.risk_assessment.estimated_buy_slippage_bps)} bps`} /><MetricLine label="Upper circuit" value={percent(row.risk_assessment.distance_to_upper_circuit_percent)} />{row.risk_assessment.gates.filter((gate) => gate.status !== "pass").slice(0, 2).map((gate) => <span className="caution-tag" key={gate.key}>{gate.key.replaceAll("_", " ")}: {gate.status}</span>)}</> : "N/A"}</td>
@@ -1313,7 +1354,7 @@ function EvidenceBoard({ rows, stockNames }: { rows: OpportunityEvidence[]; stoc
                 </tr>
               );
             })}
-            {!rows.length && <tr><td className="feature-empty" colSpan={9}>Waiting for current-session feature evidence.</td></tr>}
+            {!rows.length && <tr><td className="feature-empty" colSpan={10}>Waiting for current-session feature evidence.</td></tr>}
           </tbody>
         </table>
       </div>
@@ -1537,9 +1578,9 @@ function StockDetailPanel({ instrumentKey, stocks, opportunities, features, regi
           <MetricLine label="High / low" value={`${stock?.high == null ? "N/A" : number(stock.high)} / ${stock?.low == null ? "N/A" : number(stock.low)}`} />
           <MetricLine label="Latest minute volume" value={integer(stock?.volume ?? null)} />
           <MetricLine label="Tracking tier" value={stock?.liquidity_tier?.replace("_", " ") ?? "N/A"} />
-          <MetricLine label="20-session median value" value={tradedValue(stock?.median_daily_traded_value_inr ?? null)} />
+          <MetricLine label="Rolling median value" value={tradedValue(stock?.median_daily_traded_value_inr ?? null)} />
           <MetricLine label="Trading continuity" value={stock ? `${stock.liquidity_sessions_traded}/${stock.liquidity_sessions_expected} sessions` : "—"} />
-          <MetricLine label="20-session median spread" value={stock?.median_spread_bps_20d == null ? "—" : `${number(stock.median_spread_bps_20d, 2)} bps`} />
+          <MetricLine label="Rolling median spread" value={stock?.median_spread_bps_20d == null ? "—" : `${number(stock.median_spread_bps_20d, 2)} bps`} />
           <MetricLine label="Latest daily value" value={tradedValue(stock?.latest_daily_traded_value_inr ?? null)} />
           <MetricLine label="Updated" value={stock?.updated_at ? new Date(stock.updated_at).toLocaleTimeString("en-IN") : "N/A"} />
         </DetailCard>
@@ -1827,13 +1868,12 @@ function BacktestPanel({ databaseAvailable, stockNames }: { databaseAvailable: b
   );
 }
 
-type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "evidence" | "daily" | "financials" | "stocks" | "backtesting";
+type AnalysisTab = "opportunities" | "stock_detail" | "intraday" | "evidence" | "financials" | "stocks" | "backtesting";
 
 const ANALYSIS_TABS: Array<{ id: AnalysisTab; label: string }> = [
   { id: "opportunities", label: "Opportunity Ranking" },
   { id: "intraday", label: "Intraday Features" },
   { id: "evidence", label: "Evidence Confluence" },
-  { id: "daily", label: "Daily Regime" },
   { id: "financials", label: "Financials (Qtrly/Yearly)" },
   { id: "stocks", label: "Approved Stocks" },
   { id: "backtesting", label: "Backtesting" },
@@ -2057,7 +2097,7 @@ function Dashboard() {
           ))}
         </div>
         <div className="analysis-tab-panel" id={`analysis-panel-${activeAnalysisTab}`} role="tabpanel" aria-labelledby={`analysis-tab-${activeAnalysisTab}`}>
-          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} onSelectStock={openStockDetail} stockNames={stockNames} />}
+          {activeAnalysisTab === "opportunities" && <OpportunityRankingBoard rows={opportunities} onSelectStock={openStockDetail} stockNames={stockNames} snapshotMode={!live} />}
           {activeAnalysisTab === "stock_detail" && selectedInstrumentKey && (
             <StockDetailPanel
               instrumentKey={selectedInstrumentKey}
@@ -2071,9 +2111,8 @@ function Dashboard() {
               onBack={() => setActiveAnalysisTab("opportunities")}
             />
           )}
-          {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} stockNames={stockNames} />}
-          {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} stockNames={stockNames} />}
-          {activeAnalysisTab === "daily" && <DailyRegimePanel regimes={regimes} stockNames={stockNames} />}
+          {activeAnalysisTab === "intraday" && <FeatureMatrix features={features} stocks={stocks} stockNames={stockNames} />}
+          {activeAnalysisTab === "evidence" && <EvidenceBoard rows={evidence} stocks={stocks} stockNames={stockNames} />}
           {activeAnalysisTab === "financials" && <FinancialsPanel rows={financialMetrics} stockNames={stockNames} />}
           {activeAnalysisTab === "stocks" && <ApprovedStocksPanel stocks={stocks} />}
           {activeAnalysisTab === "backtesting" && <BacktestPanel databaseAvailable={runtime?.database_available === true} stockNames={stockNames} />}

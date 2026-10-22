@@ -8,11 +8,11 @@ Before intraday focus selection, Q-FAE classifies every approved stock from comp
 
 | Tier | Rolling rule | Runtime treatment |
 | --- | --- | --- |
-| Active | Traded in at least 18 of the latest 20 NIFTY sessions, 20-session median traded value is at least Rs 5 crore, and the rolling median spread is at most 25 bps. | Live subscription, features, evidence and opportunity ranking, subject to the live slippage gate. |
-| Watch-only | Trading continuity passes, but median traded value is below Rs 5 crore, median spread exceeds 25 bps, or spread history is still unavailable. | Live subscription, features and directional scoring for audit; excluded from executable ranks and shown separately when its opportunity signal is strong. |
-| Dormant | Traded in fewer than 18 of the latest 20 NIFTY sessions. | Excluded from live subscription and opportunity ranking; daily history still refreshes. |
+| Active | Traded in at least 8 of the latest 10 NIFTY sessions and 10-session median traded value is at least Rs 2 crore. | Live subscription, features and opportunity ranking. Rolling and live execution checks remain separate cautions. |
+| Watch-only | Trading continuity passes, but median traded value is below Rs 2 crore. | Live subscription, features and directional scoring for audit; kept outside Active ranks and shown separately when its opportunity signal is strong. |
+| Dormant | Traded in fewer than 8 of the latest 10 NIFTY sessions. | Excluded from live subscription and opportunity ranking; daily history still refreshes. |
 
-Daily spread medians are calculated from Q-FAE's recorded minute evidence and stored in PostgreSQL after reconciliation. The rolling spread window therefore builds prospectively; missing spread history is never treated as a pass. The live D5 order book must also support a Rs 1 lakh reference order with estimated worst-side slippage no greater than 20 bps, otherwise the stock is ineligible for ranking.
+Daily spread medians are calculated from Q-FAE's recorded minute evidence and stored in PostgreSQL after reconciliation. They remain visible execution context but do not control Active-universe admission. The live D5 order book still estimates impact for a Rs 1 lakh reference order, but a failed estimate creates an execution caution rather than invalidating the opportunity.
 
 Preparation continues to refresh daily history for all approved stocks, including Dormant stocks. This preserves the reactivation path and avoids permanently deleting a company from the approved universe.
 
@@ -40,7 +40,7 @@ This separation prevents late breakouts, sector rotations, news reactions, VWAP 
 | Focus | Dynamic | Confirmed long-opportunity candidates shown and ranked prominently. |
 | Focus - Cooling | Dynamic | Green Focus stocks with paused momentum or a constructive pullback; still visible and ranked so the next leg is not missed. |
 | Background | Remaining Active stocks | Hidden from the primary ranking, screened from every live quote, periodically selected for full feature discovery, and retained through compact evidence. |
-| Watch-only | Rolling-liquidity or execution constraint | Streamed and scored for observation but never given an executable rank. |
+| Watch-only | Rolling-liquidity admission constraint | Streamed and scored for observation but kept outside the Active ranking. |
 | Dormant | Failed trading-continuity gate | Excluded from live subscription while daily history continues to refresh. |
 
 Group sizes are operating defaults, not model truths. They must be calibrated from stored point-in-time outcomes.
@@ -53,14 +53,14 @@ A Background stock may enter Focus when persistent evidence supports several of 
 - improving relative strength versus NIFTY and the mapped sector;
 - price holding above or reclaiming VWAP with a positive slope;
 - accelerating same-minute RVOL and directional volume;
-- improving liquidity with acceptable spread, depth and estimated slippage;
+- strengthening participation while execution quality is shown independently;
 - a new official company announcement or other timestamped catalyst;
 - an Opportunity Score crossing the configured review threshold with adequate coverage;
 - confirmation in at least two of the latest three completed minutes.
 
 ## Demotion and hard exclusion
 
-Use hysteresis so a single noisy minute does not cause constant list turnover. The implemented starting rule promotes after two consecutive qualifying minutes. A green Focus stock with two cooling minutes moves to Focus-Cooling but remains in the table; one newly promotable minute returns it immediately to Focus. Demotion to Background still requires three consecutive materially weak red minutes. A failed execution/risk gate demotes immediately.
+Use hysteresis so a single noisy minute does not cause constant list turnover. The implemented starting rule promotes after two consecutive qualifying minutes. A green Focus stock with two cooling minutes moves to Focus-Cooling but remains in the table; one newly promotable minute returns it immediately to Focus. Demotion to Background still requires three consecutive materially weak red minutes. A failed live execution check adds a caution but does not demote the opportunity.
 
 Being below the previous close is not a sufficient demotion or exclusion rule. Material weakness requires it together with at least two other conditions such as a below/falling VWAP, simultaneous underperformance versus NIFTY and sector, weak RVOL/volume acceleration, or no opening-range breakout. A red stock can therefore enter Focus when relative strength, VWAP, volume and opening-range evidence confirm a reversal or emerging leader.
 
@@ -70,8 +70,8 @@ Hard exclusion for the rest of the session is permitted only for objective data 
 
 - invalid/delisted instrument or halted trading;
 - stale or materially incomplete live data;
-- unacceptable spread, visible-book slippage or traded value;
-- circuit proximity or another rejected risk/tradability gate;
+- failure of the rolling Active-universe admission rules;
+- stale or materially incomplete evidence that makes the opportunity calculation unreliable;
 - a confirmed surveillance or corporate restriction once those inputs are implemented.
 
 Weak first-30-minute performance alone is never a hard-exclusion reason.
